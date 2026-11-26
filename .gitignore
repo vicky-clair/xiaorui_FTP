@@ -1,0 +1,21 @@
+# 构建产物与安装包
+*.exe
+*.msi
+*.dmg
+*.AppImage
+*.deb
+
+# Node / Vite
+node_modules/
+dist/
+*.local
+
+# Rust / Tauri
+src-tauri/target/
+src-tauri/gen/
+
+# 编辑器与操作系统缓存
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

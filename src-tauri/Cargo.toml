@@ -1,0 +1,52 @@
+[package]
+name = "xiaorui_ftp"
+version = "1.0.0"
+description = "xiaorui_FTP - Modern Cross-Platform x64 File Transfer Client"
+authors = ["xiaorui"]
+edition = "2021"
+
+[[bin]]
+name = "xiaorui_FTP"
+path = "src/main.rs"
+
+[lib]
+name = "xiaorui_ftp_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+url = "2"
+async-trait = "0.1"
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+quick-xml = "0.37"
+percent-encoding = "2"
+dirs = "6"
+russh = "0.49.2"
+russh-sftp = "2.1.1"
+suppaftp = { version = "6.2.0", features = ["rustls", "deprecated"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "0.26"
+keyring = { version = "3.6.3", features = ["windows-native", "apple-native", "sync-secret-service", "crypto-rust"] }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

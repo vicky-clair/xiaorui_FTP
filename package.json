@@ -1,0 +1,34 @@
+{
+  "name": "xiaorui_ftp",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "xiaorui_FTP - Modern Cross-Platform x64 File Transfer Client (SFTP / FTPS / S3 / WebDAV)",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build:win64": "tauri build --target x86_64-pc-windows-msvc",
+    "tauri:build:mac64": "tauri build --target x86_64-apple-darwin",
+    "tauri:build:linux64": "tauri build --target x86_64-unknown-linux-gnu",
+    "release:win64": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/build-release.ps1"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.5.0",
+    "@tauri-apps/plugin-dialog": "^2.2.0",
+    "@tauri-apps/plugin-opener": "^2.2.0",
+    "lucide-react": "^0.511.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.5.0",
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "@vitejs/plugin-react": "^4.5.0",
+    "typescript": "^5.8.0",
+    "vite": "^6.3.0"
+  }
+}
