@@ -35,7 +35,7 @@ try {
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
     Write-Host "==> [3/4] 打包 Tauri v2 Windows x64 Release 安装包 (NSIS / MSI)..." -ForegroundColor Cyan
-    cargo tauri build --target $Target
+    npx tauri build --target $Target
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
     Write-Host "==> [4/4] Release 安装包构建完成：" -ForegroundColor Green

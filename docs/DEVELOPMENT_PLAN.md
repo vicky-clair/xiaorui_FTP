@@ -127,9 +127,11 @@ xiaorui_FTP/
 - **自动刷新**：前端监听 `transfer://update` 事件，当任务变为 `completed` 时自动刷新对应侧的文件列表。
 
 ### 4.4 安全与凭据存储模型
-- 站点元数据存储于操作系统标准应用数据目录的 `sites.json`，严禁保存明文密码或私钥口令。
-- 所有敏感凭据（密码、私钥口令、S3 Secret Key、STS Token、跳板机密码/口令）统一通过 `keyring` 以服务名 `com.xiaorui.ftp` 写入系统凭据库，并在编辑站点时执行**增量合并**（留空字段不会覆盖已保存密钥）。
-- 导出站点备份文件（`export_sites_to_file`）仅导出非敏感元数据；导入（`import_sites_from_file`）时自动将 `hasSavedSecret` 重置为 `false`。
+- **站点元数据**存储于操作系统标准应用数据目录的 `sites.json`，严禁保存明文密码或私钥口令。
+- **SSH 已知主机指纹（TOFU）**独立存储于 `known_hosts.json`（由 `known_hosts.rs` 管理），首次连接固定 SHA-256 指纹，后续不匹配时自动阻断连接以防范中间人攻击，并支持在前端「主机」管理弹窗中按条移除。
+- **应用层安全策略**：`tauri.conf.json` 启用最小可用 CSP（`default-src 'self'; script-src 'self'; object-src 'none'`），阻断外链脚本与未授权资源加载。
+- **凭据安全与内存清零**：所有敏感凭据（密码、私钥口令、S3 Secret Key、STS Token、跳板机密钥）通过 `keyring` 托管至系统凭据库（服务名 `com.xiaorui.ftp`），且 `SiteSecrets` 在 `Drop` 时自动通过 `zeroize` 覆写清零内存。
+- **全协议流式传输**：SFTP、FTP/FTPS、S3（SigV4 `UNSIGNED-PAYLOAD`）与 WebDAV 全部采用 64 KB 流式分块上传/下载，恒定低内存占用并支持中途取消与实时速率上报；S3 目录列举与递归删除均采用 `continuation-token` 分页并显式传播错误。
 
 ---
 

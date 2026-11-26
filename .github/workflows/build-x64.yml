@@ -32,6 +32,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+          components: rustfmt, clippy
 
       - name: Install Linux Tauri dependencies
         if: matrix.os == 'ubuntu-22.04'
@@ -41,6 +42,17 @@ jobs:
 
       - name: Install frontend dependencies
         run: npm ci
+
+      - name: TypeScript strict type check
+        run: npx tsc --noEmit
+
+      - name: Rust format check
+        working-directory: src-tauri
+        run: cargo fmt -- --check
+
+      - name: Rust Clippy check (-D warnings)
+        working-directory: src-tauri
+        run: cargo clippy --target ${{ matrix.target }} --all-targets -- -D warnings
 
       - name: Run Rust unit tests
         working-directory: src-tauri
