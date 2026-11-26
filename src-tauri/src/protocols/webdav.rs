@@ -6,7 +6,7 @@
 //! - 支持目录列举、新建目录（MKCOL）、删除（DELETE）、重命名（MOVE）及流式上传下载。
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -15,9 +15,10 @@ use futures_util::StreamExt;
 use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTROLS};
 use quick_xml::events::Event;
 use quick_xml::Reader;
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
-use reqwest::{Client, Method};
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
+use reqwest::{Body, Client, Method};
 use tokio::io::AsyncWriteExt;
+use tokio_util::io::ReaderStream;
 use url::Url;
 
 use crate::error::{AppError, AppResult};
@@ -438,20 +439,53 @@ impl RemoteFs for WebDavClient {
         if cancel.load(Ordering::Relaxed) {
             return Err(AppError::Cancelled);
         }
-        let data = tokio::fs::read(local_path).await?;
-        let total = data.len() as u64;
+        let meta = tokio::fs::metadata(local_path).await?;
+        let total = meta.len();
+        let file = tokio::fs::File::open(local_path).await?;
         let url = self.build_url(remote_path, false)?;
+
+        let mut headers = self.default_headers();
+        headers.insert(CONTENT_LENGTH, HeaderValue::from(total));
+
+        // 64 KB 流式分块上传，恒定低内存占用并支持中途取消与实时速率汇报
+        let sent = Arc::new(AtomicU64::new(0));
+        let sent_cb = sent.clone();
+        let cancel_cb = cancel.clone();
+        let progress_cb = progress.clone();
+
+        let stream = ReaderStream::with_capacity(file, 64 * 1024).map(move |chunk| {
+            if cancel_cb.load(Ordering::Relaxed) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "cancelled",
+                ));
+            }
+            let bytes = chunk?;
+            let done =
+                sent_cb.fetch_add(bytes.len() as u64, Ordering::Relaxed) + bytes.len() as u64;
+            progress_cb(done, total.max(done));
+            Ok(bytes)
+        });
+
         let resp = self
             .http
             .put(url)
-            .headers(self.default_headers())
-            .body(data)
+            .headers(headers)
+            .body(Body::wrap_stream(stream))
             .send()
             .await
-            .map_err(|e| AppError::Connection(format!("WebDAV 上传失败: {}", e)))?;
+            .map_err(|e| {
+                if cancel.load(Ordering::Relaxed) {
+                    AppError::Cancelled
+                } else {
+                    AppError::Connection(format!("WebDAV 流式上传失败: {}", e))
+                }
+            })?;
         Self::check_status(resp.status())?;
-        progress(total, total);
-        Ok(total)
+
+        let final_bytes = sent.load(Ordering::Relaxed).max(total);
+        progress(final_bytes, total.max(final_bytes));
+        Ok(final_bytes)
     }
 }
 
@@ -487,5 +521,19 @@ mod tests {
         assert!(!entries[1].is_dir);
         assert_eq!(entries[1].name, "hello world.txt");
         assert_eq!(entries[1].size, 512);
+    }
+
+    #[test]
+    fn test_webdav_check_status() {
+        assert!(WebDavClient::check_status(reqwest::StatusCode::OK).is_ok());
+        assert!(WebDavClient::check_status(reqwest::StatusCode::MULTI_STATUS).is_ok());
+        assert!(matches!(
+            WebDavClient::check_status(reqwest::StatusCode::UNAUTHORIZED),
+            Err(AppError::Auth(_))
+        ));
+        assert!(matches!(
+            WebDavClient::check_status(reqwest::StatusCode::NOT_FOUND),
+            Err(AppError::NotFound(_))
+        ));
     }
 }

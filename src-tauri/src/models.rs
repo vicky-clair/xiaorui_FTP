@@ -200,7 +200,7 @@ pub struct SiteInput {
     pub save_secret: bool,
 }
 
-/// 托管在操作系统凭据库中的站点敏感密钥集合
+/// 托管在操作系统凭据库中的站点敏感密钥集合（Drop 时自动覆写清零内存）
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SiteSecrets {
@@ -211,6 +211,27 @@ pub struct SiteSecrets {
     pub jump_secret: Option<String>,
     #[serde(default)]
     pub jump_passphrase: Option<String>,
+}
+
+impl Drop for SiteSecrets {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        if let Some(s) = self.secret.as_mut() {
+            s.zeroize();
+        }
+        if let Some(s) = self.passphrase.as_mut() {
+            s.zeroize();
+        }
+        if let Some(s) = self.session_token.as_mut() {
+            s.zeroize();
+        }
+        if let Some(s) = self.jump_secret.as_mut() {
+            s.zeroize();
+        }
+        if let Some(s) = self.jump_passphrase.as_mut() {
+            s.zeroize();
+        }
+    }
 }
 
 /// 本地 SSH Agent 可用性检测结果

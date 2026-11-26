@@ -86,6 +86,15 @@ export interface AgentStatus {
   message: string;
 }
 
+/** 已信任的 SSH 主机公钥指纹记录（TOFU） */
+export interface KnownHostEntry {
+  hostPort: string;
+  algorithm: string;
+  fingerprint: string;
+  firstSeenAt: number;
+  lastSeenAt: number;
+}
+
 /** 当前已连接的远程会话摘要 */
 export interface SessionInfo {
   sessionId: string;

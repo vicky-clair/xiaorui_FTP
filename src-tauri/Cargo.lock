@@ -6716,9 +6716,11 @@ dependencies = [
  "tauri-plugin-opener",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-util",
  "url",
  "uuid",
  "webpki-roots 0.26.11",
+ "zeroize",
 ]
 
 [[package]]

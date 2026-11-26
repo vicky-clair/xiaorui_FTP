@@ -5,6 +5,7 @@
 
 mod commands;
 mod error;
+mod known_hosts;
 mod local_fs;
 mod models;
 mod protocols;
@@ -42,6 +43,8 @@ pub fn run() {
             commands::export_sites_to_file,
             commands::import_sites_from_file,
             commands::check_ssh_agent_status,
+            commands::list_known_hosts,
+            commands::remove_known_host,
             // 会话连接与生命周期管理
             commands::connect_saved_site,
             commands::connect_adhoc,

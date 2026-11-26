@@ -229,6 +229,15 @@ button {
   background: var(--danger-soft);
 }
 
+.btn-danger-solid {
+  background: var(--danger);
+  color: #fff;
+}
+
+.btn-danger-solid:hover {
+  opacity: 0.9;
+}
+
 .icon-btn {
   width: 30px;
   height: 30px;

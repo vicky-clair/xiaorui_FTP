@@ -152,3 +152,43 @@ pub async fn rename(from: &str, to: &str) -> AppResult<()> {
     tokio::fs::rename(from, to).await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn test_local_fs_lifecycle_and_sorting() {
+        let base = std::env::temp_dir().join(format!("xiaorui_localfs_{}", Uuid::new_v4()));
+        let sub = base.join("z_folder");
+        mkdir(&sub.to_string_lossy()).await.unwrap();
+        tokio::fs::write(base.join("a_file.txt"), b"abc")
+            .await
+            .unwrap();
+
+        // 验证目录排在文件之前
+        let list = list_dir(&base.to_string_lossy()).await.unwrap();
+        assert_eq!(list.len(), 2);
+        assert!(list[0].is_dir);
+        assert_eq!(list[0].name, "z_folder");
+        assert!(!list[1].is_dir);
+        assert_eq!(list[1].name, "a_file.txt");
+
+        // 重命名并删除
+        let renamed = base.join("b_file.txt");
+        rename(
+            &base.join("a_file.txt").to_string_lossy(),
+            &renamed.to_string_lossy(),
+        )
+        .await
+        .unwrap();
+        assert!(renamed.exists());
+
+        delete(&renamed.to_string_lossy(), false).await.unwrap();
+        assert!(!renamed.exists());
+
+        delete(&base.to_string_lossy(), true).await.unwrap();
+        assert!(!base.exists());
+    }
+}

@@ -240,3 +240,94 @@ pub fn delete_secrets(site_id: &str) -> AppResult<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::Protocol;
+
+    #[test]
+    fn test_site_store_legacy_compatibility_and_backup_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("xiaorui_store_test_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 模拟旧版 sites.json（缺少跳板机 jump_* 字段），确保升级后读取绝不丢失既有站点数据
+        let legacy_json = r#"[
+          {
+            "id": "legacy-site-1",
+            "name": "生产机",
+            "group": "核心",
+            "protocol": "sftp",
+            "host": "10.0.0.10",
+            "port": 22,
+            "username": "root",
+            "authType": "password",
+            "remotePath": "/var/www",
+            "pathStyle": false,
+            "tlsSkipVerify": false,
+            "notes": "legacy",
+            "hasSavedSecret": true,
+            "updatedAt": 1700000000
+          }
+        ]"#;
+        std::fs::write(dir.join("sites.json"), legacy_json).unwrap();
+
+        let store = SiteStore::new(dir.clone()).unwrap();
+        let list = store.list().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, "legacy-site-1");
+        assert!(list[0].has_saved_secret);
+        assert!(list[0].jump_host.is_none());
+
+        // 新增站点（不触碰系统 keyring：save_secret = false）并验证导出/导入逻辑
+        let created = store
+            .save(SiteInput {
+                id: None,
+                name: "测试 MinIO".into(),
+                group: "云存储".into(),
+                protocol: Protocol::S3,
+                host: "127.0.0.1".into(),
+                port: Some(9000),
+                username: "minioadmin".into(),
+                auth_type: AuthType::AccessKey,
+                secret: Some("super-secret".into()),
+                passphrase: None,
+                session_token: None,
+                private_key_path: None,
+                remote_path: "/".into(),
+                endpoint: Some("http://127.0.0.1:9000".into()),
+                bucket: Some("assets".into()),
+                region: Some("us-east-1".into()),
+                path_style: true,
+                tls_skip_verify: false,
+                jump_host: None,
+                jump_port: None,
+                jump_username: None,
+                jump_auth_type: None,
+                jump_private_key_path: None,
+                jump_secret: None,
+                jump_passphrase: None,
+                notes: String::new(),
+                save_secret: false,
+            })
+            .unwrap();
+        assert_eq!(store.list().unwrap().len(), 2);
+
+        // 导出的备份 JSON 绝不包含明文密钥
+        let exported = store.export_json().unwrap();
+        assert!(!exported.contains("super-secret"));
+
+        // 导入至全新目录时 has_saved_secret 重置为 false 且站点完整保留
+        let dir2 = std::env::temp_dir().join(format!("xiaorui_store_import_{}", Uuid::new_v4()));
+        let store2 = SiteStore::new(dir2.clone()).unwrap();
+        let imported_count = store2.import_json(&exported).unwrap();
+        assert_eq!(imported_count, 2);
+        assert!(store2.list().unwrap().iter().all(|s| !s.has_saved_secret));
+
+        store.delete(&created.id).unwrap();
+        assert_eq!(store.list().unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+}

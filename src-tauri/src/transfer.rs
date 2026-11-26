@@ -227,3 +227,63 @@ impl TransferManager {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_transfer_manager_cancel_and_clear_finished() {
+        let mgr = TransferManager::new(2);
+        let flag = Arc::new(AtomicBool::new(false));
+        {
+            let mut tasks = mgr.tasks.write().await;
+            tasks.push(TransferTask {
+                id: "t-run".into(),
+                session_id: "s1".into(),
+                direction: TransferDirection::Upload,
+                local_path: "/tmp/a".into(),
+                remote_path: "/a".into(),
+                file_name: "a".into(),
+                total_bytes: 100,
+                transferred_bytes: 50,
+                speed_bps: 10,
+                status: TransferStatus::Running,
+                error: None,
+                created_at: 1,
+            });
+            tasks.push(TransferTask {
+                id: "t-done".into(),
+                session_id: "s1".into(),
+                direction: TransferDirection::Download,
+                local_path: "/tmp/b".into(),
+                remote_path: "/b".into(),
+                file_name: "b".into(),
+                total_bytes: 100,
+                transferred_bytes: 100,
+                speed_bps: 0,
+                status: TransferStatus::Completed,
+                error: None,
+                created_at: 2,
+            });
+            mgr.cancels
+                .write()
+                .await
+                .insert("t-run".into(), flag.clone());
+        }
+
+        // 清除已完成时，进行中任务必须保留
+        mgr.clear_finished().await;
+        assert_eq!(mgr.list().await.len(), 1);
+        assert_eq!(mgr.list().await[0].id, "t-run");
+
+        // 取消进行中任务应同时置位原子取消标志与状态
+        mgr.cancel("t-run").await.unwrap();
+        assert!(flag.load(Ordering::Relaxed));
+        assert_eq!(mgr.list().await[0].status, TransferStatus::Cancelled);
+
+        // 再次清除已完成时，已取消任务被移除
+        mgr.clear_finished().await;
+        assert!(mgr.list().await.is_empty());
+    }
+}

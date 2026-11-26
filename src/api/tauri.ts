@@ -9,6 +9,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AgentStatus,
   FileEntry,
+  KnownHostEntry,
   LocalRoot,
   SessionInfo,
   ShellOutput,
@@ -27,6 +28,9 @@ export const api = {
   importSitesFromFile: (filePath: string) =>
     invoke<number>("import_sites_from_file", { filePath }),
   checkSshAgentStatus: () => invoke<AgentStatus>("check_ssh_agent_status"),
+  listKnownHosts: () => invoke<KnownHostEntry[]>("list_known_hosts"),
+  removeKnownHost: (hostPort: string) =>
+    invoke<boolean>("remove_known_host", { hostPort }),
 
   // ---------------- 会话连接管理 ----------------
   connectSavedSite: (

@@ -23,25 +23,57 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
 use crate::error::{AppError, AppResult};
+use crate::known_hosts::KnownHostsStore;
 use crate::models::{
     format_unix_mode, join_remote_path, normalize_remote_path, AgentStatus, AuthType, FileEntry,
     ShellOutput,
 };
 use crate::protocols::{ProgressCallback, RemoteFs};
 
-/// SSH 客户端事件回调处理器
-struct ClientHandler;
+/// SSH 客户端事件回调处理器（负责 TOFU 主机公钥指纹固定与变更拦截）
+struct ClientHandler {
+    host_port: String,
+    known_hosts: Arc<KnownHostsStore>,
+    mismatch_error: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+impl ClientHandler {
+    fn new(
+        host_port: String,
+        known_hosts: Arc<KnownHostsStore>,
+        mismatch_error: Arc<std::sync::Mutex<Option<String>>>,
+    ) -> Self {
+        Self {
+            host_port,
+            known_hosts,
+            mismatch_error,
+        }
+    }
+}
 
 #[async_trait]
 impl client::Handler for ClientHandler {
     type Error = russh::Error;
 
-    /// 校验远程服务器主机公钥（当前默认信任，便于快速连接内网与动态测试主机）
+    /// 校验远程服务器主机公钥（TOFU：首次信任并持久化，后续不一致时阻断连接）
     async fn check_server_key(
         &mut self,
-        _server_public_key: &PublicKey,
+        server_public_key: &PublicKey,
     ) -> Result<bool, Self::Error> {
-        Ok(true)
+        let fingerprint = server_public_key.fingerprint(HashAlg::Sha256).to_string();
+        let algorithm = server_public_key.algorithm().to_string();
+        match self
+            .known_hosts
+            .verify_or_trust(&self.host_port, &algorithm, &fingerprint)
+        {
+            Ok(_) => Ok(true),
+            Err(mismatch) => {
+                if let Ok(mut slot) = self.mismatch_error.lock() {
+                    *slot = Some(mismatch.to_string());
+                }
+                Ok(false)
+            }
+        }
     }
 }
 
@@ -284,7 +316,7 @@ pub struct SftpClient {
 }
 
 impl SftpClient {
-    /// 建立 SFTP 连接（支持直连或经由 SSH 跳板机隧道连接）
+    /// 建立 SFTP 连接（支持直连或经由 SSH 跳板机隧道连接，均启用 TOFU 主机指纹校验）
     #[allow(clippy::too_many_arguments)]
     pub async fn connect(
         host: String,
@@ -295,6 +327,7 @@ impl SftpClient {
         private_key_path: Option<String>,
         passphrase: Option<String>,
         jump: Option<JumpHostConfig>,
+        known_hosts: Arc<KnownHostsStore>,
     ) -> AppResult<Self> {
         let target_host = host.trim().to_string();
         let target_user = username.trim().to_string();
@@ -313,8 +346,12 @@ impl SftpClient {
             ..Default::default()
         });
 
+        let target_host_port = format!("{}:{}", target_host, port);
+        let target_mismatch = Arc::new(std::sync::Mutex::new(None));
+
         let (jump_handle, session) = if let Some(jh) = jump {
             let jump_host = jh.host.trim().to_string();
+            let jump_host_port = format!("{}:{}", jump_host, jh.port);
             let jump_sock = resolve_socket_addr(jump_host.clone(), jh.port).await?;
             let jump_user = if jh.username.trim().is_empty() {
                 target_user.clone()
@@ -322,10 +359,16 @@ impl SftpClient {
                 jh.username.trim().to_string()
             };
 
-            // 1. 连接并认证跳板机
-            let jump_sess = client::connect(config.clone(), jump_sock, ClientHandler)
+            // 1. 连接并认证跳板机（独立校验跳板机主机指纹）
+            let jump_mismatch = Arc::new(std::sync::Mutex::new(None));
+            let jump_handler =
+                ClientHandler::new(jump_host_port, known_hosts.clone(), jump_mismatch.clone());
+            let jump_sess = client::connect(config.clone(), jump_sock, jump_handler)
                 .await
                 .map_err(|e| {
+                    if let Ok(Some(msg)) = jump_mismatch.lock().map(|g| g.clone()) {
+                        return AppError::Auth(msg);
+                    }
                     AppError::Connection(format!(
                         "无法连接 SSH 跳板机 {}:{}: {}",
                         jump_host, jh.port, e
@@ -360,10 +403,15 @@ impl SftpClient {
                     ))
                 })?;
 
-            // 3. 在隧道流之上建立目标主机 SSH 加密连接
-            let target_sess = client::connect_stream(config, tunnel.into_stream(), ClientHandler)
+            // 3. 在隧道流之上建立目标主机 SSH 加密连接并校验目标主机指纹
+            let target_handler =
+                ClientHandler::new(target_host_port, known_hosts, target_mismatch.clone());
+            let target_sess = client::connect_stream(config, tunnel.into_stream(), target_handler)
                 .await
                 .map_err(|e| {
+                    if let Ok(Some(msg)) = target_mismatch.lock().map(|g| g.clone()) {
+                        return AppError::Auth(msg);
+                    }
                     AppError::Connection(format!(
                         "经由跳板机连接目标主机 {}:{} 失败: {}",
                         target_host, port, e
@@ -373,9 +421,14 @@ impl SftpClient {
             (Some(jump_sess), target_sess)
         } else {
             let target_sock = resolve_socket_addr(target_host.clone(), port).await?;
-            let direct_sess = client::connect(config, target_sock, ClientHandler)
+            let target_handler =
+                ClientHandler::new(target_host_port, known_hosts, target_mismatch.clone());
+            let direct_sess = client::connect(config, target_sock, target_handler)
                 .await
                 .map_err(|e| {
+                    if let Ok(Some(msg)) = target_mismatch.lock().map(|g| g.clone()) {
+                        return AppError::Auth(msg);
+                    }
                     AppError::Connection(format!("无法连接 SSH {}:{}: {}", target_host, port, e))
                 })?;
             (None, direct_sess)

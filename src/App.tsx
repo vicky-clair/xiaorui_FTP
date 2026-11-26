@@ -10,8 +10,10 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { Cloud, Globe, Lock, Server, X } from "lucide-react";
 import { api } from "./api/tauri";
+import { DialogModal, type DialogRequest } from "./components/DialogModal";
 import { EditorModal } from "./components/EditorModal";
 import { FilePane } from "./components/FilePane";
+import { KnownHostsModal } from "./components/KnownHostsModal";
 import { SiteModal } from "./components/SiteModal";
 import { SiteSidebar } from "./components/SiteSidebar";
 import { TerminalDrawer } from "./components/TerminalDrawer";
@@ -82,6 +84,49 @@ export default function App() {
     path: string;
     content: string;
   } | null>(null);
+
+  // 跨平台确认/输入弹窗与 SSH 已知主机管理弹窗
+  const [dialog, setDialog] = useState<DialogRequest | null>(null);
+  const [knownHostsOpen, setKnownHostsOpen] = useState(false);
+
+  const openConfirm = useCallback(
+    (title: string, message: string, options?: { confirmLabel?: string; danger?: boolean }) =>
+      new Promise<boolean>((resolve) => {
+        setDialog({
+          kind: "confirm",
+          title,
+          message,
+          confirmLabel: options?.confirmLabel,
+          danger: options?.danger,
+          resolve,
+        });
+      }),
+    []
+  );
+
+  const openPrompt = useCallback(
+    (
+      title: string,
+      options?: {
+        message?: string;
+        defaultValue?: string;
+        placeholder?: string;
+        confirmLabel?: string;
+      }
+    ) =>
+      new Promise<string | null>((resolve) => {
+        setDialog({
+          kind: "prompt",
+          title,
+          message: options?.message,
+          defaultValue: options?.defaultValue,
+          placeholder: options?.placeholder,
+          confirmLabel: options?.confirmLabel,
+          resolve,
+        });
+      }),
+    []
+  );
 
   // Toasts
   const [toasts, setToasts] = useState<Toast[]>([]);
@@ -298,7 +343,12 @@ export default function App() {
   };
 
   const handleDeleteSite = async (site: SiteConfig) => {
-    if (!window.confirm(`确认删除站点「${site.name}」及其保存的凭据？`)) return;
+    const ok = await openConfirm(
+      "删除站点",
+      `确认删除站点「${site.name}」及其保存在系统凭据库中的密钥？`,
+      { confirmLabel: "删除", danger: true }
+    );
+    if (!ok) return;
     await api.deleteSite(site.id);
     setSites((prev) => prev.filter((s) => s.id !== site.id));
     pushToast(`已删除站点「${site.name}」`);
@@ -461,7 +511,10 @@ export default function App() {
   // Remote actions
   const handleRemoteMkdir = async () => {
     if (!activeSession) return;
-    const name = window.prompt("请输入新文件夹名称：");
+    const name = await openPrompt("新建远程文件夹", {
+      placeholder: "请输入新文件夹名称",
+      confirmLabel: "创建",
+    });
     if (!name?.trim()) return;
     const target = remotePath === "/" ? `/${name.trim()}` : `${remotePath}/${name.trim()}`;
     try {
@@ -474,7 +527,10 @@ export default function App() {
 
   const handleRemoteRename = async (entry: FileEntry) => {
     if (!activeSession) return;
-    const nextName = window.prompt("重命名为：", entry.name);
+    const nextName = await openPrompt("重命名远程项", {
+      defaultValue: entry.name,
+      confirmLabel: "重命名",
+    });
     if (!nextName?.trim() || nextName.trim() === entry.name) return;
     const parent = remotePath === "/" ? "" : remotePath;
     try {
@@ -487,7 +543,12 @@ export default function App() {
 
   const handleRemoteDelete = async (entry: FileEntry) => {
     if (!activeSession) return;
-    if (!window.confirm(`确认删除远程${entry.isDir ? "目录" : "文件"}「${entry.name}」？`)) return;
+    const ok = await openConfirm(
+      "删除远程项",
+      `确认删除远程${entry.isDir ? "目录（含全部子内容）" : "文件"}「${entry.name}」？此操作不可撤销。`,
+      { confirmLabel: "删除", danger: true }
+    );
+    if (!ok) return;
     try {
       await api.remoteDelete(activeSession.sessionId, entry.path, entry.isDir);
       await loadRemoteDir(activeSession.sessionId, remotePath);
@@ -499,7 +560,11 @@ export default function App() {
   const handleRemoteChmod = async (entry: FileEntry) => {
     if (!activeSession) return;
     const defaultOctal = entry.mode != null ? entry.mode.toString(8).padStart(3, "0") : "644";
-    const input = window.prompt(`修改「${entry.name}」权限（八进制，例如 755 或 644）：`, defaultOctal);
+    const input = await openPrompt(`修改「${entry.name}」权限 (CHMOD)`, {
+      message: "请输入 3 位八进制权限值（例如 755 或 644）：",
+      defaultValue: defaultOctal,
+      confirmLabel: "应用",
+    });
     if (!input?.trim()) return;
     const parsed = parseInt(input.trim(), 8);
     if (Number.isNaN(parsed)) {
@@ -527,7 +592,10 @@ export default function App() {
 
   // Local actions
   const handleLocalMkdir = async () => {
-    const name = window.prompt("请输入本地新文件夹名称：");
+    const name = await openPrompt("新建本地文件夹", {
+      placeholder: "请输入新文件夹名称",
+      confirmLabel: "创建",
+    });
     if (!name?.trim()) return;
     const sep = localPath.includes("\\") ? "\\" : "/";
     const base = localPath.endsWith(sep) ? localPath : `${localPath}${sep}`;
@@ -540,7 +608,10 @@ export default function App() {
   };
 
   const handleLocalRename = async (entry: FileEntry) => {
-    const nextName = window.prompt("重命名为：", entry.name);
+    const nextName = await openPrompt("重命名本地项", {
+      defaultValue: entry.name,
+      confirmLabel: "重命名",
+    });
     if (!nextName?.trim() || nextName.trim() === entry.name) return;
     const sep = localPath.includes("\\") ? "\\" : "/";
     const base = localPath.endsWith(sep) ? localPath : `${localPath}${sep}`;
@@ -553,7 +624,12 @@ export default function App() {
   };
 
   const handleLocalDelete = async (entry: FileEntry) => {
-    if (!window.confirm(`确认删除本地${entry.isDir ? "目录" : "文件"}「${entry.name}」？`)) return;
+    const ok = await openConfirm(
+      "删除本地项",
+      `确认删除本地${entry.isDir ? "目录（含全部子内容）" : "文件"}「${entry.name}」？此操作不可撤销。`,
+      { confirmLabel: "删除", danger: true }
+    );
+    if (!ok) return;
     try {
       await api.localDelete(entry.path, entry.isDir);
       await loadLocalDir(localPath);
@@ -610,6 +686,7 @@ export default function App() {
             onDelete={handleDeleteSite}
             onExport={handleExportSites}
             onImport={handleImportSites}
+            onOpenKnownHosts={() => setKnownHostsOpen(true)}
           />
         )}
 
@@ -804,6 +881,17 @@ export default function App() {
             pushToast(`已保存并回传 ${editor.path}`, "success");
           }}
         />
+      )}
+
+      {knownHostsOpen && (
+        <KnownHostsModal
+          onClose={() => setKnownHostsOpen(false)}
+          onNotify={pushToast}
+        />
+      )}
+
+      {dialog && (
+        <DialogModal dialog={dialog} onClose={() => setDialog(null)} />
       )}
 
       {toasts.length > 0 && (

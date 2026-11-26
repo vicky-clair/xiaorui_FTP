@@ -15,6 +15,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::error::{AppError, AppResult};
+use crate::known_hosts::KnownHostsStore;
 use crate::models::{AuthType, FileEntry, Protocol, ShellOutput, SiteConfig, SiteSecrets};
 
 /// 传输进度回调函数类型：参数依次为 `(已传输字节数, 总字节数)`
@@ -78,6 +79,7 @@ pub trait RemoteFs: Send + Sync {
 pub async fn connect_protocol(
     site: SiteConfig,
     secrets: SiteSecrets,
+    known_hosts: Arc<KnownHostsStore>,
 ) -> AppResult<Arc<dyn RemoteFs>> {
     match site.protocol {
         Protocol::Sftp => {
@@ -108,6 +110,7 @@ pub async fn connect_protocol(
                 site.private_key_path.clone(),
                 secrets.passphrase.clone(),
                 jump,
+                known_hosts,
             ))
             .await
             .map_err(|e| AppError::Connection(format!("SFTP 连接任务异常: {}", e)))??;

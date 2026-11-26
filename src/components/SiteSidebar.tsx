@@ -6,7 +6,7 @@
  */
 
 import React, { useMemo, useState } from "react";
-import { Download, Pencil, Search, Trash2, Upload } from "lucide-react";
+import { Download, Pencil, Search, ShieldCheck, Trash2, Upload } from "lucide-react";
 import { PROTOCOL_META, type SiteConfig } from "../types";
 
 interface SiteSidebarProps {
@@ -17,6 +17,7 @@ interface SiteSidebarProps {
   onDelete: (site: SiteConfig) => void;
   onExport: () => void;
   onImport: () => void;
+  onOpenKnownHosts: () => void;
 }
 
 export const SiteSidebar: React.FC<SiteSidebarProps> = ({
@@ -27,6 +28,7 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
   onDelete,
   onExport,
   onImport,
+  onOpenKnownHosts,
 }) => {
   const [query, setQuery] = useState("");
 
@@ -143,7 +145,11 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
         </button>
         <button className="btn btn-sm btn-ghost" onClick={onExport} title="导出站点备份为 JSON（不含敏感密钥）">
           <Download size={13} />
-          导出备份
+          备份
+        </button>
+        <button className="btn btn-sm btn-ghost" onClick={onOpenKnownHosts} title="管理 SSH 已知主机公钥指纹">
+          <ShieldCheck size={13} />
+          主机
         </button>
       </div>
     </aside>

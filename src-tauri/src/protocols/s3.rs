@@ -6,7 +6,7 @@
 //! - 自动将对象前缀（`CommonPrefixes`）映射为直观的虚拟目录层级。
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -16,10 +16,11 @@ use hmac::{Hmac, Mac};
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use quick_xml::events::Event;
 use quick_xml::Reader;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, HOST};
-use reqwest::{Client, Method};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_LENGTH, HOST};
+use reqwest::{Body, Client, Method};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
+use tokio_util::io::ReaderStream;
 use url::Url;
 
 use crate::error::{AppError, AppResult};
@@ -386,8 +387,8 @@ fn extract_s3_error(xml: &str) -> String {
     }
 }
 
-/// 解析 S3 `ListObjectsV2` XML 响应为统一的 `FileEntry` 列表
-pub fn parse_list_objects_v2(xml: &str, prefix: &str) -> Vec<FileEntry> {
+/// 解析 S3 `ListObjectsV2` 单页 XML 响应，返回本页条目与可选的下一页 `NextContinuationToken`
+pub fn parse_list_objects_v2_page(xml: &str, prefix: &str) -> (Vec<FileEntry>, Option<String>) {
     let mut reader = Reader::from_str(xml);
     let mut entries = Vec::new();
 
@@ -398,6 +399,8 @@ pub fn parse_list_objects_v2(xml: &str, prefix: &str) -> Vec<FileEntry> {
     let mut key = String::new();
     let mut size: u64 = 0;
     let mut modified: Option<i64> = None;
+    let mut is_truncated = false;
+    let mut next_token = String::new();
 
     loop {
         match reader.read_event() {
@@ -430,6 +433,12 @@ pub fn parse_list_objects_v2(xml: &str, prefix: &str) -> Vec<FileEntry> {
                     }
                 } else if in_common_prefix && current_tag == "Prefix" {
                     key.push_str(&text);
+                } else {
+                    match current_tag.as_str() {
+                        "IsTruncated" => is_truncated = text.trim().eq_ignore_ascii_case("true"),
+                        "NextContinuationToken" => next_token.push_str(text.trim()),
+                        _ => {}
+                    }
                 }
             }
             Ok(Event::End(e)) => {
@@ -483,7 +492,58 @@ pub fn parse_list_objects_v2(xml: &str, prefix: &str) -> Vec<FileEntry> {
             .cmp(&a.is_dir)
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
-    entries
+    let token = if is_truncated && !next_token.is_empty() {
+        Some(next_token)
+    } else {
+        None
+    };
+    (entries, token)
+}
+
+/// 解析 S3 `ListObjectsV2` XML 中的全部对象 Key 与分页续传 Token（用于目录递归删除）
+pub fn parse_list_keys_page(xml: &str) -> (Vec<String>, Option<String>) {
+    let mut reader = Reader::from_str(xml);
+    let mut keys = Vec::new();
+    let mut current_tag = String::new();
+    let mut key_buf = String::new();
+    let mut is_truncated = false;
+    let mut next_token = String::new();
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) => {
+                current_tag = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
+                if current_tag == "Key" {
+                    key_buf.clear();
+                }
+            }
+            Ok(Event::Text(t)) => {
+                let s = t.unescape().unwrap_or_default().to_string();
+                match current_tag.as_str() {
+                    "Key" => key_buf.push_str(&s),
+                    "IsTruncated" => is_truncated = s.trim().eq_ignore_ascii_case("true"),
+                    "NextContinuationToken" => next_token.push_str(s.trim()),
+                    _ => {}
+                }
+            }
+            Ok(Event::End(e)) => {
+                let name = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
+                if name == "Key" && !key_buf.is_empty() {
+                    keys.push(std::mem::take(&mut key_buf));
+                }
+                current_tag.clear();
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+
+    let token = if is_truncated && !next_token.is_empty() {
+        Some(next_token)
+    } else {
+        None
+    };
+    (keys, token)
 }
 
 #[async_trait]
@@ -496,24 +556,45 @@ impl RemoteFs for S3Client {
             format!("{}/", raw_key.trim_end_matches('/'))
         };
 
-        let mut query = vec![
-            ("list-type".to_string(), "2".to_string()),
-            ("delimiter".to_string(), "/".to_string()),
-            ("max-keys".to_string(), "1000".to_string()),
-        ];
-        if !prefix.is_empty() {
-            query.push(("prefix".to_string(), prefix.clone()));
+        // 循环拉取所有分页，避免单目录超过 1000 项时显示不全
+        let mut all_entries = Vec::new();
+        let mut continuation: Option<String> = None;
+
+        loop {
+            let mut query = vec![
+                ("list-type".to_string(), "2".to_string()),
+                ("delimiter".to_string(), "/".to_string()),
+                ("max-keys".to_string(), "1000".to_string()),
+            ];
+            if !prefix.is_empty() {
+                query.push(("prefix".to_string(), prefix.clone()));
+            }
+            if let Some(tok) = &continuation {
+                query.push(("continuation-token".to_string(), tok.clone()));
+            }
+
+            let resp = self
+                .send_signed(Method::GET, "", &query, Vec::new(), &[])
+                .await?;
+            let xml = resp
+                .text()
+                .await
+                .map_err(|e| AppError::Protocol(format!("读取 S3 响应失败: {}", e)))?;
+
+            let (mut page_entries, next_tok) = parse_list_objects_v2_page(&xml, &prefix);
+            all_entries.append(&mut page_entries);
+            match next_tok {
+                Some(t) => continuation = Some(t),
+                None => break,
+            }
         }
 
-        let resp = self
-            .send_signed(Method::GET, "", &query, Vec::new(), &[])
-            .await?;
-        let xml = resp
-            .text()
-            .await
-            .map_err(|e| AppError::Protocol(format!("读取 S3 响应失败: {}", e)))?;
-
-        Ok(parse_list_objects_v2(&xml, &prefix))
+        all_entries.sort_by(|a, b| {
+            b.is_dir
+                .cmp(&a.is_dir)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+        Ok(all_entries)
     }
 
     async fn mkdir(&self, path: &str) -> AppResult<()> {
@@ -527,47 +608,49 @@ impl RemoteFs for S3Client {
     async fn remove(&self, path: &str, is_dir: bool) -> AppResult<()> {
         let key = Self::object_key(path);
         if is_dir {
-            // 列出并逐个删除前缀下的全部子对象及目录占位对象
+            // 使用 continuation-token 循环分页列举并删除前缀下的全部子对象，显式传播删除错误
             let prefix = format!("{}/", key.trim_end_matches('/'));
-            let query = vec![
-                ("list-type".to_string(), "2".to_string()),
-                ("prefix".to_string(), prefix.clone()),
-            ];
-            let resp = self
-                .send_signed(Method::GET, "", &query, Vec::new(), &[])
-                .await?;
-            let xml = resp.text().await.unwrap_or_default();
-            let mut reader = Reader::from_str(&xml);
-            let mut in_key = false;
-            let mut keys = Vec::new();
-            let mut buf = String::new();
+            let mut continuation: Option<String> = None;
+
             loop {
-                match reader.read_event() {
-                    Ok(Event::Start(e)) if e.local_name().as_ref() == b"Key" => {
-                        in_key = true;
-                        buf.clear();
-                    }
-                    Ok(Event::Text(t)) if in_key => {
-                        buf.push_str(&t.unescape().unwrap_or_default());
-                    }
-                    Ok(Event::End(e)) if e.local_name().as_ref() == b"Key" => {
-                        in_key = false;
-                        if !buf.is_empty() {
-                            keys.push(buf.clone());
-                        }
-                    }
-                    Ok(Event::Eof) | Err(_) => break,
-                    _ => {}
+                let mut query = vec![
+                    ("list-type".to_string(), "2".to_string()),
+                    ("max-keys".to_string(), "1000".to_string()),
+                    ("prefix".to_string(), prefix.clone()),
+                ];
+                if let Some(tok) = &continuation {
+                    query.push(("continuation-token".to_string(), tok.clone()));
+                }
+
+                let resp = self
+                    .send_signed(Method::GET, "", &query, Vec::new(), &[])
+                    .await?;
+                let xml = resp
+                    .text()
+                    .await
+                    .map_err(|e| AppError::Protocol(format!("读取 S3 列表响应失败: {}", e)))?;
+
+                let (keys, next_tok) = parse_list_keys_page(&xml);
+                for k in keys {
+                    self.send_signed(Method::DELETE, &k, &[], Vec::new(), &[])
+                        .await?;
+                }
+
+                match next_tok {
+                    Some(t) => continuation = Some(t),
+                    None => break,
                 }
             }
-            for k in keys {
-                let _ = self
-                    .send_signed(Method::DELETE, &k, &[], Vec::new(), &[])
-                    .await;
-            }
-            let _ = self
+
+            // 清理可能存在的目录占位对象（若该占位对象不存在则忽略 404，其他错误照常返回）
+            if let Err(e) = self
                 .send_signed(Method::DELETE, &prefix, &[], Vec::new(), &[])
-                .await;
+                .await
+            {
+                if !matches!(e, AppError::NotFound(_)) {
+                    return Err(e);
+                }
+            }
         } else {
             let _ = self
                 .send_signed(Method::DELETE, &key, &[], Vec::new(), &[])
@@ -671,12 +754,78 @@ impl RemoteFs for S3Client {
         if cancel.load(Ordering::Relaxed) {
             return Err(AppError::Cancelled);
         }
-        let data = tokio::fs::read(local_path).await?;
-        let total = data.len() as u64;
+        let meta = tokio::fs::metadata(local_path).await?;
+        let total = meta.len();
+        let file = tokio::fs::File::open(local_path).await?;
+
         let key = Self::object_key(remote_path);
-        let _ = self.send_signed(Method::PUT, &key, &[], data, &[]).await?;
-        progress(total, total);
-        Ok(total)
+        let (url, host_header, canonical_query) = self.build_url_and_host(&key, &[])?;
+
+        // 采用 SigV4 UNSIGNED-PAYLOAD + 64 KB 流式上传，恒定低内存占用并支持中途取消与实时进度
+        let mut headers = self.sign_request(
+            &Method::PUT,
+            url.path(),
+            &canonical_query,
+            &host_header,
+            "UNSIGNED-PAYLOAD",
+            &[],
+        )?;
+        headers.insert(CONTENT_LENGTH, HeaderValue::from(total));
+
+        let sent = Arc::new(AtomicU64::new(0));
+        let sent_cb = sent.clone();
+        let cancel_cb = cancel.clone();
+        let progress_cb = progress.clone();
+
+        let stream = ReaderStream::with_capacity(file, 64 * 1024).map(move |chunk| {
+            if cancel_cb.load(Ordering::Relaxed) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "cancelled",
+                ));
+            }
+            let bytes = chunk?;
+            let done =
+                sent_cb.fetch_add(bytes.len() as u64, Ordering::Relaxed) + bytes.len() as u64;
+            progress_cb(done, total.max(done));
+            Ok(bytes)
+        });
+
+        let resp = self
+            .http
+            .request(Method::PUT, url)
+            .headers(headers)
+            .body(Body::wrap_stream(stream))
+            .send()
+            .await
+            .map_err(|e| {
+                if cancel.load(Ordering::Relaxed) {
+                    AppError::Cancelled
+                } else {
+                    AppError::Connection(format!("S3 流式上传失败: {}", e))
+                }
+            })?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err_text = resp.text().await.unwrap_or_default();
+            if status.as_u16() == 403 || status.as_u16() == 401 {
+                return Err(AppError::Auth(format!(
+                    "S3 认证被拒绝 ({}): {}",
+                    status,
+                    extract_s3_error(&err_text)
+                )));
+            }
+            return Err(AppError::Protocol(format!(
+                "S3 上传返回错误 {}: {}",
+                status,
+                extract_s3_error(&err_text)
+            )));
+        }
+
+        let final_bytes = sent.load(Ordering::Relaxed).max(total);
+        progress(final_bytes, total.max(final_bytes));
+        Ok(final_bytes)
     }
 }
 
@@ -685,11 +834,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_s3_list_xml() {
+    fn test_parse_s3_list_xml_and_pagination() {
         let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
         <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
             <Name>demo</Name>
             <Prefix>docs/</Prefix>
+            <IsTruncated>true</IsTruncated>
+            <NextContinuationToken>token-page-2</NextContinuationToken>
             <CommonPrefixes><Prefix>docs/images/</Prefix></CommonPrefixes>
             <Contents>
                 <Key>docs/readme.md</Key>
@@ -697,12 +848,27 @@ mod tests {
                 <Size>2048</Size>
             </Contents>
         </ListBucketResult>"#;
-        let entries = parse_list_objects_v2(xml, "docs/");
+        let (entries, token) = parse_list_objects_v2_page(xml, "docs/");
         assert_eq!(entries.len(), 2);
         assert!(entries[0].is_dir);
         assert_eq!(entries[0].name, "images");
         assert!(!entries[1].is_dir);
         assert_eq!(entries[1].name, "readme.md");
         assert_eq!(entries[1].size, 2048);
+        assert_eq!(token.as_deref(), Some("token-page-2"));
+
+        let (keys, key_token) = parse_list_keys_page(xml);
+        assert_eq!(keys, vec!["docs/readme.md"]);
+        assert_eq!(key_token.as_deref(), Some("token-page-2"));
+    }
+
+    #[test]
+    fn test_extract_s3_error_xml() {
+        let err_xml =
+            r#"<Error><Code>AccessDenied</Code><Message>Invalid Access Key</Message></Error>"#;
+        assert_eq!(
+            extract_s3_error(err_xml),
+            "AccessDenied - Invalid Access Key"
+        );
     }
 }

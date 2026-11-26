@@ -14,6 +14,7 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
+use crate::known_hosts::{KnownHostEntry, KnownHostsStore};
 use crate::local_fs;
 use crate::models::{
     join_remote_path, normalize_remote_path, parse_quick_connect_uri, AgentStatus, FileEntry,
@@ -32,8 +33,10 @@ pub struct ActiveSession {
 
 /// 全局 Tauri 托管应用状态
 pub struct AppState {
-    /// 站点持久化仓库
+    /// 站点持久化仓库（`sites.json`）
     pub store: SiteStore,
+    /// SSH 已知主机公钥指纹仓库（`known_hosts.json`，独立于站点配置）
+    pub known_hosts: Arc<KnownHostsStore>,
     /// 当前所有活跃的远程会话映射表（session_id -> ActiveSession）
     pub sessions: RwLock<HashMap<String, ActiveSession>>,
     /// 后台并发传输队列管理器
@@ -44,7 +47,8 @@ impl AppState {
     /// 初始化全局状态（默认最大 3 并发传输）
     pub fn new(app_data_dir: PathBuf) -> AppResult<Self> {
         Ok(Self {
-            store: SiteStore::new(app_data_dir)?,
+            store: SiteStore::new(app_data_dir.clone())?,
+            known_hosts: Arc::new(KnownHostsStore::new(app_data_dir)?),
             sessions: RwLock::new(HashMap::new()),
             transfers: TransferManager::new(3),
         })
@@ -121,6 +125,18 @@ pub async fn import_sites_from_file(
 #[tauri::command]
 pub async fn check_ssh_agent_status() -> AgentStatus {
     sftp::check_ssh_agent_status().await
+}
+
+/// 列出所有已信任的 SSH 主机公钥指纹记录（TOFU）
+#[tauri::command]
+pub async fn list_known_hosts(state: State<'_, AppState>) -> AppResult<Vec<KnownHostEntry>> {
+    state.known_hosts.list()
+}
+
+/// 移除指定 `host:port` 的已知 SSH 主机公钥指纹（用于服务器重装后重新信任）
+#[tauri::command]
+pub async fn remove_known_host(state: State<'_, AppState>, host_port: String) -> AppResult<bool> {
+    state.known_hosts.remove(&host_port)
 }
 
 // ============================================================================
@@ -216,11 +232,13 @@ async fn create_session(
 ) -> AppResult<SessionInfo> {
     let site_for_connect = site.clone();
     let secrets_for_connect = secrets.clone();
+    let known_hosts = state.known_hosts.clone();
     // 在独立异步任务中完成网络握手，避免连接过程阻塞状态锁
-    let fs =
-        tokio::spawn(async move { connect_protocol(site_for_connect, secrets_for_connect).await })
-            .await
-            .map_err(|e| AppError::Connection(format!("连接任务异常: {}", e)))??;
+    let fs = tokio::spawn(async move {
+        connect_protocol(site_for_connect, secrets_for_connect, known_hosts).await
+    })
+    .await
+    .map_err(|e| AppError::Connection(format!("连接任务异常: {}", e)))??;
 
     let session_id = Uuid::new_v4().to_string();
     let info = SessionInfo {
