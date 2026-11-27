@@ -155,6 +155,8 @@ export const SiteModal: React.FC<SiteModalProps> = ({
     try {
       await onSaveAndConnect(buildInput(), connectAfter);
       onClose();
+    } catch {
+      // 错误提示由上层 App 统一通过 Toast 展示，保持弹窗打开以便修正表单
     } finally {
       setSubmitting(false);
     }
@@ -182,7 +184,7 @@ export const SiteModal: React.FC<SiteModalProps> = ({
       <div className="modal" onClick={(e) => e.stopPropagation()}>
         <div className="modal-header">
           <span>{initial ? "编辑站点" : "新建连接站点"}</span>
-          <button className="icon-btn" onClick={onClose}>
+          <button type="button" className="icon-btn" onClick={onClose}>
             <X size={16} />
           </button>
         </div>
@@ -676,19 +678,21 @@ export const SiteModal: React.FC<SiteModalProps> = ({
         </div>
 
         <div className="modal-footer">
-          <button className="btn btn-ghost" onClick={onClose} disabled={submitting}>
+          <button type="button" className="btn btn-ghost" onClick={onClose} disabled={submitting}>
             取消
           </button>
           <button
+            type="button"
             className="btn btn-outline"
-            onClick={() => submit(false)}
+            onClick={() => void submit(false)}
             disabled={submitting}
           >
             仅保存
           </button>
           <button
+            type="button"
             className="btn btn-primary"
-            onClick={() => submit(true)}
+            onClick={() => void submit(true)}
             disabled={submitting}
           >
             {submitting ? "处理中..." : "保存并连接"}

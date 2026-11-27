@@ -337,10 +337,16 @@ export default function App() {
   };
 
   const handleSaveSite = async (input: SiteInput, connectAfter: boolean) => {
-    const saved = await api.saveSite(input);
-    const list = await api.listSites();
-    setSites(list);
-    pushToast(`已保存站点「${saved.name}」`, "success");
+    let saved: SiteConfig;
+    try {
+      saved = await api.saveSite(input);
+      const list = await api.listSites();
+      setSites(list);
+      pushToast(`已保存站点「${saved.name}」`, "success");
+    } catch (err) {
+      pushToast(String(err), "error");
+      throw err;
+    }
 
     if (connectAfter) {
       setConnectingSiteId(saved.id);

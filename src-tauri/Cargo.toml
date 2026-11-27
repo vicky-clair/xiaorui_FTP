@@ -46,8 +46,10 @@ keyring = { version = "3.6.3", features = ["windows-native", "apple-native", "sy
 zeroize = "1"
 tokio-util = { version = "0.7", features = ["io"] }
 
+[target.'cfg(windows)'.dependencies]
+pageant = "0.0.1"
+
 [profile.release]
-panic = "abort"
 codegen-units = 1
 lto = true
 opt-level = "s"

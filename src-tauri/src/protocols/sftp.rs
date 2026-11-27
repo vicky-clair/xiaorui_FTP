@@ -89,6 +89,53 @@ pub struct JumpHostConfig {
     pub passphrase: Option<String>,
 }
 
+/// 在 Windows 平台上安全连接 Pageant（PuTTY / KeePassXC / 1Password）
+///
+/// 绕过上游 `pageant 0.0.1` 中 `PageantStream::new()` 在未运行 Pageant 时调用 `.unwrap()` 导致进程崩溃的缺陷：
+/// 1. 先通过 `pageant::is_pageant_running()` 探测窗口句柄，未运行时直接返回 `None`；
+/// 2. 实际 Win32 通信放在 `spawn_blocking` 中执行，任何异常均优雅退出循环，绝不 panic。
+#[cfg(windows)]
+fn connect_safe_pageant() -> Option<AgentClient<tokio::io::DuplexStream>> {
+    if !pageant::is_pageant_running() {
+        return None;
+    }
+
+    let (client_stream, mut server_stream) = tokio::io::duplex(8192 * 16);
+    let cookie = uuid::Uuid::new_v4().simple().to_string();
+
+    tokio::spawn(async move {
+        let mut len_buf = [0u8; 4];
+        while server_stream.read_exact(&mut len_buf).await.is_ok() {
+            let msg_len = u32::from_be_bytes(len_buf) as usize;
+            if msg_len == 0 || msg_len > 8192 - 4 {
+                break;
+            }
+            let mut msg = vec![0u8; 4 + msg_len];
+            msg[..4].copy_from_slice(&len_buf);
+            if server_stream.read_exact(&mut msg[4..]).await.is_err() {
+                break;
+            }
+
+            let cookie_owned = cookie.clone();
+            let resp = tokio::task::spawn_blocking(move || {
+                pageant::query_pageant_direct(cookie_owned, &msg)
+            })
+            .await
+            .ok()
+            .and_then(|r| r.ok());
+
+            let Some(response) = resp else {
+                break;
+            };
+            if server_stream.write_all(&response).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    Some(AgentClient::connect(client_stream))
+}
+
 /// 检测本地平台 SSH Agent 服务可用性与已加载密钥数量
 pub async fn check_ssh_agent_status() -> AgentStatus {
     #[cfg(windows)]
@@ -121,25 +168,27 @@ pub async fn check_ssh_agent_status() -> AgentStatus {
             };
         }
 
-        // 若未启用 OpenSSH Agent，自动回退检测 Pageant（PuTTY / KeePassXC / 1Password）
-        let mut pageant_agent = AgentClient::connect_pageant().await;
-        match pageant_agent.request_identities().await {
-            Ok(keys) => AgentStatus {
-                available: true,
-                backend: "Pageant".to_string(),
-                key_count: keys.len(),
-                message: if keys.is_empty() {
-                    "已连接 Pageant，但尚未加载任何密钥".to_string()
-                } else {
-                    format!("已连接 Pageant，检测到 {} 个可用密钥", keys.len())
-                },
-            },
-            Err(_) => AgentStatus {
-                available: false,
-                backend: "none".to_string(),
-                key_count: 0,
-                message: "未检测到正在运行的本地 SSH Agent（请启动 Windows OpenSSH Authentication Agent 服务或 Pageant）".to_string(),
-            },
+        // 若未启用 OpenSSH Agent，安全回退检测 Pageant（PuTTY / KeePassXC / 1Password）
+        if let Some(mut pageant_agent) = connect_safe_pageant() {
+            if let Ok(keys) = pageant_agent.request_identities().await {
+                return AgentStatus {
+                    available: true,
+                    backend: "Pageant".to_string(),
+                    key_count: keys.len(),
+                    message: if keys.is_empty() {
+                        "已连接 Pageant，但尚未加载任何密钥".to_string()
+                    } else {
+                        format!("已连接 Pageant，检测到 {} 个可用密钥", keys.len())
+                    },
+                };
+            }
+        }
+
+        AgentStatus {
+            available: false,
+            backend: "none".to_string(),
+            key_count: 0,
+            message: "未检测到正在运行的本地 SSH Agent（请启动 Windows OpenSSH Authentication Agent 服务或 Pageant）".to_string(),
         }
     }
 
@@ -216,7 +265,12 @@ async fn authenticate_with_local_agent(
         {
             return try_agent_auth(session, username, pipe_agent, "Windows OpenSSH Agent").await;
         }
-        let pageant_agent = AgentClient::connect_pageant().await;
+        let pageant_agent = connect_safe_pageant().ok_or_else(|| {
+            AppError::Auth(
+                "未检测到正在运行的本地 SSH Agent（请启动 Windows OpenSSH Authentication Agent 服务或 Pageant）"
+                    .to_string(),
+            )
+        })?;
         try_agent_auth(session, username, pageant_agent, "Pageant").await
     }
 
@@ -765,5 +819,17 @@ impl RemoteFs for SftpClient {
             stderr: String::from_utf8_lossy(&stderr).to_string(),
             exit_code,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_check_ssh_agent_status_never_panics() {
+        // 即使本机未启动 OpenSSH Agent 或 Pageant，检测也必须安全返回而非触发 panic/abort
+        let status = check_ssh_agent_status().await;
+        assert!(!status.message.is_empty());
     }
 }
