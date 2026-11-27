@@ -35,7 +35,7 @@ hex = "0.4"
 base64 = "0.22"
 quick-xml = "0.37"
 percent-encoding = "2"
-dirs = "6"
+dirs = "7"
 russh = "0.49.2"
 russh-sftp = "2.1.1"
 suppaftp = { version = "6.2.0", features = ["rustls", "deprecated"] }
