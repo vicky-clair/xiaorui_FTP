@@ -5,10 +5,22 @@
  * 传输队列事件同步（含完成后自动刷新目录）、在线文本编辑器与内置 SSH 终端。
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import { Cloud, Globe, Lock, Server, X } from "lucide-react";
+import {
+  AlertCircle,
+  ArrowDownUp,
+  CheckCircle2,
+  Cloud,
+  Globe,
+  Info,
+  Lock,
+  Server,
+  ShieldCheck,
+  Sparkles,
+  X,
+} from "lucide-react";
 import { api } from "./api/tauri";
 import { DialogModal, type DialogRequest } from "./components/DialogModal";
 import { EditorModal } from "./components/EditorModal";
@@ -20,6 +32,7 @@ import { TerminalDrawer } from "./components/TerminalDrawer";
 import { TopBar } from "./components/TopBar";
 import { TransferDrawer } from "./components/TransferDrawer";
 import {
+  formatBytes,
   PROTOCOL_META,
   type FileEntry,
   type LocalRoot,
@@ -88,6 +101,12 @@ export default function App() {
   // 跨平台确认/输入弹窗与 SSH 已知主机管理弹窗
   const [dialog, setDialog] = useState<DialogRequest | null>(null);
   const [knownHostsOpen, setKnownHostsOpen] = useState(false);
+
+  // 可拖拽双栏宽度比例（左侧本地栏百分比）与命令栏聚焦引用
+  const [splitRatio, setSplitRatio] = useState(46);
+  const [resizingPanes, setResizingPanes] = useState(false);
+  const panesRef = useRef<HTMLDivElement>(null);
+  const quickConnectInputRef = useRef<HTMLInputElement>(null);
 
   const openConfirm = useCallback(
     (title: string, message: string, options?: { confirmLabel?: string; danger?: boolean }) =>
@@ -642,6 +661,64 @@ export default function App() {
     (t) => t.status === "running" || t.status === "queued"
   ).length;
 
+  const totalTransferSpeed = transfers.reduce(
+    (sum, t) => (t.status === "running" ? sum + t.speedBps : sum),
+    0
+  );
+
+  const connectedKeys = useMemo(
+    () => new Set(sessions.map((s) => `${s.protocol}:${s.host}`)),
+    [sessions]
+  );
+
+  // 全局桌面快捷键：Ctrl+K 聚焦快速直连，Ctrl+N 新建站点，F5 刷新目录
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        quickConnectInputRef.current?.focus();
+        quickConnectInputRef.current?.select();
+      } else if (
+        (e.ctrlKey || e.metaKey) &&
+        e.key.toLowerCase() === "n" &&
+        !siteModal.open &&
+        !editor &&
+        !dialog
+      ) {
+        e.preventDefault();
+        setSiteModal({ open: true, editing: null, defaultProtocol: "sftp" });
+      } else if (e.key === "F5") {
+        e.preventDefault();
+        if (activeSessionIdRef.current) {
+          void loadRemoteDir(activeSessionIdRef.current, remotePathRef.current);
+        } else if (localPathRef.current) {
+          void loadLocalDir(localPathRef.current);
+        }
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [dialog, editor, loadLocalDir, loadRemoteDir, siteModal.open]);
+
+  // 拖拽双栏分割条实时调整左右宽度
+  const handleStartResize = (e: React.MouseEvent) => {
+    e.preventDefault();
+    setResizingPanes(true);
+    const onMove = (ev: MouseEvent) => {
+      const rect = panesRef.current?.getBoundingClientRect();
+      if (!rect || rect.width <= 0) return;
+      const pct = ((ev.clientX - rect.left) / rect.width) * 100;
+      setSplitRatio(Math.min(76, Math.max(24, pct)));
+    };
+    const onUp = () => {
+      setResizingPanes(false);
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+
   return (
     <div className="app-shell">
       <TopBar
@@ -664,6 +741,7 @@ export default function App() {
           if (!terminalOpen) setTransferOpen(false);
         }}
         connecting={connecting}
+        quickConnectInputRef={quickConnectInputRef}
         onQuickConnect={handleQuickConnect}
         onNewSite={() =>
           setSiteModal({ open: true, editing: null, defaultProtocol: "sftp" })
@@ -675,6 +753,7 @@ export default function App() {
           <SiteSidebar
             sites={sites}
             connectingSiteId={connectingSiteId}
+            connectedKeys={connectedKeys}
             onConnect={handleConnectSite}
             onEdit={(site) =>
               setSiteModal({
@@ -705,6 +784,7 @@ export default function App() {
                       void loadRemoteDir(s.sessionId, s.currentPath);
                     }}
                   >
+                    <span className="status-dot online" />
                     <span className={`proto-badge ${meta.badgeClass}`}>{meta.short}</span>
                     <span
                       style={{
@@ -731,7 +811,7 @@ export default function App() {
             </div>
           )}
 
-          <div className="panes">
+          <div className="panes" ref={panesRef}>
             {dualPane && (
               <FilePane
                 mode="local"
@@ -741,13 +821,24 @@ export default function App() {
                 loading={localLoading}
                 roots={localRoots}
                 canTransfer={Boolean(activeSession)}
+                style={{ flex: `0 0 ${splitRatio}%` }}
                 onNavigate={(p) => void loadLocalDir(p)}
                 onRefresh={() => void loadLocalDir(localPath)}
                 onMkdir={() => void handleLocalMkdir()}
                 onRename={(e) => void handleLocalRename(e)}
                 onDelete={(e) => void handleLocalDelete(e)}
                 onTransfer={(e) => void handleUploadEntry(e)}
+                onCopyPath={(p) => pushToast(`已复制路径：${p}`, "info")}
                 onDropEntryFromOtherPane={(e) => void handleDownloadEntry(e, false)}
+              />
+            )}
+
+            {dualPane && (
+              <div
+                className={`pane-resizer ${resizingPanes ? "dragging" : ""}`}
+                onMouseDown={handleStartResize}
+                title="拖动调节本地与远程分栏比例（双击重置）"
+                onDoubleClick={() => setSplitRatio(46)}
               />
             )}
 
@@ -767,6 +858,7 @@ export default function App() {
                 onRename={(e) => void handleRemoteRename(e)}
                 onDelete={(e) => void handleRemoteDelete(e)}
                 onTransfer={(e) => void handleDownloadEntry(e, true)}
+                onCopyPath={(p) => pushToast(`已复制远程路径：${p}`, "info")}
                 onUploadFromPicker={() => void handleUploadFromPicker()}
                 onUploadFolderFromPicker={() => void handleUploadFolderFromPicker()}
                 onDropEntryFromOtherPane={(e) => void handleUploadEntry(e)}
@@ -776,12 +868,12 @@ export default function App() {
             ) : (
               <section className="pane">
                 <div className="empty-state">
-                  <div className="brand-mark" style={{ width: 44, height: 44, borderRadius: 12 }}>
-                    <Server size={22} />
+                  <div className="brand-mark" style={{ width: 48, height: 48, borderRadius: 13 }}>
+                    <Server size={24} />
                   </div>
                   <div className="empty-title">极简、安全的现代文件传输工作台</div>
                   <p className="empty-desc">
-                    选择一种访问方式新建连接，或在顶部地址栏直接输入 URI 一键直连。原生 x64 构架，全面支持现代加密与云存储。
+                    选择一种协议快速新建连接，或按 <kbd className="kbd-hint">Ctrl K</kbd> 在顶部直连栏输入 URI 一键连接。纯 Rust 原生 x64 引擎，零 OpenSSL 依赖。
                   </p>
 
                   <div className="quick-proto-grid">
@@ -791,9 +883,14 @@ export default function App() {
                         setSiteModal({ open: true, editing: null, defaultProtocol: "sftp" })
                       }
                     >
-                      <Lock size={18} color="#059669" />
+                      <div
+                        className="quick-proto-icon"
+                        style={{ background: "rgba(16, 185, 129, 0.14)", color: "#059669" }}
+                      >
+                        <Lock size={17} />
+                      </div>
                       <h4>SFTP / SSH 终端</h4>
-                      <p>Ed25519 / Curve25519 / 密钥登录与远程命令行</p>
+                      <p>Ed25519 · ProxyJump 跳板机 · TOFU 指纹校验</p>
                     </button>
 
                     <button
@@ -802,7 +899,12 @@ export default function App() {
                         setSiteModal({ open: true, editing: null, defaultProtocol: "s3" })
                       }
                     >
-                      <Cloud size={18} color="#7c3aed" />
+                      <div
+                        className="quick-proto-icon"
+                        style={{ background: "rgba(124, 58, 237, 0.14)", color: "#7c3aed" }}
+                      >
+                        <Cloud size={17} />
+                      </div>
                       <h4>S3 兼容对象存储</h4>
                       <p>AWS S3 · 阿里云 OSS · 腾讯云 COS · MinIO · R2</p>
                     </button>
@@ -817,9 +919,14 @@ export default function App() {
                         })
                       }
                     >
-                      <Server size={18} color="#2563eb" />
+                      <div
+                        className="quick-proto-icon"
+                        style={{ background: "rgba(37, 99, 235, 0.14)", color: "#2563eb" }}
+                      >
+                        <Server size={17} />
+                      </div>
                       <h4>FTPS / FTP</h4>
-                      <p>TLS 1.2 / TLS 1.3 现代加密传输（显式/隐式）</p>
+                      <p>纯 Rust TLS 1.2 / TLS 1.3 现代加密传输</p>
                     </button>
 
                     <button
@@ -828,10 +935,26 @@ export default function App() {
                         setSiteModal({ open: true, editing: null, defaultProtocol: "webdav" })
                       }
                     >
-                      <Globe size={18} color="#0891b2" />
+                      <div
+                        className="quick-proto-icon"
+                        style={{ background: "rgba(8, 145, 178, 0.14)", color: "#0891b2" }}
+                      >
+                        <Globe size={17} />
+                      </div>
                       <h4>WebDAV / 网盘</h4>
                       <p>Nextcloud · Alist · 群晖 NAS · Bearer Token</p>
                     </button>
+                  </div>
+
+                  <div className="empty-tips">
+                    <span className="empty-tip-pill">
+                      <ShieldCheck size={12} color="var(--success)" />
+                      系统原生凭据库托管
+                    </span>
+                    <span className="empty-tip-pill">
+                      <Sparkles size={12} color="var(--accent)" />
+                      支持系统文件夹拖放递归上传
+                    </span>
                   </div>
                 </div>
               </section>
@@ -860,6 +983,40 @@ export default function App() {
           )}
         </main>
       </div>
+
+      {/* 底部现代桌面状态栏 */}
+      <footer className="status-bar">
+        <span className="status-bar-item">
+          <span className={`status-dot ${activeSession ? "online" : ""}`} />
+          {activeSession
+            ? `已连接 · ${PROTOCOL_META[activeSession.protocol].short} · ${activeSession.host}`
+            : "就绪 · 未连接远程站点"}
+        </span>
+
+        <span className="status-bar-item tabular-nums">
+          {dualPane ? `本地 ${localEntries.length} 项` : ""}
+          {dualPane && activeSession ? " · " : ""}
+          {activeSession ? `远程 ${remoteEntries.length} 项` : ""}
+        </span>
+
+        <div className="status-bar-right">
+          <button
+            className="status-bar-btn tabular-nums"
+            onClick={() => {
+              setTransferOpen((v) => !v);
+              if (!transferOpen) setTerminalOpen(false);
+            }}
+            title="展开或收起传输队列"
+          >
+            <ArrowDownUp size={12} color={activeTransferCount > 0 ? "var(--accent)" : undefined} />
+            {activeTransferCount > 0
+              ? `传输中 ${activeTransferCount}${totalTransferSpeed > 0 ? ` · ${formatBytes(totalTransferSpeed)}/s` : ""}`
+              : `传输队列 (${transfers.length})`}
+          </button>
+
+          <span className="status-bar-item">Ctrl+K 直连 · F5 刷新</span>
+        </div>
+      </footer>
 
       {siteModal.open && (
         <SiteModal
@@ -898,7 +1055,14 @@ export default function App() {
         <div className="toast-container">
           {toasts.map((t) => (
             <div key={t.id} className={`toast ${t.kind}`}>
-              {t.text}
+              {t.kind === "success" ? (
+                <CheckCircle2 size={15} color="var(--success)" style={{ flexShrink: 0 }} />
+              ) : t.kind === "error" ? (
+                <AlertCircle size={15} color="var(--danger)" style={{ flexShrink: 0 }} />
+              ) : (
+                <Info size={15} color="var(--accent)" style={{ flexShrink: 0 }} />
+              )}
+              <span>{t.text}</span>
             </div>
           ))}
         </div>

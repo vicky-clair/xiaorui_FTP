@@ -7,7 +7,7 @@
 
 import React, { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { FolderOpen, KeyRound, Network, X } from "lucide-react";
+import { Cloud, FolderOpen, Globe, KeyRound, Lock, Network, Server, Shield, X } from "lucide-react";
 import { api } from "../api/tauri";
 import {
   PROTOCOL_META,
@@ -160,6 +160,23 @@ export const SiteModal: React.FC<SiteModalProps> = ({
     }
   };
 
+  // 按 Esc 快捷键关闭弹窗
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !submitting) onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose, submitting]);
+
+  const PROTO_TABS: { id: Protocol; label: string; icon: React.ReactNode }[] = [
+    { id: "sftp", label: "SFTP", icon: <Lock size={14} /> },
+    { id: "ftps_explicit", label: "FTPS", icon: <Shield size={14} /> },
+    { id: "ftp", label: "FTP", icon: <Server size={14} /> },
+    { id: "s3", label: "S3 对象", icon: <Cloud size={14} /> },
+    { id: "webdav", label: "WebDAV", icon: <Globe size={14} /> },
+  ];
+
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
@@ -172,22 +189,51 @@ export const SiteModal: React.FC<SiteModalProps> = ({
 
         <div className="modal-body">
           <div className="form-grid">
-            <div className="form-field">
+            <div className="form-field full">
               <label>协议类型</label>
-              <select
-                className="form-input"
-                value={protocol}
-                onChange={(e) => handleProtocolChange(e.target.value as Protocol)}
-              >
-                {(Object.keys(PROTOCOL_META) as Protocol[]).map((p) => (
-                  <option key={p} value={p}>
-                    {PROTOCOL_META[p].label}
-                  </option>
-                ))}
-              </select>
+              <div className="proto-segment-grid">
+                {PROTO_TABS.map((item) => {
+                  const active =
+                    protocol === item.id ||
+                    (item.id === "ftps_explicit" && protocol === "ftps_implicit");
+                  return (
+                    <button
+                      key={item.id}
+                      type="button"
+                      className={`proto-segment-btn ${active ? "active" : ""}`}
+                      onClick={() => handleProtocolChange(item.id)}
+                    >
+                      {item.icon}
+                      <span>{item.label}</span>
+                    </button>
+                  );
+                })}
+              </div>
+              {(protocol === "ftps_explicit" || protocol === "ftps_implicit") && (
+                <div style={{ display: "flex", gap: 14, marginTop: 4 }}>
+                  <label className="checkbox-row">
+                    <input
+                      type="radio"
+                      name="ftpsMode"
+                      checked={protocol === "ftps_explicit"}
+                      onChange={() => handleProtocolChange("ftps_explicit")}
+                    />
+                    显式 TLS (端口 21，推荐)
+                  </label>
+                  <label className="checkbox-row">
+                    <input
+                      type="radio"
+                      name="ftpsMode"
+                      checked={protocol === "ftps_implicit"}
+                      onChange={() => handleProtocolChange("ftps_implicit")}
+                    />
+                    隐式 TLS (端口 990)
+                  </label>
+                </div>
+              )}
             </div>
 
-            <div className="form-field">
+            <div className="form-field full">
               <label>站点名称</label>
               <input
                 className="form-input"

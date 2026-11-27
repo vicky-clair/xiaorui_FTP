@@ -1,21 +1,35 @@
 /**
  * 通用文件浏览面板组件（同时服务于左侧「本地」与右侧「远程」视图）
  *
- * 支持路径栏直达、返回上级、关键字过滤、单/多选拖拽互传、系统文件/文件夹拖放提示遮罩，
- * 以及新建目录、上传文件/文件夹、选择保存位置下载、在线编辑、CHMOD 权限修改、重命名与删除。
+ * 现代桌面交互能力：
+ * - 可交互路径面包屑（逐级点击跳转，点击空白处切换为手输路径直达）
+ * - 点击列头按名称 / 大小 / 修改时间升降序排序（目录始终优先置顶）
+ * - 语义化文件类型图标 + 权限标签
+ * - 右键上下文菜单（上传/下载、在线编辑、修改权限、复制路径、重命名、删除）
+ * - 支持双栏拖拽互传、系统文件/文件夹拖放上传遮罩与 F2/Delete 键盘快捷键
  */
 
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
+  ArrowDown,
   ArrowUp,
+  ChevronRight,
+  Copy,
   Download,
+  FileArchive,
+  FileAudio,
   FileCode2,
+  FileImage,
+  FileJson,
+  FileSpreadsheet,
   FileText,
+  FileVideo,
   Folder,
   FolderPlus,
   FolderUp,
   Pencil,
   RefreshCw,
+  Search,
   Shield,
   Trash2,
   Upload,
@@ -32,17 +46,33 @@ interface FilePaneProps {
   canTransfer: boolean;
   supportsChmod?: boolean;
   externalDropActive?: boolean;
+  style?: React.CSSProperties;
   onNavigate: (path: string) => void;
   onRefresh: () => void;
   onMkdir: () => void;
   onRename: (entry: FileEntry) => void;
   onDelete: (entry: FileEntry) => void;
   onTransfer: (entry: FileEntry) => void;
+  onCopyPath?: (path: string) => void;
   onUploadFromPicker?: () => void;
   onUploadFolderFromPicker?: () => void;
   onDropEntryFromOtherPane?: (entry: FileEntry) => void;
   onEditFile?: (entry: FileEntry) => void;
   onChmod?: (entry: FileEntry) => void;
+}
+
+type SortKey = "name" | "size" | "modified";
+type SortDir = "asc" | "desc";
+
+interface BreadcrumbSegment {
+  label: string;
+  path: string;
+}
+
+interface ContextMenuState {
+  x: number;
+  y: number;
+  entry: FileEntry;
 }
 
 /** 应用内双栏拖拽传输使用的自定义 MIME 类型 */
@@ -66,6 +96,106 @@ function getParentPath(path: string, mode: "local" | "remote"): string {
   return /^[A-Za-z]:$/.test(parent) ? `${parent}\\` : parent;
 }
 
+/** 将 POSIX 或 Windows 路径解析为可点击的面包屑段 */
+function parseBreadcrumbs(path: string, mode: "local" | "remote"): BreadcrumbSegment[] {
+  if (!path) return [];
+  if (mode === "remote") {
+    const clean = path.replace(/\/+$/, "");
+    const segs: BreadcrumbSegment[] = [{ label: "/", path: "/" }];
+    if (!clean || clean === "/") return segs;
+    const parts = clean.split("/").filter(Boolean);
+    let acc = "";
+    for (const part of parts) {
+      acc += `/${part}`;
+      segs.push({ label: part, path: acc });
+    }
+    return segs;
+  }
+
+  // Windows 本地路径（如 C:\Users\name\Documents）
+  if (/^[A-Za-z]:/.test(path)) {
+    const drive = path.slice(0, 2);
+    const rest = path.slice(2).replace(/^[\\/]+/, "").replace(/[\\/]+$/, "");
+    const segs: BreadcrumbSegment[] = [{ label: `${drive}\\`, path: `${drive}\\` }];
+    if (!rest) return segs;
+    const parts = rest.split(/[\\/]+/).filter(Boolean);
+    let acc = `${drive}\\`;
+    for (const part of parts) {
+      acc = acc.endsWith("\\") ? `${acc}${part}` : `${acc}\\${part}`;
+      segs.push({ label: part, path: acc });
+    }
+    return segs;
+  }
+
+  // Unix 本地路径
+  const clean = path.replace(/\/+$/, "");
+  const segs: BreadcrumbSegment[] = [{ label: "/", path: "/" }];
+  if (!clean || clean === "/") return segs;
+  const parts = clean.split("/").filter(Boolean);
+  let acc = "";
+  for (const part of parts) {
+    acc += `/${part}`;
+    segs.push({ label: part, path: acc });
+  }
+  return segs;
+}
+
+/** 根据文件扩展名返回语义化图标，提升列表可扫描性 */
+function renderFileIcon(entry: FileEntry): React.ReactNode {
+  if (entry.isDir) {
+    return <Folder size={15} color="var(--accent)" style={{ flexShrink: 0 }} />;
+  }
+  const dot = entry.name.lastIndexOf(".");
+  const ext = dot >= 0 ? entry.name.slice(dot + 1).toLowerCase() : "";
+
+  if (["json", "jsonc", "toml", "yaml", "yml", "xml", "ini", "env", "conf"].includes(ext)) {
+    return <FileJson size={15} color="#d97706" style={{ flexShrink: 0 }} />;
+  }
+  if (
+    [
+      "ts",
+      "tsx",
+      "js",
+      "jsx",
+      "rs",
+      "py",
+      "go",
+      "java",
+      "c",
+      "cpp",
+      "h",
+      "cs",
+      "sh",
+      "ps1",
+      "sql",
+      "html",
+      "css",
+      "scss",
+      "vue",
+      "php",
+      "rb",
+    ].includes(ext)
+  ) {
+    return <FileCode2 size={15} color="#2563eb" style={{ flexShrink: 0 }} />;
+  }
+  if (["png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "bmp", "avif"].includes(ext)) {
+    return <FileImage size={15} color="#059669" style={{ flexShrink: 0 }} />;
+  }
+  if (["zip", "tar", "gz", "tgz", "bz2", "xz", "7z", "rar", "zst"].includes(ext)) {
+    return <FileArchive size={15} color="#7c3aed" style={{ flexShrink: 0 }} />;
+  }
+  if (["mp4", "mkv", "mov", "avi", "webm", "flv"].includes(ext)) {
+    return <FileVideo size={15} color="#db2777" style={{ flexShrink: 0 }} />;
+  }
+  if (["mp3", "wav", "flac", "ogg", "m4a", "aac"].includes(ext)) {
+    return <FileAudio size={15} color="#0891b2" style={{ flexShrink: 0 }} />;
+  }
+  if (["csv", "xlsx", "xls", "parquet"].includes(ext)) {
+    return <FileSpreadsheet size={15} color="#16a34a" style={{ flexShrink: 0 }} />;
+  }
+  return <FileText size={15} color="var(--text-muted)" style={{ flexShrink: 0 }} />;
+}
+
 export const FilePane: React.FC<FilePaneProps> = ({
   mode,
   title,
@@ -76,12 +206,14 @@ export const FilePane: React.FC<FilePaneProps> = ({
   canTransfer,
   supportsChmod,
   externalDropActive,
+  style,
   onNavigate,
   onRefresh,
   onMkdir,
   onRename,
   onDelete,
   onTransfer,
+  onCopyPath,
   onUploadFromPicker,
   onUploadFolderFromPicker,
   onDropEntryFromOtherPane,
@@ -89,29 +221,92 @@ export const FilePane: React.FC<FilePaneProps> = ({
   onChmod,
 }) => {
   const [pathInput, setPathInput] = useState(currentPath);
+  const [editingPath, setEditingPath] = useState(false);
   const [filter, setFilter] = useState("");
+  const [sortKey, setSortKey] = useState<SortKey>("name");
+  const [sortDir, setSortDir] = useState<SortDir>("asc");
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [internalDragOver, setInternalDragOver] = useState(false);
+  const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
 
-  React.useEffect(() => {
+  const pathInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
     setPathInput(currentPath);
   }, [currentPath]);
 
-  const filtered = useMemo(() => {
+  useEffect(() => {
+    if (editingPath) {
+      requestAnimationFrame(() => {
+        pathInputRef.current?.focus();
+        pathInputRef.current?.select();
+      });
+    }
+  }, [editingPath]);
+
+  // 点击空白、滚动或按 Esc 时关闭右键菜单
+  useEffect(() => {
+    if (!contextMenu) return;
+    const close = () => setContextMenu(null);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") close();
+    };
+    window.addEventListener("click", close);
+    window.addEventListener("scroll", close, true);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("scroll", close, true);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [contextMenu]);
+
+  const breadcrumbs = useMemo(
+    () => parseBreadcrumbs(currentPath, mode),
+    [currentPath, mode]
+  );
+
+  /** 过滤并按当前列头排序（文件夹始终排在文件之前） */
+  const sortedEntries = useMemo(() => {
     const q = filter.trim().toLowerCase();
-    if (!q) return entries;
-    return entries.filter((e) => e.name.toLowerCase().includes(q));
-  }, [entries, filter]);
+    const base = q
+      ? entries.filter((e) => e.name.toLowerCase().includes(q))
+      : [...entries];
+
+    const factor = sortDir === "asc" ? 1 : -1;
+    base.sort((a, b) => {
+      if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+      if (sortKey === "size") {
+        return (a.size - b.size) * factor || a.name.localeCompare(b.name);
+      }
+      if (sortKey === "modified") {
+        return ((a.modified ?? 0) - (b.modified ?? 0)) * factor || a.name.localeCompare(b.name);
+      }
+      return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }) * factor;
+    });
+    return base;
+  }, [entries, filter, sortKey, sortDir]);
 
   const selectedEntry = useMemo(
     () => entries.find((e) => e.path === selectedPath) ?? null,
     [entries, selectedPath]
   );
 
+  const toggleSort = (key: SortKey) => {
+    if (sortKey === key) {
+      setSortDir((d) => (d === "asc" ? "desc" : "asc"));
+    } else {
+      setSortKey(key);
+      setSortDir(key === "name" ? "asc" : "desc");
+    }
+  };
+
   const handlePathSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (pathInput.trim()) {
-      onNavigate(pathInput.trim());
+    const target = pathInput.trim();
+    setEditingPath(false);
+    if (target && target !== currentPath) {
+      onNavigate(target);
     }
   };
 
@@ -153,18 +348,59 @@ export const FilePane: React.FC<FilePaneProps> = ({
     }
   };
 
+  const handleRowContextMenu = (e: React.MouseEvent, entry: FileEntry) => {
+    e.preventDefault();
+    setSelectedPath(entry.path);
+    const menuWidth = 196;
+    const menuHeight = 220;
+    const x = Math.min(e.clientX, window.innerWidth - menuWidth - 10);
+    const y = Math.min(e.clientY, window.innerHeight - menuHeight - 10);
+    setContextMenu({ x: Math.max(8, x), y: Math.max(8, y), entry });
+  };
+
+  const handlePaneKeyDown = (e: React.KeyboardEvent<HTMLElement>) => {
+    const tag = (e.target as HTMLElement | null)?.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+    if (!selectedEntry) return;
+    if (e.key === "F2") {
+      e.preventDefault();
+      onRename(selectedEntry);
+    } else if (e.key === "Delete") {
+      e.preventDefault();
+      onDelete(selectedEntry);
+    }
+  };
+
+  const handleCopyPath = async (path: string) => {
+    try {
+      await navigator.clipboard.writeText(path);
+      onCopyPath?.(path);
+    } catch {
+      // clipboard API unavailable
+    }
+  };
+
+  const renderSortIcon = (key: SortKey) => {
+    if (sortKey !== key) return null;
+    return sortDir === "asc" ? <ArrowUp size={11} /> : <ArrowDown size={11} />;
+  };
+
   const showDropOverlay = Boolean(externalDropActive) || internalDragOver;
 
   return (
     <section
       className="pane"
-      style={{ position: "relative" }}
+      tabIndex={0}
+      style={{ position: "relative", ...style }}
+      onKeyDown={handlePaneKeyDown}
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
     >
       <div className="pane-toolbar">
-        <span className="pane-title-chip">{title}</span>
+        <span className={`pane-title-chip ${mode === "remote" ? "remote" : ""}`} title={title}>
+          {title}
+        </span>
 
         {mode === "local" && roots && roots.length > 0 && (
           <select
@@ -194,16 +430,58 @@ export const FilePane: React.FC<FilePaneProps> = ({
           <ArrowUp size={15} />
         </button>
 
-        <form onSubmit={handlePathSubmit} style={{ flex: 1, display: "flex", minWidth: 0 }}>
-          <input
-            className="path-bar"
-            value={pathInput}
-            onChange={(e) => setPathInput(e.target.value)}
-            title="输入路径按回车跳转"
-          />
-        </form>
+        {/* 可交互路径面包屑，点击空白处切换为手输路径 */}
+        {editingPath ? (
+          <form onSubmit={handlePathSubmit} style={{ flex: 1, display: "flex", minWidth: 0 }}>
+            <input
+              ref={pathInputRef}
+              className="path-bar"
+              value={pathInput}
+              onChange={(e) => setPathInput(e.target.value)}
+              onBlur={() => setEditingPath(false)}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") {
+                  setPathInput(currentPath);
+                  setEditingPath(false);
+                }
+              }}
+              title="输入路径按回车跳转，Esc 取消"
+            />
+          </form>
+        ) : (
+          <div
+            className="breadcrumb-bar"
+            title="点击任意目录层级跳转，或点击空白处直接输入路径"
+            onClick={() => setEditingPath(true)}
+          >
+            {breadcrumbs.map((seg, idx) => {
+              const isLast = idx === breadcrumbs.length - 1;
+              return (
+                <React.Fragment key={seg.path}>
+                  {idx > 0 && (
+                    <span className="breadcrumb-sep">
+                      <ChevronRight size={12} />
+                    </span>
+                  )}
+                  <button
+                    type="button"
+                    className={`breadcrumb-seg ${isLast ? "current" : ""}`}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      if (!isLast) onNavigate(seg.path);
+                      else setEditingPath(true);
+                    }}
+                  >
+                    {seg.label}
+                  </button>
+                </React.Fragment>
+              );
+            })}
+            <span className="breadcrumb-spacer" />
+          </div>
+        )}
 
-        <button className="icon-btn" onClick={onRefresh} title="刷新">
+        <button className="icon-btn" onClick={onRefresh} title="刷新 (F5)">
           <RefreshCw size={14} className={loading ? "spin" : ""} />
         </button>
 
@@ -250,18 +528,21 @@ export const FilePane: React.FC<FilePaneProps> = ({
       </div>
 
       <div className="pane-subbar">
-        <input
-          className="pane-filter"
-          value={filter}
-          onChange={(e) => setFilter(e.target.value)}
-          placeholder="过滤当前目录..."
-        />
-        <span className="pane-status">
+        <div className="pane-filter-wrap">
+          <Search size={12} color="var(--text-muted)" />
+          <input
+            className="pane-filter"
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
+            placeholder="过滤当前目录..."
+          />
+        </div>
+        <span className="pane-status tabular-nums">
           {loading
             ? "加载中..."
             : mode === "remote"
-              ? `${filtered.length} 项 · 支持拖放文件/文件夹上传`
-              : `${filtered.length} 项`}
+              ? `${sortedEntries.length} 项 · 支持右键菜单与拖放上传`
+              : `${sortedEntries.length} 项`}
         </span>
       </div>
 
@@ -269,39 +550,66 @@ export const FilePane: React.FC<FilePaneProps> = ({
         <table className="file-table">
           <thead>
             <tr>
-              <th style={{ width: "44%" }}>名称</th>
-              <th style={{ width: "16%" }}>大小</th>
-              <th style={{ width: "22%" }}>修改时间</th>
+              <th style={{ width: "45%" }}>
+                <button
+                  type="button"
+                  className={`th-sort-btn ${sortKey === "name" ? "active" : ""}`}
+                  onClick={() => toggleSort("name")}
+                >
+                  名称 {renderSortIcon("name")}
+                </button>
+              </th>
+              <th style={{ width: "15%" }}>
+                <button
+                  type="button"
+                  className={`th-sort-btn ${sortKey === "size" ? "active" : ""}`}
+                  onClick={() => toggleSort("size")}
+                >
+                  大小 {renderSortIcon("size")}
+                </button>
+              </th>
+              <th style={{ width: "22%" }}>
+                <button
+                  type="button"
+                  className={`th-sort-btn ${sortKey === "modified" ? "active" : ""}`}
+                  onClick={() => toggleSort("modified")}
+                >
+                  修改时间 {renderSortIcon("modified")}
+                </button>
+              </th>
               <th style={{ width: "18%", textAlign: "right" }}>操作</th>
             </tr>
           </thead>
           <tbody>
-            {filtered.length === 0 ? (
+            {sortedEntries.length === 0 ? (
               <tr>
                 <td
                   colSpan={4}
                   style={{
                     textAlign: "center",
-                    padding: "36px 12px",
+                    padding: "40px 12px",
                     color: "var(--text-muted)",
                     borderBottom: "none",
                   }}
                 >
                   {loading
                     ? "正在读取目录..."
-                    : mode === "remote"
-                      ? "目录为空，可直接从系统拖入文件或文件夹上传"
-                      : "目录为空"}
+                    : filter
+                      ? "没有匹配当前过滤条件的文件"
+                      : mode === "remote"
+                        ? "目录为空，可直接从系统拖入文件或文件夹上传"
+                        : "目录为空"}
                 </td>
               </tr>
             ) : (
-              filtered.map((entry) => (
+              sortedEntries.map((entry) => (
                 <tr
                   key={entry.path}
                   className={`file-row ${selectedPath === entry.path ? "selected" : ""}`}
                   draggable={canTransfer}
                   onDragStart={(e) => handleDragStart(e, entry)}
                   onClick={() => setSelectedPath(entry.path)}
+                  onContextMenu={(e) => handleRowContextMenu(e, entry)}
                   onDoubleClick={() => {
                     if (entry.isDir) {
                       onNavigate(entry.path);
@@ -314,18 +622,20 @@ export const FilePane: React.FC<FilePaneProps> = ({
                 >
                   <td>
                     <div className="file-name-cell" title={entry.path}>
-                      {entry.isDir ? (
-                        <Folder size={15} color="var(--accent)" style={{ flexShrink: 0 }} />
-                      ) : (
-                        <FileText size={15} color="var(--text-muted)" style={{ flexShrink: 0 }} />
-                      )}
+                      {renderFileIcon(entry)}
                       <span className="file-name-text">{entry.name}</span>
+                      {mode === "remote" && entry.permissions && (
+                        <span className="file-perm-chip">{entry.permissions}</span>
+                      )}
                     </div>
                   </td>
-                  <td style={{ color: "var(--text-secondary)" }}>
+                  <td className="tabular-nums" style={{ color: "var(--text-secondary)" }}>
                     {entry.isDir ? "—" : formatBytes(entry.size)}
                   </td>
-                  <td style={{ color: "var(--text-secondary)", fontSize: 12 }}>
+                  <td
+                    className="tabular-nums"
+                    style={{ color: "var(--text-secondary)", fontSize: 12 }}
+                  >
                     {formatTime(entry.modified)}
                   </td>
                   <td style={{ textAlign: "right" }} onClick={(e) => e.stopPropagation()}>
@@ -371,7 +681,7 @@ export const FilePane: React.FC<FilePaneProps> = ({
                       <button
                         className="icon-btn"
                         style={{ width: 24, height: 24 }}
-                        title="重命名"
+                        title="重命名 (F2)"
                         onClick={() => onRename(entry)}
                       >
                         <Pencil size={13} />
@@ -379,7 +689,7 @@ export const FilePane: React.FC<FilePaneProps> = ({
                       <button
                         className="icon-btn btn-danger"
                         style={{ width: 24, height: 24 }}
-                        title="删除"
+                        title="删除 (Delete)"
                         onClick={() => onDelete(entry)}
                       >
                         <Trash2 size={13} />
@@ -392,6 +702,101 @@ export const FilePane: React.FC<FilePaneProps> = ({
           </tbody>
         </table>
       </div>
+
+      {/* 原生风格右键上下文菜单 */}
+      {contextMenu && (
+        <div
+          className="context-menu"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          {contextMenu.entry.isDir && (
+            <button
+              className="context-menu-item"
+              onClick={() => {
+                onNavigate(contextMenu.entry.path);
+                setContextMenu(null);
+              }}
+            >
+              <Folder size={14} color="var(--accent)" />
+              打开文件夹
+            </button>
+          )}
+          {canTransfer && (
+            <button
+              className="context-menu-item"
+              onClick={() => {
+                onTransfer(contextMenu.entry);
+                setContextMenu(null);
+              }}
+            >
+              {mode === "local" ? <Upload size={14} /> : <Download size={14} />}
+              {mode === "local"
+                ? contextMenu.entry.isDir
+                  ? "递归上传文件夹"
+                  : "上传到远程"
+                : contextMenu.entry.isDir
+                  ? "递归下载文件夹..."
+                  : "下载并选择保存位置..."}
+            </button>
+          )}
+          {mode === "remote" && !contextMenu.entry.isDir && onEditFile && (
+            <button
+              className="context-menu-item"
+              onClick={() => {
+                onEditFile(contextMenu.entry);
+                setContextMenu(null);
+              }}
+            >
+              <FileCode2 size={14} />
+              在线查看 / 编辑
+            </button>
+          )}
+          {mode === "remote" && supportsChmod && onChmod && (
+            <button
+              className="context-menu-item"
+              onClick={() => {
+                onChmod(contextMenu.entry);
+                setContextMenu(null);
+              }}
+            >
+              <Shield size={14} />
+              修改权限 (CHMOD)
+            </button>
+          )}
+          <div className="context-menu-sep" />
+          <button
+            className="context-menu-item"
+            onClick={() => {
+              void handleCopyPath(contextMenu.entry.path);
+              setContextMenu(null);
+            }}
+          >
+            <Copy size={14} />
+            复制完整路径
+          </button>
+          <button
+            className="context-menu-item"
+            onClick={() => {
+              onRename(contextMenu.entry);
+              setContextMenu(null);
+            }}
+          >
+            <Pencil size={14} />
+            重命名
+          </button>
+          <button
+            className="context-menu-item danger"
+            onClick={() => {
+              onDelete(contextMenu.entry);
+              setContextMenu(null);
+            }}
+          >
+            <Trash2 size={14} />
+            删除
+          </button>
+        </div>
+      )}
 
       {showDropOverlay && (
         <div className="drop-overlay">

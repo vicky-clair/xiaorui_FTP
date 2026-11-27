@@ -1,8 +1,8 @@
 /**
  * 左侧可折叠站点收藏夹侧边栏
  *
- * 支持按关键字即时搜索站点、按分组展示、点击一键连接、编辑/删除站点，
- * 以及站点列表的本地 JSON 备份导出与导入。
+ * 支持按关键字即时搜索站点、按分组展示与计数、显示当前在线状态与跳板机标记、
+ * 点击一键连接、编辑/删除站点，以及站点备份导入导出与 SSH 已知主机管理入口。
  */
 
 import React, { useMemo, useState } from "react";
@@ -12,6 +12,7 @@ import { PROTOCOL_META, type SiteConfig } from "../types";
 interface SiteSidebarProps {
   sites: SiteConfig[];
   connectingSiteId: string | null;
+  connectedKeys?: Set<string>;
   onConnect: (site: SiteConfig) => void;
   onEdit: (site: SiteConfig) => void;
   onDelete: (site: SiteConfig) => void;
@@ -23,6 +24,7 @@ interface SiteSidebarProps {
 export const SiteSidebar: React.FC<SiteSidebarProps> = ({
   sites,
   connectingSiteId,
+  connectedKeys,
   onConnect,
   onEdit,
   onDelete,
@@ -59,11 +61,11 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
     <aside className="sidebar">
       <div className="sidebar-header">
         <div className="search-box">
-          <Search size={14} color="var(--text-muted)" />
+          <Search size={13} color="var(--text-muted)" />
           <input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="搜索站点..."
+            placeholder="搜索站点、主机或协议..."
           />
         </div>
       </div>
@@ -72,7 +74,7 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
         {grouped.length === 0 ? (
           <div
             style={{
-              padding: "28px 12px",
+              padding: "32px 12px",
               textAlign: "center",
               color: "var(--text-muted)",
               fontSize: 12,
@@ -85,14 +87,20 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
         ) : (
           grouped.map(([group, list]) => (
             <div key={group}>
-              <div className="site-group-label">{group}</div>
+              <div className="site-group-label">
+                <span>{group}</span>
+                <span className="site-group-count">{list.length}</span>
+              </div>
               {list.map((site) => {
                 const meta = PROTOCOL_META[site.protocol];
                 const isBusy = connectingSiteId === site.id;
+                const isConnected = Boolean(
+                  connectedKeys?.has(`${site.protocol}:${site.host}`)
+                );
                 return (
                   <div
                     key={site.id}
-                    className="site-item"
+                    className={`site-item ${isConnected ? "connected" : ""}`}
                     onClick={() => !isBusy && onConnect(site)}
                     title={`点击连接 ${site.host}:${site.port}${site.jumpHost ? ` (跳板机: ${site.jumpHost})` : ""}`}
                   >
@@ -101,7 +109,13 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
                     </span>
                     <div className="site-item-info">
                       <div className="site-item-name">
-                        {isBusy ? `连接中... ${site.name}` : site.name}
+                        {isConnected && (
+                          <span className="status-dot online" title="当前已连接" />
+                        )}
+                        <span className="site-item-name-text">
+                          {isBusy ? `连接中... ${site.name}` : site.name}
+                        </span>
+                        {site.jumpHost && <span className="site-jump-tag">跳板</span>}
                       </div>
                       <div className="site-item-sub">
                         {site.protocol === "s3"

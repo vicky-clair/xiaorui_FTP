@@ -31,14 +31,23 @@ export const TransferDrawer: React.FC<TransferDrawerProps> = ({
   onClearFinished,
   onClose,
 }) => {
+  const activeCount = tasks.filter(
+    (t) => t.status === "running" || t.status === "queued"
+  ).length;
+  const doneCount = tasks.filter((t) => t.status === "completed").length;
+
   return (
     <div className="bottom-drawer">
       <div className="drawer-header">
-        <span>传输队列 ({tasks.length})</span>
+        <span>传输队列</span>
+        <span className={`drawer-pill ${activeCount > 0 ? "active" : ""}`}>
+          进行中 {activeCount}
+        </span>
+        <span className="drawer-pill">已完成 {doneCount}</span>
         <div style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
           <button className="btn btn-sm btn-ghost" onClick={onClearFinished}>
             <Trash2 size={12} />
-            清除已完成
+            清除已结束
           </button>
           <button className="icon-btn" style={{ width: 24, height: 24 }} onClick={onClose}>
             <X size={14} />
@@ -99,12 +108,18 @@ export const TransferDrawer: React.FC<TransferDrawerProps> = ({
                   </div>
                 </div>
 
-                <span style={{ color: "var(--text-secondary)", textAlign: "right" }}>
+                <span
+                  className="tabular-nums"
+                  style={{ color: "var(--text-secondary)", textAlign: "right" }}
+                >
                   {formatBytes(t.transferredBytes)}
                   {t.totalBytes > 0 ? ` / ${formatBytes(t.totalBytes)}` : ""}
                 </span>
 
-                <span style={{ color: "var(--text-muted)", textAlign: "right" }}>
+                <span
+                  className="tabular-nums"
+                  style={{ color: "var(--text-muted)", textAlign: "right" }}
+                >
                   {t.status === "running" && t.speedBps > 0
                     ? `${formatBytes(t.speedBps)}/s`
                     : STATUS_LABEL[t.status]}
