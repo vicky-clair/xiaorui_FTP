@@ -984,7 +984,7 @@ echo "DISKS_END"
     }
 }
 
-/// 过滤 Linux/macOS 伪文件系统与系统临时挂载点，仅保留真实业务磁盘
+/// 过滤 Linux/macOS 伪文件系统、内核引导分区与容器/系统临时挂载点，仅保留真实业务磁盘
 fn is_ignored_fs(fs_type: Option<&str>, dev: &str, mount: &str) -> bool {
     if let Some(t) = fs_type {
         let lt = t.to_ascii_lowercase();
@@ -1006,11 +1006,16 @@ fn is_ignored_fs(fs_type: Option<&str>, dev: &str, mount: &str) -> bool {
                 | "fuse.lxcfs"
                 | "nsfs"
                 | "ramfs"
+                | "iso9660"
         ) {
             return true;
         }
     }
-    if dev.starts_with("tmpfs") || dev.starts_with("devtmpfs") || dev.starts_with("overlay") {
+    if dev.starts_with("tmpfs")
+        || dev.starts_with("devtmpfs")
+        || dev.starts_with("overlay")
+        || dev.starts_with("/dev/loop")
+    {
         return true;
     }
     mount.starts_with("/snap/")
@@ -1018,7 +1023,12 @@ fn is_ignored_fs(fs_type: Option<&str>, dev: &str, mount: &str) -> bool {
         || mount.starts_with("/dev")
         || mount.starts_with("/sys")
         || mount.starts_with("/proc")
-        || mount == "/boot/efi"
+        || mount == "/boot"
+        || mount.starts_with("/boot/")
+        || mount.starts_with("/var/lib/docker/")
+        || mount.starts_with("/var/lib/containerd/")
+        || mount.starts_with("/var/lib/kubelet/")
+        || mount.starts_with("/etc/")
 }
 
 /// 解析 POSIX 或 Windows 远端硬件与多磁盘采集输出
@@ -1035,6 +1045,8 @@ pub fn parse_server_metrics(raw: &str) -> Option<ServerMetrics> {
     let mut mem_total_bytes: u64 = 0;
     let mut disks: Vec<RemoteDisk> = Vec::new();
     let mut seen_mounts = std::collections::HashSet::new();
+    // 同一物理块设备（如 /dev/sda1）在多处 bind 挂载时仅保留主挂载点，防止 1 块盘被重复计为多盘
+    let mut seen_devs: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut in_disks = false;
 
     for raw_line in raw.lines() {
@@ -1105,41 +1117,63 @@ pub fn parse_server_metrics(raw: &str) -> Option<ServerMetrics> {
         // POSIX `df -kP -T` (7+ 列: fs type 1024-blocks used avail cap% mount...)
         // 或 `df -kP` (6+ 列: fs 1024-blocks used avail cap% mount...)
         let cols: Vec<&str> = line.split_whitespace().collect();
-        if cols.len() >= 7 && cols[2].parse::<u64>().is_ok() && cols[3].parse::<u64>().is_ok() {
-            let dev = cols[0];
-            let fs_type = cols[1];
-            let total = cols[2].parse::<u64>().unwrap_or(0).saturating_mul(1024);
-            let used = cols[3].parse::<u64>().unwrap_or(0).saturating_mul(1024);
-            let avail = cols[4].parse::<u64>().unwrap_or(0).saturating_mul(1024);
-            let cap: u8 = cols[5].trim_end_matches('%').parse().unwrap_or(0).min(100);
-            let mount = cols[6..].join(" ");
-            if total == 0 || is_ignored_fs(Some(fs_type), dev, &mount) {
-                continue;
-            }
-            if seen_mounts.insert(mount.clone()) {
-                disks.push(RemoteDisk {
-                    label: mount.clone(),
-                    mount_path: mount,
-                    total_bytes: total,
-                    used_bytes: used,
-                    avail_bytes: avail,
-                    use_percent: cap,
-                });
-            }
+        let parsed_posix = if cols.len() >= 7
+            && cols[2].parse::<u64>().is_ok()
+            && cols[3].parse::<u64>().is_ok()
+        {
+            Some((
+                cols[0],
+                Some(cols[1]),
+                cols[2].parse::<u64>().unwrap_or(0).saturating_mul(1024),
+                cols[3].parse::<u64>().unwrap_or(0).saturating_mul(1024),
+                cols[4].parse::<u64>().unwrap_or(0).saturating_mul(1024),
+                cols[5]
+                    .trim_end_matches('%')
+                    .parse::<u8>()
+                    .unwrap_or(0)
+                    .min(100),
+                cols[6..].join(" "),
+            ))
         } else if cols.len() >= 6
             && cols[1].parse::<u64>().is_ok()
             && cols[2].parse::<u64>().is_ok()
         {
-            let dev = cols[0];
-            let total = cols[1].parse::<u64>().unwrap_or(0).saturating_mul(1024);
-            let used = cols[2].parse::<u64>().unwrap_or(0).saturating_mul(1024);
-            let avail = cols[3].parse::<u64>().unwrap_or(0).saturating_mul(1024);
-            let cap: u8 = cols[4].trim_end_matches('%').parse().unwrap_or(0).min(100);
-            let mount = cols[5..].join(" ");
-            if total == 0 || is_ignored_fs(None, dev, &mount) {
+            Some((
+                cols[0],
+                None,
+                cols[1].parse::<u64>().unwrap_or(0).saturating_mul(1024),
+                cols[2].parse::<u64>().unwrap_or(0).saturating_mul(1024),
+                cols[3].parse::<u64>().unwrap_or(0).saturating_mul(1024),
+                cols[4]
+                    .trim_end_matches('%')
+                    .parse::<u8>()
+                    .unwrap_or(0)
+                    .min(100),
+                cols[5..].join(" "),
+            ))
+        } else {
+            None
+        };
+
+        if let Some((dev, fs_type, total, used, avail, cap, mount)) = parsed_posix {
+            if total == 0 || is_ignored_fs(fs_type, dev, &mount) {
                 continue;
             }
+            if dev.starts_with("/dev/") {
+                if let Some(&idx) = seen_devs.get(dev) {
+                    // 若新挂载点是 `/` 或路径更短，则替换为主挂载点，避免同一块盘重复列出
+                    if mount == "/" || mount.len() < disks[idx].mount_path.len() {
+                        disks[idx].label = mount.clone();
+                        disks[idx].mount_path = mount;
+                    }
+                    continue;
+                }
+            }
             if seen_mounts.insert(mount.clone()) {
+                let idx = disks.len();
+                if dev.starts_with("/dev/") {
+                    seen_devs.insert(dev.to_string(), idx);
+                }
                 disks.push(RemoteDisk {
                     label: mount.clone(),
                     mount_path: mount,
@@ -1202,6 +1236,8 @@ MEM=4294967296:17179869184
 DISKS_BEGIN
 tmpfs tmpfs 1638400 1200 1637200 1% /run
 /dev/sda1 ext4 52428800 20971520 31457280 40% /
+/dev/sda1 ext4 52428800 20971520 31457280 40% /var/bind-root
+/dev/sda2 ext4 1048576 204800 843776 20% /boot
 /dev/sdb1 xfs 1048576000 629145600 419430400 60% /data
 /dev/loop0 squashfs 102400 102400 0 100% /snap/core20/123
 DISKS_END

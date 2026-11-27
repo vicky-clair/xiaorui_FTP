@@ -13,6 +13,8 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowDown,
   ArrowUp,
+  Check,
+  ChevronDown,
   ChevronRight,
   Copy,
   Download,
@@ -27,6 +29,7 @@ import {
   Folder,
   FolderPlus,
   FolderUp,
+  HardDrive,
   Pencil,
   RefreshCw,
   Search,
@@ -235,6 +238,7 @@ export const FilePane: React.FC<FilePaneProps> = ({
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [internalDragOver, setInternalDragOver] = useState(false);
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
+  const [diskMenuOpen, setDiskMenuOpen] = useState(false);
 
   const pathInputRef = useRef<HTMLInputElement>(null);
 
@@ -243,7 +247,41 @@ export const FilePane: React.FC<FilePaneProps> = ({
     setSelectedPath(null);
     setEditingPath(false);
     setContextMenu(null);
+    setDiskMenuOpen(false);
   }, [currentPath]);
+
+  // 点击空白或按 Esc 关闭磁盘选择浮层
+  useEffect(() => {
+    if (!diskMenuOpen) return;
+    const close = () => setDiskMenuOpen(false);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") close();
+    };
+    window.addEventListener("click", close);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [diskMenuOpen]);
+
+  /** 匹配当前远程路径所属磁盘（最长挂载前缀优先） */
+  const activeRemoteDisk = useMemo(() => {
+    if (!remoteDisks || remoteDisks.length === 0) return null;
+    const norm = currentPath || "/";
+    let best: RemoteDisk | null = null;
+    for (const d of remoteDisks) {
+      const mp =
+        d.mountPath.endsWith("/") && d.mountPath.length > 1
+          ? d.mountPath.slice(0, -1)
+          : d.mountPath;
+      const matches = mp === "/" || norm === mp || norm.startsWith(`${mp}/`);
+      if (matches && (!best || mp.length > best.mountPath.length)) {
+        best = d;
+      }
+    }
+    return best ?? remoteDisks[0];
+  }, [remoteDisks, currentPath]);
 
   useEffect(() => {
     if (editingPath) {
@@ -421,6 +459,7 @@ export const FilePane: React.FC<FilePaneProps> = ({
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
     >
+      {/* 第一行：面板标识、磁盘/位置切换与主操作按钮（绝不挤压路径栏或裁切按钮） */}
       <div className="pane-toolbar">
         <span className={`pane-title-chip ${mode === "remote" ? "remote" : ""}`} title={title}>
           {title}
@@ -433,10 +472,10 @@ export const FilePane: React.FC<FilePaneProps> = ({
             onChange={(e) => {
               if (e.target.value) onNavigate(e.target.value);
             }}
-            title="快速切换本地位置"
+            title="快速切换本地位置或盘符"
           >
             <option value="" disabled>
-              位置...
+              切换位置...
             </option>
             {roots.map((r) => (
               <option key={r.path} value={r.path}>
@@ -447,31 +486,131 @@ export const FilePane: React.FC<FilePaneProps> = ({
         )}
 
         {mode === "remote" && remoteDisks && remoteDisks.length > 0 && (
-          <select
-            className="root-select remote-disk-select"
-            value=""
-            onChange={(e) => {
-              if (e.target.value) onNavigate(e.target.value);
-            }}
-            title="快速切换远端服务器磁盘 / 挂载点"
-          >
-            <option value="" disabled>
-              磁盘 ({remoteDisks.length})...
-            </option>
-            {remoteDisks.map((d) => (
-              <option key={d.mountPath} value={d.mountPath}>
-                {d.label} · {d.usePercent}% ({formatBytes(d.usedBytes)} / {formatBytes(d.totalBytes)})
-              </option>
-            ))}
-          </select>
+          <div className="disk-popover-wrap" onClick={(e) => e.stopPropagation()}>
+            <button
+              type="button"
+              className={`disk-trigger-btn ${diskMenuOpen ? "active" : ""}`}
+              onClick={() => setDiskMenuOpen((v) => !v)}
+              title="点击查看或切换远端服务器磁盘 / 挂载点"
+            >
+              <HardDrive size={12} />
+              <span className="disk-trigger-label">
+                {activeRemoteDisk ? activeRemoteDisk.label : "/"}
+              </span>
+              {remoteDisks.length > 1 && (
+                <span className="disk-count-tag tabular-nums">{remoteDisks.length}盘</span>
+              )}
+              <ChevronDown size={12} />
+            </button>
+
+            {diskMenuOpen && (
+              <div className="disk-popover">
+                <div className="disk-popover-header">
+                  远端磁盘与挂载点（共 {remoteDisks.length} 个）
+                </div>
+                {remoteDisks.map((d) => {
+                  const isCurrent = activeRemoteDisk?.mountPath === d.mountPath;
+                  const levelClass =
+                    d.usePercent >= 90 ? "hot" : d.usePercent >= 78 ? "warn" : "";
+                  return (
+                    <button
+                      key={d.mountPath}
+                      type="button"
+                      className={`disk-option ${isCurrent ? "current" : ""}`}
+                      onClick={() => {
+                        setDiskMenuOpen(false);
+                        onNavigate(d.mountPath);
+                      }}
+                    >
+                      <div className="disk-option-top">
+                        <span className="disk-option-name">
+                          <HardDrive size={13} color={isCurrent ? "var(--accent)" : undefined} />
+                          <span>{d.label}</span>
+                        </span>
+                        <span className="disk-option-pct tabular-nums">
+                          {d.usePercent}%
+                          {isCurrent && <Check size={12} color="var(--accent)" />}
+                        </span>
+                      </div>
+                      <div className="disk-option-bar">
+                        <div
+                          className={`disk-option-fill ${levelClass}`}
+                          style={{ width: `${d.usePercent}%` }}
+                        />
+                      </div>
+                      <div className="disk-option-sub tabular-nums">
+                        已用 {formatBytes(d.usedBytes)} / {formatBytes(d.totalBytes)} · 剩余{" "}
+                        {formatBytes(d.availBytes)}
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
         )}
 
+        <div className="pane-toolbar-actions">
+          <button type="button" className="icon-btn" onClick={onRefresh} title="刷新 (F5)">
+            <RefreshCw size={14} className={loading ? "spin" : ""} />
+          </button>
+
+          <button type="button" className="icon-btn" onClick={onMkdir} title="新建文件夹">
+            <FolderPlus size={15} />
+          </button>
+
+          {mode === "remote" && onUploadFolderFromPicker && (
+            <button
+              type="button"
+              className="icon-btn"
+              onClick={onUploadFolderFromPicker}
+              title="选择本地文件夹递归上传"
+            >
+              <FolderUp size={15} />
+            </button>
+          )}
+
+          {mode === "remote" && (
+            <button
+              type="button"
+              className="btn btn-sm btn-outline"
+              disabled={!selectedEntry}
+              onClick={() => selectedEntry && onTransfer(selectedEntry)}
+              title={
+                selectedEntry
+                  ? `下载「${selectedEntry.name}」并选择保存位置`
+                  : "先在下方选中文件或文件夹，即可点击选择位置下载"
+              }
+            >
+              <Download size={13} />
+              下载
+            </button>
+          )}
+
+          {mode === "remote" && onUploadFromPicker && (
+            <button
+              type="button"
+              className="btn btn-sm btn-primary"
+              onClick={onUploadFromPicker}
+              title="选择本地文件上传到当前远程目录"
+            >
+              <Upload size={13} />
+              上传
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* 第二行：独立全宽路径面包屑导航 + 目录即时过滤 */}
+      <div className="pane-subbar">
         <button
+          type="button"
           className="icon-btn"
+          style={{ width: 26, height: 26 }}
           onClick={() => onNavigate(getParentPath(currentPath, mode))}
           title="返回上级目录"
         >
-          <ArrowUp size={15} />
+          <ArrowUp size={14} />
         </button>
 
         {/* 可交互路径面包屑，点击空白处切换为手输路径 */}
@@ -525,68 +664,18 @@ export const FilePane: React.FC<FilePaneProps> = ({
           </div>
         )}
 
-        <button className="icon-btn" onClick={onRefresh} title="刷新 (F5)">
-          <RefreshCw size={14} className={loading ? "spin" : ""} />
-        </button>
-
-        <button className="icon-btn" onClick={onMkdir} title="新建文件夹">
-          <FolderPlus size={15} />
-        </button>
-
-        {mode === "remote" && onUploadFolderFromPicker && (
-          <button
-            className="icon-btn"
-            onClick={onUploadFolderFromPicker}
-            title="选择本地文件夹递归上传"
-          >
-            <FolderUp size={15} />
-          </button>
-        )}
-
-        {mode === "remote" && (
-          <button
-            className="btn btn-sm btn-outline"
-            disabled={!selectedEntry}
-            onClick={() => selectedEntry && onTransfer(selectedEntry)}
-            title={
-              selectedEntry
-                ? `下载「${selectedEntry.name}」并选择保存位置`
-                : "先在下方选中文件或文件夹，即可点击选择位置下载"
-            }
-          >
-            <Download size={13} />
-            下载
-          </button>
-        )}
-
-        {mode === "remote" && onUploadFromPicker && (
-          <button
-            className="btn btn-sm btn-primary"
-            onClick={onUploadFromPicker}
-            title="选择本地文件上传到当前远程目录"
-          >
-            <Upload size={13} />
-            上传
-          </button>
-        )}
-      </div>
-
-      <div className="pane-subbar">
         <div className="pane-filter-wrap">
           <Search size={12} color="var(--text-muted)" />
           <input
             className="pane-filter"
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
-            placeholder="过滤当前目录..."
+            placeholder="过滤..."
           />
         </div>
+
         <span className="pane-status tabular-nums">
-          {loading
-            ? "加载中..."
-            : mode === "remote"
-              ? `${sortedEntries.length} 项 · 支持右键菜单与拖放上传`
-              : `${sortedEntries.length} 项`}
+          {loading ? "加载中..." : `${sortedEntries.length} 项`}
         </span>
       </div>
 
