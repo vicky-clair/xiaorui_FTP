@@ -151,4 +151,4 @@ npm run tauri:build:mac64    # macOS x64 (DMG)
 npm run tauri:build:linux64  # Linux x64 (AppImage / DEB)
 ```
 
-更多架构设计与模块接口细节请参阅 [docs/DEVELOPMENT_PLAN.md](docs/DEVELOPMENT_PLAN.md)。
+更多架构设计与模块接口细节请参阅 [docs/DEVELOPMENT_PLAN.md](docs/DEVELOPMENT_PLAN.md)；与主流商业 FTP 软件（FlashFXP / SmartFTP / CuteFTP / Wing FTP Server）的对照分析请参阅 [docs/COMPETITIVE_COMPARISON.md](docs/COMPETITIVE_COMPARISON.md)。
