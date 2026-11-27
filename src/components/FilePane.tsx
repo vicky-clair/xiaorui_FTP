@@ -233,6 +233,9 @@ export const FilePane: React.FC<FilePaneProps> = ({
 
   useEffect(() => {
     setPathInput(currentPath);
+    setSelectedPath(null);
+    setEditingPath(false);
+    setContextMenu(null);
   }, [currentPath]);
 
   useEffect(() => {
@@ -375,8 +378,22 @@ export const FilePane: React.FC<FilePaneProps> = ({
     try {
       await navigator.clipboard.writeText(path);
       onCopyPath?.(path);
+      return;
     } catch {
-      // clipboard API unavailable
+      // 回退到临时 textarea 复制，兼容受限 WebView 环境
+    }
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = path;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      document.body.removeChild(ta);
+      onCopyPath?.(path);
+    } catch {
+      // ignore
     }
   };
 

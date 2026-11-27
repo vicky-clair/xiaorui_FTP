@@ -42,11 +42,17 @@ impl SiteStore {
         Ok(sites)
     }
 
-    /// 将站点列表写回磁盘
+    /// 原子方式将站点列表写回磁盘（先写临时文件再替换，避免异常中断损坏 sites.json）
     fn write_all(&self, sites: &[SiteConfig]) -> AppResult<()> {
         let json = serde_json::to_string_pretty(sites)
             .map_err(|e| AppError::Storage(format!("序列化站点配置失败: {}", e)))?;
-        std::fs::write(&self.sites_file, json)?;
+        let tmp = self.sites_file.with_extension("json.tmp");
+        std::fs::write(&tmp, &json)?;
+        if std::fs::rename(&tmp, &self.sites_file).is_err() {
+            // Windows 目标文件存在时回退覆盖写入并清理临时文件
+            std::fs::write(&self.sites_file, &json)?;
+            let _ = std::fs::remove_file(&tmp);
+        }
         Ok(())
     }
 
@@ -123,7 +129,11 @@ impl SiteStore {
         let cfg = SiteConfig {
             id: id.clone(),
             name: if input.name.trim().is_empty() {
-                format!("{}@{}", input.username, input.host)
+                if input.username.trim().is_empty() {
+                    input.host.trim().to_string()
+                } else {
+                    format!("{}@{}", input.username.trim(), input.host.trim())
+                }
             } else {
                 input.name.trim().to_string()
             },

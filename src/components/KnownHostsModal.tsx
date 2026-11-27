@@ -37,6 +37,14 @@ export const KnownHostsModal: React.FC<KnownHostsModalProps> = ({
     void refresh();
   }, []);
 
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
   const handleRemove = async (hostPort: string) => {
     try {
       await api.removeKnownHost(hostPort);

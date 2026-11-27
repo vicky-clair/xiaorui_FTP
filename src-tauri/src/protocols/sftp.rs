@@ -413,21 +413,30 @@ impl SftpClient {
                 jh.username.trim().to_string()
             };
 
-            // 1. 连接并认证跳板机（独立校验跳板机主机指纹）
+            // 1. 连接并认证跳板机（带 20 秒超时保护，独立校验跳板机主机指纹）
             let jump_mismatch = Arc::new(std::sync::Mutex::new(None));
             let jump_handler =
                 ClientHandler::new(jump_host_port, known_hosts.clone(), jump_mismatch.clone());
-            let jump_sess = client::connect(config.clone(), jump_sock, jump_handler)
-                .await
-                .map_err(|e| {
-                    if let Ok(Some(msg)) = jump_mismatch.lock().map(|g| g.clone()) {
-                        return AppError::Auth(msg);
-                    }
-                    AppError::Connection(format!(
-                        "无法连接 SSH 跳板机 {}:{}: {}",
-                        jump_host, jh.port, e
-                    ))
-                })?;
+            let jump_sess = tokio::time::timeout(
+                Duration::from_secs(20),
+                client::connect(config.clone(), jump_sock, jump_handler),
+            )
+            .await
+            .map_err(|_| {
+                AppError::Connection(format!(
+                    "连接 SSH 跳板机 {}:{} 超时（20 秒）",
+                    jump_host, jh.port
+                ))
+            })?
+            .map_err(|e| {
+                if let Ok(Some(msg)) = jump_mismatch.lock().map(|g| g.clone()) {
+                    return AppError::Auth(msg);
+                }
+                AppError::Connection(format!(
+                    "无法连接 SSH 跳板机 {}:{}: {}",
+                    jump_host, jh.port, e
+                ))
+            })?;
 
             let jump_sess = tokio::spawn(authenticate_handle(
                 jump_sess,
@@ -460,31 +469,46 @@ impl SftpClient {
             // 3. 在隧道流之上建立目标主机 SSH 加密连接并校验目标主机指纹
             let target_handler =
                 ClientHandler::new(target_host_port, known_hosts, target_mismatch.clone());
-            let target_sess = client::connect_stream(config, tunnel.into_stream(), target_handler)
-                .await
-                .map_err(|e| {
-                    if let Ok(Some(msg)) = target_mismatch.lock().map(|g| g.clone()) {
-                        return AppError::Auth(msg);
-                    }
-                    AppError::Connection(format!(
-                        "经由跳板机连接目标主机 {}:{} 失败: {}",
-                        target_host, port, e
-                    ))
-                })?;
+            let target_sess = tokio::time::timeout(
+                Duration::from_secs(20),
+                client::connect_stream(config, tunnel.into_stream(), target_handler),
+            )
+            .await
+            .map_err(|_| {
+                AppError::Connection(format!(
+                    "经由跳板机连接目标主机 {}:{} 超时（20 秒）",
+                    target_host, port
+                ))
+            })?
+            .map_err(|e| {
+                if let Ok(Some(msg)) = target_mismatch.lock().map(|g| g.clone()) {
+                    return AppError::Auth(msg);
+                }
+                AppError::Connection(format!(
+                    "经由跳板机连接目标主机 {}:{} 失败: {}",
+                    target_host, port, e
+                ))
+            })?;
 
             (Some(jump_sess), target_sess)
         } else {
             let target_sock = resolve_socket_addr(target_host.clone(), port).await?;
             let target_handler =
                 ClientHandler::new(target_host_port, known_hosts, target_mismatch.clone());
-            let direct_sess = client::connect(config, target_sock, target_handler)
-                .await
-                .map_err(|e| {
-                    if let Ok(Some(msg)) = target_mismatch.lock().map(|g| g.clone()) {
-                        return AppError::Auth(msg);
-                    }
-                    AppError::Connection(format!("无法连接 SSH {}:{}: {}", target_host, port, e))
-                })?;
+            let direct_sess = tokio::time::timeout(
+                Duration::from_secs(20),
+                client::connect(config, target_sock, target_handler),
+            )
+            .await
+            .map_err(|_| {
+                AppError::Connection(format!("连接 SSH {}:{} 超时（20 秒）", target_host, port))
+            })?
+            .map_err(|e| {
+                if let Ok(Some(msg)) = target_mismatch.lock().map(|g| g.clone()) {
+                    return AppError::Auth(msg);
+                }
+                AppError::Connection(format!("无法连接 SSH {}:{}: {}", target_host, port, e))
+            })?;
             (None, direct_sess)
         };
 
@@ -565,15 +589,25 @@ impl RemoteFs for SftpClient {
             }
             let meta = entry.metadata();
             let file_type = entry.file_type();
-            let is_dir = file_type.is_dir();
             let is_symlink = file_type.is_symlink();
+            let full_path = join_remote_path(&norm, &name);
+            // 指向目录的软链接在浏览时按目录展示（仍保留 is_symlink=true 避免递归删除/下载陷入死循环）
+            let is_dir = if is_symlink {
+                self.sftp
+                    .metadata(&full_path)
+                    .await
+                    .map(|m| m.is_dir())
+                    .unwrap_or(false)
+            } else {
+                file_type.is_dir()
+            };
             let mode = meta.permissions;
             let permissions = mode.map(format_unix_mode);
             let modified = meta.mtime.map(|m| m as i64);
             let size = if is_dir { 0 } else { meta.size.unwrap_or(0) };
 
             entries.push(FileEntry {
-                path: join_remote_path(&norm, &name),
+                path: full_path,
                 name,
                 is_dir,
                 size,
@@ -713,6 +747,8 @@ impl RemoteFs for SftpClient {
 
         loop {
             if cancel.load(Ordering::Relaxed) {
+                drop(local_file);
+                let _ = tokio::fs::remove_file(local_path).await;
                 return Err(AppError::Cancelled);
             }
             let n = remote_file

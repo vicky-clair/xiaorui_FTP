@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use serde::Deserialize;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -23,7 +23,7 @@ use crate::models::{
 };
 use crate::protocols::{connect_protocol, sftp, RemoteFs};
 use crate::storage::{load_secrets, SiteStore};
-use crate::transfer::TransferManager;
+use crate::transfer::{TransferManager, TRANSFER_EVENT};
 
 /// 活跃远程会话实例（包含元数据与协议适配器句柄）
 pub struct ActiveSession {
@@ -597,6 +597,15 @@ pub async fn enqueue_download(
     while let Some((cur_remote, cur_local)) = stack.pop() {
         let entries = fs.list_dir(&cur_remote).await?;
         for entry in entries {
+            // 防御异常服务端返回 `..` 或带路径分隔符的文件名造成目录穿越
+            if entry.name.is_empty()
+                || entry.name == "."
+                || entry.name == ".."
+                || entry.name.contains('/')
+                || entry.name.contains('\\')
+            {
+                continue;
+            }
             let next_local = cur_local.join(&entry.name);
             if entry.is_dir && !entry.is_symlink {
                 tokio::fs::create_dir_all(&next_local).await?;
@@ -628,10 +637,17 @@ pub async fn list_transfers(state: State<'_, AppState>) -> AppResult<Vec<Transfe
     Ok(state.transfers.list().await)
 }
 
-/// 取消指定传输任务
+/// 取消指定传输任务并立即通知前端刷新队列状态
 #[tauri::command]
-pub async fn cancel_transfer(state: State<'_, AppState>, task_id: String) -> AppResult<()> {
-    state.transfers.cancel(&task_id).await
+pub async fn cancel_transfer(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    task_id: String,
+) -> AppResult<()> {
+    if let Some(task) = state.transfers.cancel(&task_id).await? {
+        let _ = app.emit(TRANSFER_EVENT, task);
+    }
+    Ok(())
 }
 
 /// 清理已完成、失败或已取消的历史传输记录

@@ -280,8 +280,13 @@ export default function App() {
             if (payload.paths.length === 0) return;
             try {
               const queued = await api.enqueueUploadPaths(sid, payload.paths, targetDir);
-              setTransferOpen(true);
-              pushToast(`已扫描并加入 ${queued.length} 个上传任务`, "success");
+              if (queued.length > 0) {
+                setTransferOpen(true);
+                pushToast(`已扫描并加入 ${queued.length} 个上传任务`, "success");
+              } else {
+                await loadRemoteDir(sid, targetDir);
+                pushToast("已在远程创建空文件夹", "success");
+              }
             } catch (err) {
               pushToast(String(err), "error");
             }
@@ -374,19 +379,28 @@ export default function App() {
       { confirmLabel: "删除", danger: true }
     );
     if (!ok) return;
-    await api.deleteSite(site.id);
-    setSites((prev) => prev.filter((s) => s.id !== site.id));
-    pushToast(`已删除站点「${site.name}」`);
+    try {
+      await api.deleteSite(site.id);
+      setSites((prev) => prev.filter((s) => s.id !== site.id));
+      pushToast(`已删除站点「${site.name}」`);
+    } catch (err) {
+      pushToast(String(err), "error");
+    }
   };
 
   const handleDisconnect = async (sessionId: string) => {
-    await api.disconnectSession(sessionId);
+    try {
+      await api.disconnectSession(sessionId);
+    } catch (err) {
+      pushToast(String(err), "error");
+    }
     setSessions((prev) => {
       const next = prev.filter((s) => s.sessionId !== sessionId);
       if (activeSessionId === sessionId) {
         const fallback = next[0] ?? null;
         setActiveSessionId(fallback ? fallback.sessionId : null);
         if (fallback) {
+          if (!fallback.supportsShell) setTerminalOpen(false);
           void loadRemoteDir(fallback.sessionId, fallback.currentPath);
         } else {
           setRemoteEntries([]);
@@ -434,13 +448,18 @@ export default function App() {
     if (!activeSession) return;
     try {
       const queued = await api.enqueueUpload(activeSession.sessionId, entry.path, remotePath);
-      setTransferOpen(true);
-      pushToast(
-        entry.isDir
-          ? `已递归加入文件夹「${entry.name}」共 ${queued.length} 个文件上传`
-          : `已加入上传队列：${entry.name}`,
-        "success"
-      );
+      if (queued.length > 0) {
+        setTransferOpen(true);
+        pushToast(
+          entry.isDir
+            ? `已递归加入文件夹「${entry.name}」共 ${queued.length} 个文件上传`
+            : `已加入上传队列：${entry.name}`,
+          "success"
+        );
+      } else if (entry.isDir) {
+        await loadRemoteDir(activeSession.sessionId, remotePath);
+        pushToast(`已在远程创建空文件夹「${entry.name}」`, "success");
+      }
     } catch (err) {
       pushToast(String(err), "error");
     }
@@ -489,13 +508,18 @@ export default function App() {
         });
       }
 
-      setTransferOpen(true);
-      pushToast(
-        entry.isDir
-          ? `已递归加入文件夹「${entry.name}」共 ${queued.length} 个文件下载`
-          : `已加入下载队列：${entry.name}`,
-        "success"
-      );
+      if (queued.length > 0) {
+        setTransferOpen(true);
+        pushToast(
+          entry.isDir
+            ? `已递归加入文件夹「${entry.name}」共 ${queued.length} 个文件下载`
+            : `已加入下载队列：${entry.name}`,
+          "success"
+        );
+      } else if (entry.isDir) {
+        if (localPath) void loadLocalDir(localPath);
+        pushToast(`已在本地创建空文件夹「${entry.name}」`, "success");
+      }
     } catch (err) {
       pushToast(String(err), "error");
     }
@@ -526,8 +550,13 @@ export default function App() {
     const paths = Array.isArray(picked) ? picked : [picked];
     try {
       const queued = await api.enqueueUploadPaths(activeSession.sessionId, paths, remotePath);
-      setTransferOpen(true);
-      pushToast(`已递归扫描并加入 ${queued.length} 个上传任务`, "success");
+      if (queued.length > 0) {
+        setTransferOpen(true);
+        pushToast(`已递归扫描并加入 ${queued.length} 个上传任务`, "success");
+      } else {
+        await loadRemoteDir(activeSession.sessionId, remotePath);
+        pushToast("已在远程创建所选空文件夹", "success");
+      }
     } catch (err) {
       pushToast(String(err), "error");
     }
@@ -679,21 +708,16 @@ export default function App() {
 
   // 全局桌面快捷键：Ctrl+K 聚焦快速直连，Ctrl+N 新建站点，F5 刷新目录
   useEffect(() => {
+    const anyModalOpen = siteModal.open || Boolean(editor) || Boolean(dialog) || knownHostsOpen;
     const onKeyDown = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k" && !anyModalOpen) {
         e.preventDefault();
         quickConnectInputRef.current?.focus();
         quickConnectInputRef.current?.select();
-      } else if (
-        (e.ctrlKey || e.metaKey) &&
-        e.key.toLowerCase() === "n" &&
-        !siteModal.open &&
-        !editor &&
-        !dialog
-      ) {
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "n" && !anyModalOpen) {
         e.preventDefault();
         setSiteModal({ open: true, editing: null, defaultProtocol: "sftp" });
-      } else if (e.key === "F5") {
+      } else if (e.key === "F5" && !anyModalOpen) {
         e.preventDefault();
         if (activeSessionIdRef.current) {
           void loadRemoteDir(activeSessionIdRef.current, remotePathRef.current);
@@ -704,7 +728,7 @@ export default function App() {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [dialog, editor, loadLocalDir, loadRemoteDir, siteModal.open]);
+  }, [dialog, editor, knownHostsOpen, loadLocalDir, loadRemoteDir, siteModal.open]);
 
   // 拖拽双栏分割条实时调整左右宽度
   const handleStartResize = (e: React.MouseEvent) => {
@@ -787,6 +811,7 @@ export default function App() {
                     className={`session-tab ${isActive ? "active" : ""}`}
                     onClick={() => {
                       setActiveSessionId(s.sessionId);
+                      if (!s.supportsShell) setTerminalOpen(false);
                       void loadRemoteDir(s.sessionId, s.currentPath);
                     }}
                   >
@@ -970,10 +995,20 @@ export default function App() {
           {transferOpen && (
             <TransferDrawer
               tasks={transfers}
-              onCancel={(id) => void api.cancelTransfer(id)}
+              onCancel={async (id) => {
+                try {
+                  await api.cancelTransfer(id);
+                } catch (err) {
+                  pushToast(String(err), "error");
+                }
+              }}
               onClearFinished={async () => {
-                await api.clearFinishedTransfers();
-                setTransfers(await api.listTransfers());
+                try {
+                  await api.clearFinishedTransfers();
+                  setTransfers(await api.listTransfers());
+                } catch (err) {
+                  pushToast(String(err), "error");
+                }
               }}
               onClose={() => setTransferOpen(false)}
             />
@@ -1026,6 +1061,7 @@ export default function App() {
 
       {siteModal.open && (
         <SiteModal
+          key={siteModal.editing?.id ?? siteModal.defaultProtocol}
           initial={siteModal.editing}
           defaultProtocol={siteModal.defaultProtocol}
           onClose={() => setSiteModal((s) => ({ ...s, open: false }))}
@@ -1039,9 +1075,14 @@ export default function App() {
           initialContent={editor.content}
           onClose={() => setEditor(null)}
           onSave={async (nextContent) => {
-            await api.remoteWriteText(activeSession.sessionId, editor.path, nextContent);
-            await loadRemoteDir(activeSession.sessionId, remotePath);
-            pushToast(`已保存并回传 ${editor.path}`, "success");
+            try {
+              await api.remoteWriteText(activeSession.sessionId, editor.path, nextContent);
+              await loadRemoteDir(activeSession.sessionId, remotePath);
+              pushToast(`已保存并回传 ${editor.path}`, "success");
+            } catch (err) {
+              pushToast(String(err), "error");
+              throw err;
+            }
           }}
         />
       )}

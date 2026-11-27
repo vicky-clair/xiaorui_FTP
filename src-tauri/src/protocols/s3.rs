@@ -79,6 +79,7 @@ impl S3Client {
         }
 
         let http = Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(20))
             .danger_accept_invalid_certs(tls_skip_verify)
             .user_agent("xiaorui_FTP/1.0")
             .build()
@@ -589,16 +590,37 @@ impl RemoteFs for S3Client {
             }
         }
 
-        all_entries.sort_by(|a, b| {
+        // 按 path 去重（防止目录占位对象与 CommonPrefixes 同时返回造成重复条目）
+        let mut deduped: std::collections::HashMap<String, FileEntry> =
+            std::collections::HashMap::with_capacity(all_entries.len());
+        for entry in all_entries {
+            deduped
+                .entry(entry.path.clone())
+                .and_modify(|existing| {
+                    if entry.is_dir && !existing.is_dir {
+                        *existing = entry.clone();
+                    } else if existing.modified.is_none() && entry.modified.is_some() {
+                        existing.modified = entry.modified;
+                    }
+                })
+                .or_insert(entry);
+        }
+        let mut unique_entries: Vec<FileEntry> = deduped.into_values().collect();
+        unique_entries.sort_by(|a, b| {
             b.is_dir
                 .cmp(&a.is_dir)
                 .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         });
-        Ok(all_entries)
+        Ok(unique_entries)
     }
 
     async fn mkdir(&self, path: &str) -> AppResult<()> {
-        let key = format!("{}/", Self::object_key(path).trim_end_matches('/'));
+        let obj_key = Self::object_key(path);
+        let trimmed = obj_key.trim_end_matches('/');
+        if trimmed.is_empty() {
+            return Err(AppError::InvalidInput("目录名称不能为空".into()));
+        }
+        let key = format!("{}/", trimmed);
         let _ = self
             .send_signed(Method::PUT, &key, &[], Vec::new(), &[])
             .await?;
@@ -733,6 +755,8 @@ impl RemoteFs for S3Client {
 
         while let Some(item) = stream.next().await {
             if cancel.load(Ordering::Relaxed) {
+                drop(file);
+                let _ = tokio::fs::remove_file(local_path).await;
                 return Err(AppError::Cancelled);
             }
             let chunk = item.map_err(|e| AppError::Protocol(format!("下载流中断: {}", e)))?;

@@ -76,6 +76,7 @@ export const SiteModal: React.FC<SiteModalProps> = ({
   const [agentStatus, setAgentStatus] = useState<AgentStatus | null>(null);
   const [saveSecret, setSaveSecret] = useState(true);
   const [submitting, setSubmitting] = useState(false);
+  const [validationError, setValidationError] = useState<string | null>(null);
 
   const needsAgent =
     protocol === "sftp" && (authType === "agent" || (useJump && jumpAuthType === "agent"));
@@ -109,14 +110,44 @@ export const SiteModal: React.FC<SiteModalProps> = ({
   };
 
   const pickKeyFile = async (target: "main" | "jump") => {
-    const selected = await open({
-      multiple: false,
-      title: "选择 SSH 私钥文件 (id_ed25519 / id_rsa / .pem)",
-    });
-    if (typeof selected === "string") {
-      if (target === "main") setPrivateKeyPath(selected);
-      else setJumpPrivateKeyPath(selected);
+    try {
+      const selected = await open({
+        multiple: false,
+        title: "选择 SSH 私钥文件 (id_ed25519 / id_rsa / .pem)",
+      });
+      if (typeof selected === "string") {
+        if (target === "main") setPrivateKeyPath(selected);
+        else setJumpPrivateKeyPath(selected);
+      }
+    } catch (err) {
+      setValidationError(`选择私钥文件失败：${String(err)}`);
     }
+  };
+
+  /** 提交前基础表单校验，避免保存或连接不完整配置 */
+  const validateForm = (): string | null => {
+    if (protocol === "s3") {
+      if (!endpoint.trim()) return "请填写 S3 Endpoint 地址（例如 https://s3.amazonaws.com）";
+      if (!bucket.trim()) return "请填写 S3 Bucket 存储桶名称";
+      return null;
+    }
+    if (protocol === "webdav") {
+      if (!endpoint.trim()) return "请填写 WebDAV 服务完整 URL";
+      return null;
+    }
+    if (!host.trim()) return "请填写服务器主机地址或 IP";
+    const parsedPort = Number(port);
+    if (!Number.isInteger(parsedPort) || parsedPort < 1 || parsedPort > 65535) {
+      return "端口号必须为 1–65535 之间的整数";
+    }
+    if (protocol === "sftp" && useJump) {
+      if (!jumpHost.trim()) return "已启用跳板机，请填写跳板机主机地址";
+      const parsedJumpPort = Number(jumpPort);
+      if (!Number.isInteger(parsedJumpPort) || parsedJumpPort < 1 || parsedJumpPort > 65535) {
+        return "跳板机端口必须为 1–65535 之间的整数";
+      }
+    }
+    return null;
   };
 
   const buildInput = (): SiteInput => ({
@@ -151,6 +182,12 @@ export const SiteModal: React.FC<SiteModalProps> = ({
   });
 
   const submit = async (connectAfter: boolean) => {
+    const errMsg = validateForm();
+    if (errMsg) {
+      setValidationError(errMsg);
+      return;
+    }
+    setValidationError(null);
     setSubmitting(true);
     try {
       await onSaveAndConnect(buildInput(), connectAfter);
@@ -190,6 +227,20 @@ export const SiteModal: React.FC<SiteModalProps> = ({
         </div>
 
         <div className="modal-body">
+          {validationError && (
+            <div
+              style={{
+                padding: "8px 11px",
+                borderRadius: "var(--radius-sm)",
+                background: "var(--danger-soft)",
+                border: "1px solid rgba(220, 38, 38, 0.35)",
+                color: "var(--danger)",
+                fontSize: 12,
+              }}
+            >
+              {validationError}
+            </div>
+          )}
           <div className="form-grid">
             <div className="form-field full">
               <label>协议类型</label>

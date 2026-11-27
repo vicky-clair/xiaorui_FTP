@@ -46,8 +46,8 @@ impl TransferManager {
         self.tasks.read().await.clone()
     }
 
-    /// 取消指定 ID 的排队中或进行中任务
-    pub async fn cancel(&self, task_id: &str) -> AppResult<()> {
+    /// 取消指定 ID 的排队中或进行中任务，若状态发生变更则返回更新后的任务快照供上层广播
+    pub async fn cancel(&self, task_id: &str) -> AppResult<Option<TransferTask>> {
         if let Some(flag) = self.cancels.read().await.get(task_id) {
             flag.store(true, Ordering::Relaxed);
         }
@@ -55,9 +55,11 @@ impl TransferManager {
         if let Some(t) = tasks.iter_mut().find(|t| t.id == task_id) {
             if matches!(t.status, TransferStatus::Queued | TransferStatus::Running) {
                 t.status = TransferStatus::Cancelled;
+                t.speed_bps = 0;
+                return Ok(Some(t.clone()));
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     /// 清除所有已结束（已完成、失败或已取消）的历史任务
@@ -120,6 +122,9 @@ impl TransferManager {
             };
 
             if cancel_flag.load(Ordering::Relaxed) {
+                Self::update_status(&tasks_ref, &app, &task_id, TransferStatus::Cancelled, None)
+                    .await;
+                cancels_ref.write().await.remove(&task_id);
                 return;
             }
 
@@ -151,6 +156,10 @@ impl TransferManager {
                 tokio::spawn(async move {
                     let mut guard = tasks_inner.write().await;
                     if let Some(t) = guard.iter_mut().find(|x| x.id == tid) {
+                        // 仅在仍处于 Running 状态时更新进度，防止延迟回调覆盖已完成或已取消状态
+                        if t.status != TransferStatus::Running {
+                            return;
+                        }
                         t.transferred_bytes = done;
                         t.total_bytes = total.max(t.total_bytes);
                         t.speed_bps = speed;
@@ -277,8 +286,9 @@ mod tests {
         assert_eq!(mgr.list().await.len(), 1);
         assert_eq!(mgr.list().await[0].id, "t-run");
 
-        // 取消进行中任务应同时置位原子取消标志与状态
-        mgr.cancel("t-run").await.unwrap();
+        // 取消进行中任务应同时置位原子取消标志与状态，并返回更新后的任务快照
+        let cancelled = mgr.cancel("t-run").await.unwrap();
+        assert!(cancelled.is_some());
         assert!(flag.load(Ordering::Relaxed));
         assert_eq!(mgr.list().await[0].status, TransferStatus::Cancelled);
 

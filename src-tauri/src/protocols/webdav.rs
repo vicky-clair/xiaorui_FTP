@@ -82,6 +82,7 @@ impl WebDavClient {
         };
 
         let http = Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(20))
             .danger_accept_invalid_certs(tls_skip_verify)
             .user_agent("xiaorui_FTP/1.0")
             .build()
@@ -172,7 +173,11 @@ pub fn parse_propfind_xml(
     let mut modified: Option<i64> = None;
     let mut is_dir = false;
 
-    let base_prefix = base_url_path.trim_end_matches('/');
+    // 先对基础路径做百分号解码，避免含中文/空格的基础 URL 与解码后的 href 前缀失配
+    let base_prefix_decoded = percent_decode_str(base_url_path)
+        .decode_utf8_lossy()
+        .trim_end_matches('/')
+        .to_string();
     let req_norm = normalize_remote_path(requested_remote_path);
 
     loop {
@@ -228,8 +233,10 @@ pub fn parse_propfind_xml(
                     let decoded = percent_decode_str(&raw_path)
                         .decode_utf8_lossy()
                         .to_string();
-                    let stripped = if !base_prefix.is_empty() && decoded.starts_with(base_prefix) {
-                        &decoded[base_prefix.len()..]
+                    let stripped = if !base_prefix_decoded.is_empty() {
+                        decoded
+                            .strip_prefix(base_prefix_decoded.as_str())
+                            .unwrap_or(decoded.as_str())
                     } else {
                         decoded.as_str()
                     };
@@ -237,12 +244,13 @@ pub fn parse_propfind_xml(
                     // 过滤掉当前目录自身，仅保留子项
                     if entry_path != req_norm && entry_path != "/" {
                         let name_only = entry_path.rsplit('/').next().unwrap_or("").to_string();
+                        let entry_is_dir = is_dir || raw_path.ends_with('/');
                         if !name_only.is_empty() {
                             entries.push(FileEntry {
                                 name: name_only,
                                 path: entry_path,
-                                is_dir: is_dir || raw_path.ends_with('/'),
-                                size: if is_dir { 0 } else { size },
+                                is_dir: entry_is_dir,
+                                size: if entry_is_dir { 0 } else { size },
                                 modified,
                                 permissions: None,
                                 mode: None,
@@ -418,6 +426,8 @@ impl RemoteFs for WebDavClient {
 
         while let Some(item) = stream.next().await {
             if cancel.load(Ordering::Relaxed) {
+                drop(file);
+                let _ = tokio::fs::remove_file(local_path).await;
                 return Err(AppError::Cancelled);
             }
             let chunk = item.map_err(|e| AppError::Protocol(format!("下载中断: {}", e)))?;
@@ -521,6 +531,29 @@ mod tests {
         assert!(!entries[1].is_dir);
         assert_eq!(entries[1].name, "hello world.txt");
         assert_eq!(entries[1].size, 512);
+    }
+
+    #[test]
+    fn test_parse_propfind_xml_encoded_chinese_base_path() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+        <d:multistatus xmlns:d="DAV:">
+          <d:response>
+            <d:href>/%E6%88%91%E7%9A%84%E7%BD%91%E7%9B%98/</d:href>
+            <d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop></d:propstat>
+          </d:response>
+          <d:response>
+            <d:href>/%E6%88%91%E7%9A%84%E7%BD%91%E7%9B%98/%E6%96%87%E6%A1%A3.txt</d:href>
+            <d:propstat><d:prop>
+              <d:resourcetype/>
+              <d:getcontentlength>128</d:getcontentlength>
+            </d:prop></d:propstat>
+          </d:response>
+        </d:multistatus>"#;
+        let entries = parse_propfind_xml(xml, "/%E6%88%91%E7%9A%84%E7%BD%91%E7%9B%98", "/");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "文档.txt");
+        assert_eq!(entries[0].path, "/文档.txt");
+        assert_eq!(entries[0].size, 128);
     }
 
     #[test]

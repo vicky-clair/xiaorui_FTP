@@ -11,7 +11,7 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -125,35 +125,41 @@ impl FtpClient {
             .unwrap_or("anonymous@xiaorui-ftp.local")
             .to_string();
 
-        let stream = tokio::task::spawn_blocking(move || -> AppResult<RustlsFtpStream> {
-            let addr = format!("{}:{}", host, port);
-            let mut ftp = match protocol {
-                Protocol::FtpsImplicit => {
-                    let connector = build_rustls_connector(tls_skip_verify)?;
-                    RustlsFtpStream::connect_secure_implicit(&addr, connector, &host)
-                        .map_err(|e| AppError::Connection(format!("隐式 FTPS 连接失败: {}", e)))?
-                }
-                Protocol::FtpsExplicit => {
-                    let connector = build_rustls_connector(tls_skip_verify)?;
-                    let plain = RustlsFtpStream::connect(&addr).map_err(|e| {
+        let stream = tokio::time::timeout(
+            Duration::from_secs(20),
+            tokio::task::spawn_blocking(move || -> AppResult<RustlsFtpStream> {
+                let addr = format!("{}:{}", host, port);
+                let mut ftp = match protocol {
+                    Protocol::FtpsImplicit => {
+                        let connector = build_rustls_connector(tls_skip_verify)?;
+                        RustlsFtpStream::connect_secure_implicit(&addr, connector, &host).map_err(
+                            |e| AppError::Connection(format!("隐式 FTPS 连接失败: {}", e)),
+                        )?
+                    }
+                    Protocol::FtpsExplicit => {
+                        let connector = build_rustls_connector(tls_skip_verify)?;
+                        let plain = RustlsFtpStream::connect(&addr).map_err(|e| {
+                            AppError::Connection(format!("连接 FTP {} 失败: {}", addr, e))
+                        })?;
+                        plain.into_secure(connector, &host).map_err(|e| {
+                            AppError::Connection(format!("FTPS AUTH TLS 握手失败: {}", e))
+                        })?
+                    }
+                    _ => RustlsFtpStream::connect(&addr).map_err(|e| {
                         AppError::Connection(format!("连接 FTP {} 失败: {}", addr, e))
-                    })?;
-                    plain.into_secure(connector, &host).map_err(|e| {
-                        AppError::Connection(format!("FTPS AUTH TLS 握手失败: {}", e))
-                    })?
-                }
-                _ => RustlsFtpStream::connect(&addr)
-                    .map_err(|e| AppError::Connection(format!("连接 FTP {} 失败: {}", addr, e)))?,
-            };
+                    })?,
+                };
 
-            ftp.login(&user, &pass)
-                .map_err(|e| AppError::Auth(format!("FTP 登录失败: {}", e)))?;
-            // 强制二进制传输模式，避免文本换行符被服务端篡改
-            let _ = ftp.transfer_type(FileType::Binary);
-            ftp.set_mode(Mode::ExtendedPassive);
-            Ok(ftp)
-        })
+                ftp.login(&user, &pass)
+                    .map_err(|e| AppError::Auth(format!("FTP 登录失败: {}", e)))?;
+                // 强制二进制传输模式，避免文本换行符被服务端篡改
+                let _ = ftp.transfer_type(FileType::Binary);
+                ftp.set_mode(Mode::ExtendedPassive);
+                Ok(ftp)
+            }),
+        )
         .await
+        .map_err(|_| AppError::Connection("连接 FTP/FTPS 服务器超时（20 秒）".into()))?
         .map_err(|e| AppError::Connection(format!("FTP 连接任务异常: {}", e)))??;
 
         Ok(Self {
@@ -246,13 +252,56 @@ impl RemoteFs for FtpClient {
             let mut ftp = stream
                 .lock()
                 .map_err(|_| AppError::Protocol("锁损坏".into()))?;
-            if is_dir {
-                ftp.rmdir(&norm).map_err(|e| {
-                    AppError::Protocol(format!("删除目录失败（请先清空子项）: {}", e))
-                })?;
-            } else {
+            if !is_dir {
                 ftp.rm(&norm)
                     .map_err(|e| AppError::Protocol(format!("删除文件失败: {}", e)))?;
+                return Ok(());
+            }
+
+            // 先尝试直接删除空目录；若非空则迭代递归清空子文件与子目录后再删除
+            if ftp.rmdir(&norm).is_ok() {
+                return Ok(());
+            }
+
+            let mut to_visit = vec![norm.clone()];
+            let mut dirs_post_order = Vec::new();
+
+            while let Some(dir) = to_visit.pop() {
+                dirs_post_order.push(dir.clone());
+                ftp.cwd(&dir)
+                    .map_err(|e| AppError::Protocol(format!("进入目录 '{}' 失败: {}", dir, e)))?;
+                let lines = match ftp.list(None) {
+                    Ok(l) => l,
+                    Err(_) => {
+                        ftp.set_mode(Mode::Passive);
+                        ftp.list(None).map_err(|e| {
+                            AppError::Protocol(format!("列举目录 '{}' 失败: {}", dir, e))
+                        })?
+                    }
+                };
+                for line in lines {
+                    if let Ok(parsed) = FtpListFile::from_str(&line) {
+                        let name = parsed.name().to_string();
+                        if name == "." || name == ".." || name.is_empty() {
+                            continue;
+                        }
+                        let child_path = join_remote_path(&dir, &name);
+                        if parsed.is_directory() && !parsed.is_symlink() {
+                            to_visit.push(child_path);
+                        } else {
+                            ftp.rm(&child_path).map_err(|e| {
+                                AppError::Protocol(format!("删除文件 '{}' 失败: {}", child_path, e))
+                            })?;
+                        }
+                    }
+                }
+            }
+
+            // 回到根目录避免服务端禁止删除当前工作目录，再由深到浅逐级移除目录
+            let _ = ftp.cwd("/");
+            for dir in dirs_post_order.into_iter().rev() {
+                ftp.rmdir(&dir)
+                    .map_err(|e| AppError::Protocol(format!("删除目录 '{}' 失败: {}", dir, e)))?;
             }
             Ok(())
         })
@@ -380,6 +429,7 @@ impl RemoteFs for FtpClient {
             })
             .map_err(|e| {
                 if cancel.load(Ordering::Relaxed) {
+                    let _ = std::fs::remove_file(&local_pb);
                     AppError::Cancelled
                 } else {
                     AppError::Protocol(format!("FTP 下载失败: {}", e))
