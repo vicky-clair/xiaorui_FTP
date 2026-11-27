@@ -23,30 +23,52 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
 use crate::error::{AppError, AppResult};
-use crate::known_hosts::KnownHostsStore;
+use crate::known_hosts::{HostKeyCheckError, KnownHostsStore};
 use crate::models::{
     format_unix_mode, join_remote_path, normalize_remote_path, AgentStatus, AuthType, FileEntry,
     RemoteDisk, ServerMetrics, ShellOutput,
 };
 use crate::protocols::{ProgressCallback, PtyCommand, PtyHandle, RemoteFs};
+use crate::security::{
+    commit_staging_file, ensure_not_symlink_target, staging_part_path,
+    validate_remote_path_no_control,
+};
 
-/// SSH 客户端事件回调处理器（负责 TOFU 主机公钥指纹固定与变更拦截）
+/// 将主机密钥校验失败转换为结构化 `AppError`，供前端展示首次确认弹窗或阻断性中间人告警
+fn map_host_key_error(err: HostKeyCheckError) -> AppError {
+    match err {
+        HostKeyCheckError::Unknown(u) => {
+            let payload = serde_json::to_string(&u).unwrap_or_else(|_| u.host_port.clone());
+            AppError::HostKeyUnknown(payload)
+        }
+        HostKeyCheckError::Mismatch(m) => {
+            let payload = serde_json::to_string(&m).unwrap_or_else(|_| m.to_string());
+            AppError::HostKeyMismatch(payload)
+        }
+        HostKeyCheckError::StorageCorrupted(msg) => AppError::SecurityPolicy(msg),
+    }
+}
+
+/// SSH 客户端事件回调处理器（严格校验主机公钥指纹：未知主机需显式确认，变更立即阻断）
 struct ClientHandler {
     host_port: String,
+    is_jump_host: bool,
     known_hosts: Arc<KnownHostsStore>,
-    mismatch_error: Arc<std::sync::Mutex<Option<String>>>,
+    host_key_error: Arc<std::sync::Mutex<Option<HostKeyCheckError>>>,
 }
 
 impl ClientHandler {
     fn new(
         host_port: String,
+        is_jump_host: bool,
         known_hosts: Arc<KnownHostsStore>,
-        mismatch_error: Arc<std::sync::Mutex<Option<String>>>,
+        host_key_error: Arc<std::sync::Mutex<Option<HostKeyCheckError>>>,
     ) -> Self {
         Self {
             host_port,
+            is_jump_host,
             known_hosts,
-            mismatch_error,
+            host_key_error,
         }
     }
 }
@@ -55,21 +77,23 @@ impl ClientHandler {
 impl client::Handler for ClientHandler {
     type Error = russh::Error;
 
-    /// 校验远程服务器主机公钥（TOFU：首次信任并持久化，后续不一致时阻断连接）
+    /// 严格校验远程服务器主机公钥（绝不静默接受未知主机或变更密钥）
     async fn check_server_key(
         &mut self,
         server_public_key: &PublicKey,
     ) -> Result<bool, Self::Error> {
         let fingerprint = server_public_key.fingerprint(HashAlg::Sha256).to_string();
         let algorithm = server_public_key.algorithm().to_string();
-        match self
-            .known_hosts
-            .verify_or_trust(&self.host_port, &algorithm, &fingerprint)
-        {
-            Ok(_) => Ok(true),
-            Err(mismatch) => {
-                if let Ok(mut slot) = self.mismatch_error.lock() {
-                    *slot = Some(mismatch.to_string());
+        match self.known_hosts.verify_strict(
+            &self.host_port,
+            &algorithm,
+            &fingerprint,
+            self.is_jump_host,
+        ) {
+            Ok(()) => Ok(true),
+            Err(check_err) => {
+                if let Ok(mut slot) = self.host_key_error.lock() {
+                    *slot = Some(check_err);
                 }
                 Ok(false)
             }
@@ -77,8 +101,8 @@ impl client::Handler for ClientHandler {
     }
 }
 
-/// SSH 跳板机（ProxyJump / Bastion）连接参数
-#[derive(Debug, Clone)]
+/// SSH 跳板机（ProxyJump / Bastion）连接参数（手写脱敏 Debug 并在 Drop 时清零敏感字段）
+#[derive(Clone)]
 pub struct JumpHostConfig {
     pub host: String,
     pub port: u16,
@@ -87,6 +111,34 @@ pub struct JumpHostConfig {
     pub secret: Option<String>,
     pub private_key_path: Option<String>,
     pub passphrase: Option<String>,
+}
+
+impl std::fmt::Debug for JumpHostConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JumpHostConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field("auth_type", &self.auth_type)
+            .field("secret", &self.secret.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "passphrase",
+                &self.passphrase.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
+
+impl Drop for JumpHostConfig {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        if let Some(s) = self.secret.as_mut() {
+            s.zeroize();
+        }
+        if let Some(p) = self.passphrase.as_mut() {
+            p.zeroize();
+        }
+    }
 }
 
 /// 在 Windows 平台上安全连接 Pageant（PuTTY / KeePassXC / 1Password）
@@ -401,9 +453,10 @@ impl SftpClient {
         });
 
         let target_host_port = format!("{}:{}", target_host, port);
-        let target_mismatch = Arc::new(std::sync::Mutex::new(None));
+        let target_key_err: Arc<std::sync::Mutex<Option<HostKeyCheckError>>> =
+            Arc::new(std::sync::Mutex::new(None));
 
-        let (jump_handle, session) = if let Some(jh) = jump {
+        let (jump_handle, session) = if let Some(mut jh) = jump {
             let jump_host = jh.host.trim().to_string();
             let jump_host_port = format!("{}:{}", jump_host, jh.port);
             let jump_sock = resolve_socket_addr(jump_host.clone(), jh.port).await?;
@@ -413,10 +466,15 @@ impl SftpClient {
                 jh.username.trim().to_string()
             };
 
-            // 1. 连接并认证跳板机（带 20 秒超时保护，独立校验跳板机主机指纹）
-            let jump_mismatch = Arc::new(std::sync::Mutex::new(None));
-            let jump_handler =
-                ClientHandler::new(jump_host_port, known_hosts.clone(), jump_mismatch.clone());
+            // 1. 连接并认证跳板机（连接与认证均带 20 秒超时保护，独立严格校验跳板机主机指纹）
+            let jump_key_err: Arc<std::sync::Mutex<Option<HostKeyCheckError>>> =
+                Arc::new(std::sync::Mutex::new(None));
+            let jump_handler = ClientHandler::new(
+                jump_host_port,
+                true,
+                known_hosts.clone(),
+                jump_key_err.clone(),
+            );
             let jump_sess = tokio::time::timeout(
                 Duration::from_secs(20),
                 client::connect(config.clone(), jump_sock, jump_handler),
@@ -429,8 +487,8 @@ impl SftpClient {
                 ))
             })?
             .map_err(|e| {
-                if let Ok(Some(msg)) = jump_mismatch.lock().map(|g| g.clone()) {
-                    return AppError::Auth(msg);
+                if let Ok(Some(hk_err)) = jump_key_err.lock().map(|mut g| g.take()) {
+                    return map_host_key_error(hk_err);
                 }
                 AppError::Connection(format!(
                     "无法连接 SSH 跳板机 {}:{}: {}",
@@ -438,37 +496,57 @@ impl SftpClient {
                 ))
             })?;
 
-            let jump_sess = tokio::spawn(authenticate_handle(
-                jump_sess,
-                format!("跳板机 ({})", jump_host),
-                jump_user,
-                jh.auth_type,
-                jh.secret,
-                jh.private_key_path,
-                jh.passphrase,
-            ))
+            let jump_secret = jh.secret.take();
+            let jump_key_path = jh.private_key_path.take();
+            let jump_passphrase = jh.passphrase.take();
+            let jump_sess = tokio::time::timeout(
+                Duration::from_secs(20),
+                tokio::spawn(authenticate_handle(
+                    jump_sess,
+                    format!("跳板机 ({})", jump_host),
+                    jump_user,
+                    jh.auth_type,
+                    jump_secret,
+                    jump_key_path,
+                    jump_passphrase,
+                )),
+            )
             .await
+            .map_err(|_| {
+                AppError::Auth(format!(
+                    "SSH 跳板机 {}:{} 认证超时（20 秒）",
+                    jump_host, jh.port
+                ))
+            })?
             .map_err(|e| AppError::Auth(format!("跳板机认证任务异常: {}", e)))??;
 
             // 2. 通过跳板机打开到目标主机的直连 TCP 隧道
-            let tunnel = jump_sess
-                .channel_open_direct_tcpip(
+            let tunnel = tokio::time::timeout(
+                Duration::from_secs(20),
+                jump_sess.channel_open_direct_tcpip(
                     target_host.clone(),
                     port as u32,
                     String::from("127.0.0.1"),
                     0,
-                )
-                .await
-                .map_err(|e| {
-                    AppError::Connection(format!(
-                        "跳板机 {} 无法建立到 {}:{} 的直连隧道: {}",
-                        jump_host, target_host, port, e
-                    ))
-                })?;
+                ),
+            )
+            .await
+            .map_err(|_| {
+                AppError::Connection(format!(
+                    "跳板机 {} 打开到 {}:{} 的直连隧道超时（20 秒）",
+                    jump_host, target_host, port
+                ))
+            })?
+            .map_err(|e| {
+                AppError::Connection(format!(
+                    "跳板机 {} 无法建立到 {}:{} 的直连隧道: {}",
+                    jump_host, target_host, port, e
+                ))
+            })?;
 
-            // 3. 在隧道流之上建立目标主机 SSH 加密连接并校验目标主机指纹
+            // 3. 在隧道流之上建立目标主机 SSH 加密连接并严格校验目标主机指纹
             let target_handler =
-                ClientHandler::new(target_host_port, known_hosts, target_mismatch.clone());
+                ClientHandler::new(target_host_port, false, known_hosts, target_key_err.clone());
             let target_sess = tokio::time::timeout(
                 Duration::from_secs(20),
                 client::connect_stream(config, tunnel.into_stream(), target_handler),
@@ -481,8 +559,8 @@ impl SftpClient {
                 ))
             })?
             .map_err(|e| {
-                if let Ok(Some(msg)) = target_mismatch.lock().map(|g| g.clone()) {
-                    return AppError::Auth(msg);
+                if let Ok(Some(hk_err)) = target_key_err.lock().map(|mut g| g.take()) {
+                    return map_host_key_error(hk_err);
                 }
                 AppError::Connection(format!(
                     "经由跳板机连接目标主机 {}:{} 失败: {}",
@@ -494,7 +572,7 @@ impl SftpClient {
         } else {
             let target_sock = resolve_socket_addr(target_host.clone(), port).await?;
             let target_handler =
-                ClientHandler::new(target_host_port, known_hosts, target_mismatch.clone());
+                ClientHandler::new(target_host_port, false, known_hosts, target_key_err.clone());
             let direct_sess = tokio::time::timeout(
                 Duration::from_secs(20),
                 client::connect(config, target_sock, target_handler),
@@ -504,40 +582,53 @@ impl SftpClient {
                 AppError::Connection(format!("连接 SSH {}:{} 超时（20 秒）", target_host, port))
             })?
             .map_err(|e| {
-                if let Ok(Some(msg)) = target_mismatch.lock().map(|g| g.clone()) {
-                    return AppError::Auth(msg);
+                if let Ok(Some(hk_err)) = target_key_err.lock().map(|mut g| g.take()) {
+                    return map_host_key_error(hk_err);
                 }
                 AppError::Connection(format!("无法连接 SSH {}:{}: {}", target_host, port, e))
             })?;
             (None, direct_sess)
         };
 
-        // 认证目标主机
-        let session = tokio::spawn(authenticate_handle(
-            session,
-            format!("目标主机 ({})", target_host),
-            target_user,
-            auth_type,
-            password,
-            private_key_path,
-            passphrase,
-        ))
+        // 认证目标主机（独立 20 秒超时保护）
+        let session = tokio::time::timeout(
+            Duration::from_secs(20),
+            tokio::spawn(authenticate_handle(
+                session,
+                format!("目标主机 ({})", target_host),
+                target_user,
+                auth_type,
+                password,
+                private_key_path,
+                passphrase,
+            )),
+        )
         .await
+        .map_err(|_| {
+            AppError::Auth(format!(
+                "SSH {}:{} 身份认证超时（20 秒）",
+                target_host, port
+            ))
+        })?
         .map_err(|e| AppError::Auth(format!("SSH 认证任务异常: {}", e)))??;
 
-        // 请求启动 SFTP 子系统
-        let channel = session
-            .channel_open_session()
-            .await
-            .map_err(|e| AppError::Protocol(format!("打开 SFTP 通道失败: {}", e)))?;
-        channel
-            .request_subsystem(true, String::from("sftp"))
-            .await
-            .map_err(|e| AppError::Protocol(format!("启动 SFTP 子系统失败: {}", e)))?;
+        // 请求启动 SFTP 子系统（独立 20 秒超时保护）
+        let sftp = tokio::time::timeout(Duration::from_secs(20), async {
+            let channel = session
+                .channel_open_session()
+                .await
+                .map_err(|e| AppError::Protocol(format!("打开 SFTP 通道失败: {}", e)))?;
+            channel
+                .request_subsystem(true, String::from("sftp"))
+                .await
+                .map_err(|e| AppError::Protocol(format!("启动 SFTP 子系统失败: {}", e)))?;
 
-        let sftp = SftpSession::new(channel.into_stream())
-            .await
-            .map_err(|e| AppError::Protocol(format!("初始化 SFTP 会话失败: {}", e)))?;
+            SftpSession::new(channel.into_stream())
+                .await
+                .map_err(|e| AppError::Protocol(format!("初始化 SFTP 会话失败: {}", e)))
+        })
+        .await
+        .map_err(|_| AppError::Protocol("初始化 SFTP 子系统超时（20 秒）".into()))??;
 
         Ok(Self {
             _jump_ssh: jump_handle,
@@ -574,6 +665,7 @@ impl SftpClient {
 #[async_trait]
 impl RemoteFs for SftpClient {
     async fn list_dir(&self, path: &str) -> AppResult<Vec<FileEntry>> {
+        validate_remote_path_no_control(path)?;
         let norm = normalize_remote_path(path);
         // 兼容 Windows OpenSSH SFTP 盘符根目录（如 `/D:` -> `/D:/`）
         let is_win_drive_root = norm.len() == 3
@@ -637,6 +729,7 @@ impl RemoteFs for SftpClient {
     }
 
     async fn mkdir(&self, path: &str) -> AppResult<()> {
+        validate_remote_path_no_control(path)?;
         let norm = normalize_remote_path(path);
         self.sftp
             .create_dir(&norm)
@@ -646,8 +739,24 @@ impl RemoteFs for SftpClient {
     }
 
     async fn remove(&self, path: &str, is_dir: bool) -> AppResult<()> {
+        validate_remote_path_no_control(path)?;
         let norm = normalize_remote_path(path);
-        if is_dir {
+        if norm == "/" {
+            return Err(AppError::SecurityPolicy("禁止删除远程根目录 '/'".into()));
+        }
+        // 不盲信前端传入的 is_dir：先在服务端通过 lstat (symlink_metadata) 核实真实类型，
+        // 若目标本身是符号链接则仅删除链接本身，绝不跟随递归删除链接指向的真实目录！
+        let actual_is_dir = match self.sftp.symlink_metadata(&norm).await {
+            Ok(meta) => {
+                if meta.is_symlink() {
+                    false
+                } else {
+                    meta.is_dir()
+                }
+            }
+            Err(_) => is_dir,
+        };
+        if actual_is_dir {
             self.remove_dir_recursive(&norm).await?;
         } else {
             self.sftp
@@ -659,6 +768,8 @@ impl RemoteFs for SftpClient {
     }
 
     async fn rename(&self, from: &str, to: &str) -> AppResult<()> {
+        validate_remote_path_no_control(from)?;
+        validate_remote_path_no_control(to)?;
         let src = normalize_remote_path(from);
         let dst = normalize_remote_path(to);
         self.sftp.rename(&src, &dst).await.map_err(|e| {
@@ -668,6 +779,7 @@ impl RemoteFs for SftpClient {
     }
 
     async fn chmod(&self, path: &str, mode: u32) -> AppResult<()> {
+        validate_remote_path_no_control(path)?;
         let norm = normalize_remote_path(path);
         let attrs = FileAttributes {
             permissions: Some(mode & 0o7777),
@@ -681,6 +793,7 @@ impl RemoteFs for SftpClient {
     }
 
     async fn read_bytes(&self, path: &str, max_bytes: usize) -> AppResult<Vec<u8>> {
+        validate_remote_path_no_control(path)?;
         let norm = normalize_remote_path(path);
         let meta = self
             .sftp
@@ -706,6 +819,7 @@ impl RemoteFs for SftpClient {
     }
 
     async fn write_bytes(&self, path: &str, data: &[u8]) -> AppResult<()> {
+        validate_remote_path_no_control(path)?;
         let norm = normalize_remote_path(path);
         let mut file = self
             .sftp
@@ -731,6 +845,8 @@ impl RemoteFs for SftpClient {
         progress: ProgressCallback,
         cancel: Arc<AtomicBool>,
     ) -> AppResult<u64> {
+        validate_remote_path_no_control(remote_path)?;
+        ensure_not_symlink_target(local_path)?;
         let norm = normalize_remote_path(remote_path);
         let total = self
             .sftp
@@ -749,30 +865,43 @@ impl RemoteFs for SftpClient {
             .open(&norm)
             .await
             .map_err(|e| AppError::Protocol(format!("无法打开远程文件 '{}': {}", norm, e)))?;
-        let mut local_file = tokio::fs::File::create(local_path).await?;
+
+        // 先写入同目录临时 `.part` 文件，完全落盘后再原子提交，避免断网/取消留下半截文件
+        let part_path = staging_part_path(local_path);
+        let mut local_file = tokio::fs::File::create(&part_path).await?;
 
         // 按 64 KB 分块流式下载并实时回调进度
         let mut buf = vec![0u8; 64 * 1024];
         let mut transferred: u64 = 0;
 
-        loop {
-            if cancel.load(Ordering::Relaxed) {
-                drop(local_file);
-                let _ = tokio::fs::remove_file(local_path).await;
-                return Err(AppError::Cancelled);
+        let transfer_res: AppResult<()> = async {
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(AppError::Cancelled);
+                }
+                let n = remote_file
+                    .read(&mut buf)
+                    .await
+                    .map_err(|e| AppError::Protocol(format!("SFTP 读取流错误: {}", e)))?;
+                if n == 0 {
+                    break;
+                }
+                local_file.write_all(&buf[..n]).await?;
+                transferred += n as u64;
+                progress(transferred, total.max(transferred));
             }
-            let n = remote_file
-                .read(&mut buf)
-                .await
-                .map_err(|e| AppError::Protocol(format!("SFTP 读取流错误: {}", e)))?;
-            if n == 0 {
-                break;
-            }
-            local_file.write_all(&buf[..n]).await?;
-            transferred += n as u64;
-            progress(transferred, total.max(transferred));
+            local_file.flush().await?;
+            Ok(())
         }
-        local_file.flush().await?;
+        .await;
+
+        drop(local_file);
+        if let Err(err) = transfer_res {
+            let _ = tokio::fs::remove_file(&part_path).await;
+            return Err(err);
+        }
+
+        commit_staging_file(&part_path, local_path)?;
         Ok(transferred)
     }
 
@@ -783,6 +912,7 @@ impl RemoteFs for SftpClient {
         progress: ProgressCallback,
         cancel: Arc<AtomicBool>,
     ) -> AppResult<u64> {
+        validate_remote_path_no_control(remote_path)?;
         let norm = normalize_remote_path(remote_path);
         let meta = tokio::fs::metadata(local_path).await?;
         let total = meta.len();

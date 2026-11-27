@@ -86,13 +86,52 @@ export interface AgentStatus {
   message: string;
 }
 
-/** 已信任的 SSH 主机公钥指纹记录（TOFU） */
+/** 已信任的 SSH 主机公钥指纹记录 */
 export interface KnownHostEntry {
   hostPort: string;
   algorithm: string;
   fingerprint: string;
   firstSeenAt: number;
   lastSeenAt: number;
+}
+
+/** 首次连接未知主机时的待确认指纹信息 */
+export interface HostKeyUnknown {
+  hostPort: string;
+  algorithm: string;
+  fingerprint: string;
+  isJumpHost: boolean;
+}
+
+/** SSH 主机公钥指纹发生变更时的阻断详情 */
+export interface HostKeyMismatch {
+  hostPort: string;
+  expectedAlgorithm: string;
+  expectedFingerprint: string;
+  actualAlgorithm: string;
+  actualFingerprint: string;
+  isJumpHost: boolean;
+}
+
+/** 本地安全审计事件严重级别 */
+export type AuditSeverity = "info" | "warn" | "high" | "critical";
+
+/** 本地安全审计事件分类 */
+export type AuditCategory =
+  | "host_key"
+  | "session"
+  | "credential"
+  | "file_op"
+  | "security_policy";
+
+/** 单条脱敏安全审计日志记录 */
+export interface AuditEntry {
+  timestamp: number;
+  severity: AuditSeverity;
+  category: AuditCategory;
+  event: string;
+  target: string;
+  detail: string;
 }
 
 /** 当前已连接的远程会话摘要 */
@@ -106,6 +145,10 @@ export interface SessionInfo {
   currentPath: string;
   supportsShell: boolean;
   supportsChmod: boolean;
+  /** 是否使用明文传输协议（如 FTP / HTTP） */
+  insecureTransport?: boolean;
+  /** 是否跳过了 TLS 证书校验 */
+  tlsSkipVerify?: boolean;
 }
 
 /** 统一本地/远程文件与目录条目 */

@@ -7,6 +7,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build-x64:
     strategy:
@@ -43,8 +46,14 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Frontend dependency audit (production)
+        run: npm audit --omit=dev --audit-level=high
+
       - name: TypeScript strict type check
         run: npx tsc --noEmit
+
+      - name: Run frontend unit & security tests (Vitest)
+        run: npm test
 
       - name: Rust format check
         working-directory: src-tauri
@@ -54,7 +63,7 @@ jobs:
         working-directory: src-tauri
         run: cargo clippy --target ${{ matrix.target }} --all-targets -- -D warnings
 
-      - name: Run Rust unit tests
+      - name: Run Rust unit & security tests
         working-directory: src-tauri
         run: cargo test --target ${{ matrix.target }}
 

@@ -3,12 +3,14 @@
 //! 负责初始化 Tauri 运行时、注册插件、系统托盘与关闭最小化行为、
 //! 管理全局应用状态（站点、会话、传输队列、偏好设置）以及向前端暴露所有类型安全的 IPC 命令。
 
+mod audit;
 mod commands;
 mod error;
 mod known_hosts;
 mod local_fs;
 mod models;
 mod protocols;
+mod security;
 mod storage;
 mod transfer;
 
@@ -31,9 +33,8 @@ fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        // 注册系统文件/目录选择对话框插件与外部链接打开插件
+        // 遵循最小权限原则：仅注册实际使用的系统文件/目录选择对话框插件（移除未使用的 opener 插件）
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             // 获取操作系统标准应用数据目录用于持久化站点列表与轻量偏好
             let data_dir = app
@@ -80,10 +81,11 @@ pub fn run() {
 
             Ok(())
         })
-        // 拦截主窗口关闭事件：当用户开启“关闭时最小化到托盘”时隐藏窗口而非退出进程
+        // 拦截窗口关闭事件：主窗口按托盘偏好最小化；独立终端窗口关闭时回收其会话绑定
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
-                if window.label() == "main" {
+                let label = window.label().to_string();
+                if label == "main" {
                     let should_hide = window
                         .try_state::<AppState>()
                         .map(|s| s.is_minimize_to_tray())
@@ -92,6 +94,13 @@ pub fn run() {
                         api.prevent_close();
                         let _ = window.hide();
                     }
+                } else if label.starts_with("term-") {
+                    let app_handle = window.app_handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Some(state) = app_handle.try_state::<AppState>() {
+                            state.unregister_terminal_window(&label).await;
+                        }
+                    });
                 }
             }
         })
@@ -106,6 +115,9 @@ pub fn run() {
             commands::check_ssh_agent_status,
             commands::list_known_hosts,
             commands::remove_known_host,
+            commands::trust_known_host,
+            commands::list_audit_logs,
+            commands::export_audit_logs,
             commands::get_app_settings,
             commands::set_minimize_to_tray,
             // 会话连接与生命周期管理
@@ -136,8 +148,7 @@ pub fn run() {
             commands::list_transfers,
             commands::cancel_transfer,
             commands::clear_finished_transfers,
-            // SFTP 内置远程命令终端、交互式 PTY、独立终端窗口与服务器硬件监测
-            commands::ssh_exec_command,
+            // 交互式 SSH PTY、独立终端窗口与服务器硬件监测
             commands::remote_server_metrics,
             commands::ssh_pty_open,
             commands::ssh_pty_write,

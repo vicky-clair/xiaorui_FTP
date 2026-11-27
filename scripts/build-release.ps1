@@ -28,9 +28,12 @@ try {
     Pop-Location
 }
 
-Write-Host "==> [2/4] 构建 TypeScript + Vite 生产前端..." -ForegroundColor Cyan
+Write-Host "==> [2/4] 运行前端安全测试并构建 TypeScript + Vite 生产前端..." -ForegroundColor Cyan
 Push-Location "$PSScriptRoot\.."
 try {
+    npm test
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
     npm run build
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 

@@ -6,7 +6,7 @@
  */
 
 import React, { useMemo, useState } from "react";
-import { Download, Pencil, Search, ShieldCheck, Trash2, Upload } from "lucide-react";
+import { Download, FileClock, Pencil, Search, ShieldCheck, Trash2, Upload } from "lucide-react";
 import { PROTOCOL_META, type SiteConfig } from "../types";
 
 interface SiteSidebarProps {
@@ -19,6 +19,7 @@ interface SiteSidebarProps {
   onExport: () => void;
   onImport: () => void;
   onOpenKnownHosts: () => void;
+  onOpenAuditLogs: () => void;
 }
 
 export const SiteSidebar: React.FC<SiteSidebarProps> = ({
@@ -31,6 +32,7 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
   onExport,
   onImport,
   onOpenKnownHosts,
+  onOpenAuditLogs,
 }) => {
   const [query, setQuery] = useState("");
 
@@ -164,6 +166,10 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
         <button className="btn btn-sm btn-ghost" onClick={onOpenKnownHosts} title="管理 SSH 已知主机公钥指纹">
           <ShieldCheck size={13} />
           主机
+        </button>
+        <button className="btn btn-sm btn-ghost" onClick={onOpenAuditLogs} title="查看本地脱敏安全审计日志">
+          <FileClock size={13} />
+          日志
         </button>
       </div>
     </aside>

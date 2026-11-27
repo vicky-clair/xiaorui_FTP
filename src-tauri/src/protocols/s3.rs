@@ -26,6 +26,7 @@ use url::Url;
 use crate::error::{AppError, AppResult};
 use crate::models::{normalize_remote_path, FileEntry};
 use crate::protocols::{ProgressCallback, RemoteFs};
+use crate::security::{commit_staging_file, ensure_not_symlink_target, staging_part_path};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -39,7 +40,7 @@ const AWS_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
 /// 路径编码字符集（在 SigV4 基础上保留路径分隔符 `/`）
 const AWS_PATH_ENCODE_SET: &AsciiSet = &AWS_ENCODE_SET.remove(b'/');
 
-/// S3 兼容对象存储客户端
+/// S3 兼容对象存储客户端（释放时自动覆写清零 SecretKey 与 STS 令牌）
 pub struct S3Client {
     http: Client,
     endpoint: Url,
@@ -49,6 +50,16 @@ pub struct S3Client {
     secret_key: String,
     session_token: Option<String>,
     path_style: bool,
+}
+
+impl Drop for S3Client {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.secret_key.zeroize();
+        if let Some(tok) = self.session_token.as_mut() {
+            tok.zeroize();
+        }
+    }
 }
 
 impl S3Client {
@@ -741,6 +752,7 @@ impl RemoteFs for S3Client {
         progress: ProgressCallback,
         cancel: Arc<AtomicBool>,
     ) -> AppResult<u64> {
+        ensure_not_symlink_target(local_path)?;
         let key = Self::object_key(remote_path);
         let resp = self
             .send_signed(Method::GET, &key, &[], Vec::new(), &[])
@@ -749,22 +761,32 @@ impl RemoteFs for S3Client {
         if let Some(parent) = local_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let mut file = tokio::fs::File::create(local_path).await?;
+        let part_path = staging_part_path(local_path);
+        let mut file = tokio::fs::File::create(&part_path).await?;
         let mut stream = resp.bytes_stream();
         let mut transferred: u64 = 0;
 
-        while let Some(item) = stream.next().await {
-            if cancel.load(Ordering::Relaxed) {
-                drop(file);
-                let _ = tokio::fs::remove_file(local_path).await;
-                return Err(AppError::Cancelled);
+        let res: AppResult<()> = async {
+            while let Some(item) = stream.next().await {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(AppError::Cancelled);
+                }
+                let chunk = item.map_err(|e| AppError::Protocol(format!("下载流中断: {}", e)))?;
+                file.write_all(&chunk).await?;
+                transferred += chunk.len() as u64;
+                progress(transferred, total.max(transferred));
             }
-            let chunk = item.map_err(|e| AppError::Protocol(format!("下载流中断: {}", e)))?;
-            file.write_all(&chunk).await?;
-            transferred += chunk.len() as u64;
-            progress(transferred, total.max(transferred));
+            file.flush().await?;
+            Ok(())
         }
-        file.flush().await?;
+        .await;
+
+        drop(file);
+        if let Err(err) = res {
+            let _ = tokio::fs::remove_file(&part_path).await;
+            return Err(err);
+        }
+        commit_staging_file(&part_path, local_path)?;
         Ok(transferred)
     }
 

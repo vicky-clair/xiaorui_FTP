@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
 use crate::models::{normalize_remote_path, AuthType, SiteConfig, SiteInput, SiteSecrets};
+use crate::security::write_private_file;
 
 /// 操作系统凭据库中的服务命名空间
 const KEYRING_SERVICE: &str = "com.xiaorui.ftp";
@@ -42,18 +43,11 @@ impl SiteStore {
         Ok(sites)
     }
 
-    /// 原子方式将站点列表写回磁盘（先写临时文件再替换，避免异常中断损坏 sites.json）
+    /// 原子方式将站点列表写回磁盘（Unix 平台自动收紧权限至 `0o600`）
     fn write_all(&self, sites: &[SiteConfig]) -> AppResult<()> {
         let json = serde_json::to_string_pretty(sites)
             .map_err(|e| AppError::Storage(format!("序列化站点配置失败: {}", e)))?;
-        let tmp = self.sites_file.with_extension("json.tmp");
-        std::fs::write(&tmp, &json)?;
-        if std::fs::rename(&tmp, &self.sites_file).is_err() {
-            // Windows 目标文件存在时回退覆盖写入并清理临时文件
-            std::fs::write(&self.sites_file, &json)?;
-            let _ = std::fs::remove_file(&tmp);
-        }
-        Ok(())
+        write_private_file(&self.sites_file, &json)
     }
 
     /// 按站点 ID 查询单个站点配置
@@ -65,10 +59,11 @@ impl SiteStore {
     }
 
     /// 新增或更新站点配置，并在启用保存密钥时将敏感凭据增量合并写入系统凭据库
-    pub fn save(&self, input: SiteInput) -> AppResult<SiteConfig> {
+    pub fn save(&self, mut input: SiteInput) -> AppResult<SiteConfig> {
         let mut sites = self.list()?;
         let id = input
             .id
+            .take()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
@@ -98,34 +93,34 @@ impl SiteStore {
                     SiteSecrets::default()
                 };
                 if input.secret.as_deref().is_some_and(|s| !s.is_empty()) {
-                    merged.secret = input.secret.clone();
+                    merged.secret = input.secret.take();
                 }
                 if input.passphrase.as_deref().is_some_and(|s| !s.is_empty()) {
-                    merged.passphrase = input.passphrase.clone();
+                    merged.passphrase = input.passphrase.take();
                 }
                 if input
                     .session_token
                     .as_deref()
                     .is_some_and(|s| !s.is_empty())
                 {
-                    merged.session_token = input.session_token.clone();
+                    merged.session_token = input.session_token.take();
                 }
                 if input.jump_secret.as_deref().is_some_and(|s| !s.is_empty()) {
-                    merged.jump_secret = input.jump_secret.clone();
+                    merged.jump_secret = input.jump_secret.take();
                 }
                 if input
                     .jump_passphrase
                     .as_deref()
                     .is_some_and(|s| !s.is_empty())
                 {
-                    merged.jump_passphrase = input.jump_passphrase.clone();
+                    merged.jump_passphrase = input.jump_passphrase.take();
                 }
                 save_secrets(&id, &merged)?;
                 has_saved_secret = true;
             }
         }
 
-        let jump_host = input.jump_host.filter(|s| !s.trim().is_empty());
+        let jump_host = input.jump_host.take().filter(|s| !s.trim().is_empty());
         let cfg = SiteConfig {
             id: id.clone(),
             name: if input.name.trim().is_empty() {
@@ -147,25 +142,31 @@ impl SiteStore {
             port: input.port.unwrap_or_else(|| input.protocol.default_port()),
             username: input.username.trim().to_string(),
             auth_type: input.auth_type,
-            private_key_path: input.private_key_path.filter(|s| !s.trim().is_empty()),
+            private_key_path: input
+                .private_key_path
+                .take()
+                .filter(|s| !s.trim().is_empty()),
             remote_path: normalize_remote_path(&input.remote_path),
-            endpoint: input.endpoint.filter(|s| !s.trim().is_empty()),
-            bucket: input.bucket.filter(|s| !s.trim().is_empty()),
-            region: input.region.filter(|s| !s.trim().is_empty()),
+            endpoint: input.endpoint.take().filter(|s| !s.trim().is_empty()),
+            bucket: input.bucket.take().filter(|s| !s.trim().is_empty()),
+            region: input.region.take().filter(|s| !s.trim().is_empty()),
             path_style: input.path_style,
             tls_skip_verify: input.tls_skip_verify,
             jump_port: jump_host.as_ref().map(|_| input.jump_port.unwrap_or(22)),
             jump_username: jump_host
                 .as_ref()
-                .and_then(|_| input.jump_username.filter(|s| !s.trim().is_empty())),
+                .and_then(|_| input.jump_username.take().filter(|s| !s.trim().is_empty())),
             jump_auth_type: jump_host
                 .as_ref()
                 .map(|_| input.jump_auth_type.unwrap_or(AuthType::Agent)),
-            jump_private_key_path: jump_host
-                .as_ref()
-                .and_then(|_| input.jump_private_key_path.filter(|s| !s.trim().is_empty())),
+            jump_private_key_path: jump_host.as_ref().and_then(|_| {
+                input
+                    .jump_private_key_path
+                    .take()
+                    .filter(|s| !s.trim().is_empty())
+            }),
             jump_host,
-            notes: input.notes,
+            notes: std::mem::take(&mut input.notes),
             has_saved_secret,
             updated_at: Utc::now().timestamp(),
         };
@@ -220,27 +221,66 @@ impl SiteStore {
     }
 }
 
-/// 将站点密钥安全写入操作系统凭据库
+/// 将站点密钥安全写入操作系统凭据库（写入后立刻清零临时序列化缓冲区）
 pub fn save_secrets(site_id: &str, secrets: &SiteSecrets) -> AppResult<()> {
-    let entry = Entry::new(KEYRING_SERVICE, site_id)
-        .map_err(|e| AppError::Storage(format!("初始化系统凭据库失败: {}", e)))?;
-    let payload = serde_json::to_string(secrets)
+    use zeroize::Zeroize;
+    let entry = Entry::new(KEYRING_SERVICE, site_id).map_err(|e| {
+        AppError::Storage(format!(
+            "初始化系统凭据库失败（请检查操作系统凭据服务是否可用）: {}",
+            e
+        ))
+    })?;
+    let mut payload = serde_json::to_string(secrets)
         .map_err(|e| AppError::Storage(format!("序列化凭据失败: {}", e)))?;
-    entry
+    let res = entry
         .set_password(&payload)
-        .map_err(|e| AppError::Storage(format!("写入系统凭据库失败: {}", e)))?;
-    Ok(())
+        .map_err(|e| AppError::Storage(format!("写入系统凭据库失败（不会回退明文保存）: {}", e)));
+    payload.zeroize();
+    res
 }
 
-/// 从操作系统凭据库读取站点密钥（读取不到时返回空默认值）
-pub fn load_secrets(site_id: &str) -> SiteSecrets {
-    let Ok(entry) = Entry::new(KEYRING_SERVICE, site_id) else {
-        return SiteSecrets::default();
+/// 严格从操作系统凭据库读取站点密钥：
+/// - 若凭据条目不存在，返回空默认值；
+/// - 若站点标记了 `expect_saved` 且系统凭据库不可用或读取出错，返回明确错误提示而非静默吞错。
+pub fn load_secrets_strict(site_id: &str, expect_saved: bool) -> AppResult<SiteSecrets> {
+    use zeroize::Zeroize;
+    let entry = match Entry::new(KEYRING_SERVICE, site_id) {
+        Ok(e) => e,
+        Err(e) => {
+            if expect_saved {
+                return Err(AppError::Storage(format!(
+                    "操作系统凭据库不可用（请确认 Windows 凭据管理器 / macOS Keychain / Linux Secret Service 正常运行）: {}",
+                    e
+                )));
+            }
+            return Ok(SiteSecrets::default());
+        }
     };
+
     match entry.get_password() {
-        Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
-        Err(_) => SiteSecrets::default(),
+        Ok(mut raw) => {
+            let parsed = serde_json::from_str::<SiteSecrets>(&raw)
+                .map_err(|e| AppError::Storage(format!("解析系统凭据库中的站点凭据失败: {}", e)));
+            raw.zeroize();
+            parsed
+        }
+        Err(keyring::Error::NoEntry) => Ok(SiteSecrets::default()),
+        Err(e) => {
+            if expect_saved {
+                Err(AppError::Storage(format!(
+                    "读取操作系统凭据库失败（请检查系统凭据服务权限或解锁钥匙串）: {}",
+                    e
+                )))
+            } else {
+                Ok(SiteSecrets::default())
+            }
+        }
     }
+}
+
+/// 兼容旧调用方的宽松读取（内部复用严格读取并安全清零中间字符串）
+pub fn load_secrets(site_id: &str) -> SiteSecrets {
+    load_secrets_strict(site_id, false).unwrap_or_default()
 }
 
 /// 从操作系统凭据库删除指定站点的密钥

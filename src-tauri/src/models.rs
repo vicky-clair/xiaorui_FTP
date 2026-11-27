@@ -139,8 +139,8 @@ pub struct SiteConfig {
     pub updated_at: i64,
 }
 
-/// 前端提交的新建/编辑站点或临时连接表单载荷（可包含瞬态敏感密钥）
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// 前端提交的新建/编辑站点或临时连接表单载荷（含瞬态敏感密钥，手写脱敏 Debug 并在 Drop 时清零内存）
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SiteInput {
     pub id: Option<String>,
@@ -200,8 +200,62 @@ pub struct SiteInput {
     pub save_secret: bool,
 }
 
-/// 托管在操作系统凭据库中的站点敏感密钥集合（Drop 时自动覆写清零内存）
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+impl std::fmt::Debug for SiteInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SiteInput")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("protocol", &self.protocol)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field("auth_type", &self.auth_type)
+            .field("secret", &self.secret.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "passphrase",
+                &self.passphrase.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("jump_host", &self.jump_host)
+            .field(
+                "jump_secret",
+                &self.jump_secret.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "jump_passphrase",
+                &self.jump_passphrase.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("save_secret", &self.save_secret)
+            .finish()
+    }
+}
+
+impl Drop for SiteInput {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        if let Some(s) = self.secret.as_mut() {
+            s.zeroize();
+        }
+        if let Some(s) = self.passphrase.as_mut() {
+            s.zeroize();
+        }
+        if let Some(s) = self.session_token.as_mut() {
+            s.zeroize();
+        }
+        if let Some(s) = self.jump_secret.as_mut() {
+            s.zeroize();
+        }
+        if let Some(s) = self.jump_passphrase.as_mut() {
+            s.zeroize();
+        }
+    }
+}
+
+/// 托管在操作系统凭据库中的站点敏感密钥集合（脱敏 Debug 且 Drop 时自动覆写清零内存）
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SiteSecrets {
     pub secret: Option<String>,
@@ -211,6 +265,30 @@ pub struct SiteSecrets {
     pub jump_secret: Option<String>,
     #[serde(default)]
     pub jump_passphrase: Option<String>,
+}
+
+impl std::fmt::Debug for SiteSecrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SiteSecrets")
+            .field("secret", &self.secret.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "passphrase",
+                &self.passphrase.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "jump_secret",
+                &self.jump_secret.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "jump_passphrase",
+                &self.jump_passphrase.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 impl Drop for SiteSecrets {
@@ -261,6 +339,12 @@ pub struct SessionInfo {
     pub current_path: String,
     pub supports_shell: bool,
     pub supports_chmod: bool,
+    /// 是否处于明文传输状态（如 FTP 或 HTTP WebDAV/S3），供前端显示持续安全警示
+    #[serde(default)]
+    pub insecure_transport: bool,
+    /// 是否跳过了 TLS 证书校验（自签名测试模式），供前端显示持续安全警示
+    #[serde(default)]
+    pub tls_skip_verify: bool,
 }
 
 /// 统一文件/目录条目（同时用于本地与所有远程协议）

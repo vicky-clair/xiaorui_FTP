@@ -35,6 +35,7 @@ import {
   Zap,
 } from "lucide-react";
 import { api } from "../api/tauri";
+import { buildSafeCdCommand, isDangerousMultilinePaste } from "../utils/security";
 
 export interface TerminalCommandRequest {
   id: number;
@@ -255,6 +256,7 @@ const PtyTabPane = React.forwardRef<
     onStatusChange: (status: TabMeta["status"], sizeLabel?: string) => void;
     onOpenSearch: () => void;
     onZoomDelta: (delta: number | "reset") => void;
+    onRequestPaste: (text: string) => void;
   }
 >(
   (
@@ -268,6 +270,7 @@ const PtyTabPane = React.forwardRef<
       onStatusChange,
       onOpenSearch,
       onZoomDelta,
+      onRequestPaste,
     },
     ref
   ) => {
@@ -280,6 +283,7 @@ const PtyTabPane = React.forwardRef<
     const onOpenSearchRef = useRef(onOpenSearch);
     const onZoomDeltaRef = useRef(onZoomDelta);
     const onStatusChangeRef = useRef(onStatusChange);
+    const onRequestPasteRef = useRef(onRequestPaste);
 
     useEffect(() => {
       copyOnSelectRef.current = copyOnSelect;
@@ -293,6 +297,9 @@ const PtyTabPane = React.forwardRef<
     useEffect(() => {
       onStatusChangeRef.current = onStatusChange;
     }, [onStatusChange]);
+    useEffect(() => {
+      onRequestPasteRef.current = onRequestPaste;
+    }, [onRequestPaste]);
 
     const fitAndNotify = useCallback(() => {
       const term = termRef.current;
@@ -397,6 +404,9 @@ const PtyTabPane = React.forwardRef<
       term.loadAddon(fitAddon);
       term.loadAddon(searchAddon);
       term.open(container);
+      // 终端输出纵深防御：显式拦截恶意远端 OSC 52（剪贴板读写）与 OSC 8（隐藏超链接）控制序列
+      const osc52Disp = term.parser.registerOscHandler(52, () => true);
+      const osc8Disp = term.parser.registerOscHandler(8, () => true);
       termRef.current = term;
       fitRef.current = fitAddon;
       searchRef.current = searchAddon;
@@ -446,8 +456,7 @@ const PtyTabPane = React.forwardRef<
             void navigator.clipboard
               .readText()
               .then((txt) => {
-                const tid = terminalIdRef.current;
-                if (tid && txt) void api.sshPtyWrite(tid, txt);
+                if (txt) onRequestPasteRef.current(txt);
               })
               .catch(() => {});
             return false;
@@ -536,6 +545,8 @@ const PtyTabPane = React.forwardRef<
         disposed = true;
         if (resizeTimer) window.clearTimeout(resizeTimer);
         ro.disconnect();
+        osc52Disp.dispose();
+        osc8Disp.dispose();
         selDisp.dispose();
         dataDisp.dispose();
         if (unlistenData) unlistenData();
@@ -570,8 +581,7 @@ const PtyTabPane = React.forwardRef<
             void navigator.clipboard
               .readText()
               .then((txt) => {
-                const tid = terminalIdRef.current;
-                if (tid && txt) void api.sshPtyWrite(tid, txt);
+                if (txt) onRequestPasteRef.current(txt);
               })
               .catch(() => {});
           }
@@ -625,12 +635,13 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
   const [searchRegex, setSearchRegex] = useState(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
 
-  // 快捷命令栏状态
+  // 快捷命令栏状态与多行危险粘贴二次确认状态
   const [snippetsOpen, setSnippetsOpen] = useState(true);
   const [snippets, setSnippets] = useState<QuickSnippet[]>(loadSnippets);
   const [addingSnippet, setAddingSnippet] = useState(false);
   const [newLabel, setNewLabel] = useState("");
   const [newCmd, setNewCmd] = useState("");
+  const [pendingPaste, setPendingPaste] = useState<string | null>(null);
 
   useEffect(() => {
     localStorage.setItem(STORAGE_FONT, String(fontSize));
@@ -686,13 +697,27 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
     });
   }, []);
 
-  /** 同步当前 SFTP 远程浏览目录到活跃 Shell */
+  /** 粘贴安全守卫：单行文本直接写入，含换行符的多行命令先弹出内联确认条防隐藏命令注入 */
+  const handleRequestPaste = useCallback(
+    (text: string) => {
+      if (!text) return;
+      if (isDangerousMultilinePaste(text)) {
+        setPendingPaste(text);
+        return;
+      }
+      void getActiveHandle()?.writeInput(text);
+    },
+    [getActiveHandle]
+  );
+
+  /** 同步当前 SFTP 远程浏览目录到活跃 Shell（严格拦截非法控制字符与命令注入） */
   const handleSyncCwd = useCallback(async () => {
     if (!cwd) return;
-    const isWinDrive = /^\/[A-Za-z]:/.test(cwd);
-    const cmd = isWinDrive
-      ? `cd "${cwd.slice(1).replace(/\//g, "\\")}"\r`
-      : `cd '${cwd.replace(/'/g, "'\\''")}'\r`;
+    const cmd = buildSafeCdCommand(cwd);
+    if (!cmd) {
+      onNotify?.("当前远程目录包含非法控制字符或危险元字符，已阻止同步至终端", "error");
+      return;
+    }
     const ok = await getActiveHandle()?.writeInput(cmd);
     if (!ok) onNotify?.("当前终端尚未连接就绪", "error");
   }, [cwd, getActiveHandle, onNotify]);
@@ -1129,6 +1154,70 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
         </div>
       )}
 
+      {/* 多行危险粘贴二次确认警示条（防范恶意网页隐藏换行命令立即执行） */}
+      {pendingPaste !== null && (
+        <div
+          className="term-search-bar"
+          style={{
+            background: "rgba(217, 119, 6, 0.14)",
+            borderBottom: "1px solid rgba(217, 119, 6, 0.4)",
+            justifyContent: "space-between",
+            flexWrap: "wrap",
+            gap: 8,
+          }}
+        >
+          <div style={{ fontSize: 12, flex: 1, minWidth: 200 }}>
+            <strong style={{ color: "#d97706" }}>多行粘贴安全确认：</strong>
+            剪贴板包含 {pendingPaste.split(/\r?\n/).length} 行内容（含换行回车，将立即执行）。预览：
+            <code
+              style={{
+                marginLeft: 6,
+                fontFamily: "var(--font-mono)",
+                fontSize: 11,
+                opacity: 0.9,
+              }}
+            >
+              {pendingPaste.replace(/\r?\n/g, " ↵ ").slice(0, 90)}
+              {pendingPaste.length > 90 ? "..." : ""}
+            </code>
+          </div>
+          <div style={{ display: "inline-flex", gap: 6 }}>
+            <button
+              type="button"
+              className="btn btn-sm btn-danger"
+              onClick={() => {
+                const txt = pendingPaste;
+                setPendingPaste(null);
+                void getActiveHandle()?.writeInput(txt);
+              }}
+            >
+              确认全部粘贴
+            </button>
+            <button
+              type="button"
+              className="btn btn-sm"
+              onClick={() => {
+                const firstLine = pendingPaste.split(/\r?\n/)[0] ?? "";
+                setPendingPaste(null);
+                if (firstLine) void getActiveHandle()?.writeInput(firstLine);
+              }}
+            >
+              仅粘贴首行（去回车）
+            </button>
+            <button
+              type="button"
+              className="btn btn-sm btn-ghost"
+              onClick={() => {
+                setPendingPaste(null);
+                getActiveHandle()?.focus();
+              }}
+            >
+              取消
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* 多标签 PTY 渲染区 */}
       <div className="term-viewport-wrap">
         {tabs.map((tab) => (
@@ -1146,6 +1235,7 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
             copyOnSelect={copyOnSelect}
             onOpenSearch={handleOpenSearch}
             onZoomDelta={handleZoom}
+            onRequestPaste={handleRequestPaste}
             onStatusChange={(status, sizeLabel) =>
               setTabs((prev) =>
                 prev.map((t) =>

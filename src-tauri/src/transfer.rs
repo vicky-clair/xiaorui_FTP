@@ -62,6 +62,32 @@ impl TransferManager {
         Ok(None)
     }
 
+    /// 取消属于指定远程会话的全部排队中/进行中传输任务（会话断开时调用），返回已取消的任务快照列表
+    pub async fn cancel_by_session(&self, session_id: &str) -> Vec<TransferTask> {
+        let mut affected_ids = Vec::new();
+        let mut updated = Vec::new();
+        {
+            let mut tasks = self.tasks.write().await;
+            for t in tasks.iter_mut() {
+                if t.session_id == session_id
+                    && matches!(t.status, TransferStatus::Queued | TransferStatus::Running)
+                {
+                    t.status = TransferStatus::Cancelled;
+                    t.speed_bps = 0;
+                    affected_ids.push(t.id.clone());
+                    updated.push(t.clone());
+                }
+            }
+        }
+        let cancels = self.cancels.read().await;
+        for id in affected_ids {
+            if let Some(flag) = cancels.get(&id) {
+                flag.store(true, Ordering::Relaxed);
+            }
+        }
+        updated
+    }
+
     /// 清除所有已结束（已完成、失败或已取消）的历史任务
     pub async fn clear_finished(&self) {
         let mut tasks = self.tasks.write().await;
@@ -295,5 +321,47 @@ mod tests {
         // 再次清除已完成时，已取消任务被移除
         mgr.clear_finished().await;
         assert!(mgr.list().await.is_empty());
+
+        // 验证按会话批量取消仅影响目标会话任务，不误伤其他会话
+        let flag_s1 = Arc::new(AtomicBool::new(false));
+        let flag_s2 = Arc::new(AtomicBool::new(false));
+        {
+            let mut tasks = mgr.tasks.write().await;
+            tasks.push(TransferTask {
+                id: "t-s1".into(),
+                session_id: "s1".into(),
+                direction: TransferDirection::Download,
+                local_path: "/tmp/1".into(),
+                remote_path: "/1".into(),
+                file_name: "1".into(),
+                total_bytes: 100,
+                transferred_bytes: 0,
+                speed_bps: 0,
+                status: TransferStatus::Queued,
+                error: None,
+                created_at: 3,
+            });
+            tasks.push(TransferTask {
+                id: "t-s2".into(),
+                session_id: "s2".into(),
+                direction: TransferDirection::Download,
+                local_path: "/tmp/2".into(),
+                remote_path: "/2".into(),
+                file_name: "2".into(),
+                total_bytes: 100,
+                transferred_bytes: 0,
+                speed_bps: 0,
+                status: TransferStatus::Running,
+                error: None,
+                created_at: 4,
+            });
+            let mut cancels = mgr.cancels.write().await;
+            cancels.insert("t-s1".into(), flag_s1.clone());
+            cancels.insert("t-s2".into(), flag_s2.clone());
+        }
+        let cancelled_s1 = mgr.cancel_by_session("s1").await;
+        assert_eq!(cancelled_s1.len(), 1);
+        assert!(flag_s1.load(Ordering::Relaxed));
+        assert!(!flag_s2.load(Ordering::Relaxed));
     }
 }

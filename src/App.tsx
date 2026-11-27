@@ -26,15 +26,23 @@ import {
   X,
 } from "lucide-react";
 import { api } from "./api/tauri";
+import { AuditLogModal } from "./components/AuditLogModal";
 import { DialogModal, type DialogRequest } from "./components/DialogModal";
 import { EditorModal } from "./components/EditorModal";
 import { FilePane } from "./components/FilePane";
+import { HostKeyModal } from "./components/HostKeyModal";
 import { KnownHostsModal } from "./components/KnownHostsModal";
 import { SiteModal } from "./components/SiteModal";
 import { SiteSidebar } from "./components/SiteSidebar";
 import { TerminalDrawer, type TerminalCommandRequest } from "./components/TerminalDrawer";
 import { TopBar } from "./components/TopBar";
 import { TransferDrawer } from "./components/TransferDrawer";
+import {
+  buildSafeCdCommand,
+  buildSafeInsertPath,
+  parseHostKeyError,
+  type HostKeyPrompt,
+} from "./utils/security";
 import {
   formatBytes,
   PROTOCOL_META,
@@ -106,9 +114,14 @@ export default function App() {
     content: string;
   } | null>(null);
 
-  // 跨平台确认/输入弹窗、SSH 已知主机管理弹窗、托盘偏好与远端硬件指标
+  // 跨平台确认/输入弹窗、SSH 主机指纹确认/告警弹窗、已知主机管理、托盘偏好与远端硬件指标
   const [dialog, setDialog] = useState<DialogRequest | null>(null);
+  const [hostKeyPrompt, setHostKeyPrompt] = useState<{
+    prompt: HostKeyPrompt;
+    retry?: () => Promise<void>;
+  } | null>(null);
   const [knownHostsOpen, setKnownHostsOpen] = useState(false);
+  const [auditLogsOpen, setAuditLogsOpen] = useState(false);
   const [minimizeToTray, setMinimizeToTray] = useState(true);
   const [serverMetrics, setServerMetrics] = useState<ServerMetrics | null>(null);
 
@@ -200,25 +213,35 @@ export default function App() {
     };
   }, [activeSession?.sessionId, activeSession?.supportsShell]);
 
-  /** 从远程文件面板一键在 SSH 终端进入指定目录 */
-  const handleOpenDirInTerminal = useCallback((dirPath: string) => {
-    setTransferOpen(false);
-    setTerminalOpen(true);
-    const isWinDrive = /^\/[A-Za-z]:/.test(dirPath);
-    const cmd = isWinDrive
-      ? `cd "${dirPath.slice(1).replace(/\//g, "\\")}"\r`
-      : `cd '${dirPath.replace(/'/g, "'\\''")}'\r`;
-    setTerminalCommand({ id: Date.now() + Math.random(), text: cmd });
-  }, []);
+  /** 从远程文件面板一键在 SSH 终端进入指定目录（安全转义并拦截控制字符注入） */
+  const handleOpenDirInTerminal = useCallback(
+    (dirPath: string) => {
+      const cmd = buildSafeCdCommand(dirPath);
+      if (!cmd) {
+        pushToast("远程目录包含非法控制字符或危险元字符，已阻止发送到终端", "error");
+        return;
+      }
+      setTransferOpen(false);
+      setTerminalOpen(true);
+      setTerminalCommand({ id: Date.now() + Math.random(), text: cmd });
+    },
+    [pushToast]
+  );
 
-  /** 从远程文件面板将文件/目录完整路径插入 SSH 终端当前光标位置 */
-  const handleInsertPathToTerminal = useCallback((filePath: string) => {
-    setTransferOpen(false);
-    setTerminalOpen(true);
-    const needsQuote = /\s|['"\\$`&;|<>()]/.test(filePath);
-    const formatted = needsQuote ? `'${filePath.replace(/'/g, "'\\''")}' ` : `${filePath} `;
-    setTerminalCommand({ id: Date.now() + Math.random(), text: formatted });
-  }, []);
+  /** 从远程文件面板将文件/目录完整路径插入 SSH 终端当前光标位置（拦截换行与控制字符注入） */
+  const handleInsertPathToTerminal = useCallback(
+    (filePath: string) => {
+      const formatted = buildSafeInsertPath(filePath);
+      if (!formatted) {
+        pushToast("远程路径包含非法换行符或控制字符，已阻止插入终端", "error");
+        return;
+      }
+      setTransferOpen(false);
+      setTerminalOpen(true);
+      setTerminalCommand({ id: Date.now() + Math.random(), text: formatted });
+    },
+    [pushToast]
+  );
 
   /** 将当前 SSH 会话终端弹出为独立原生操作系统窗口 */
   const handlePopOutTerminal = async () => {
@@ -422,6 +445,22 @@ export default function App() {
     [loadRemoteDir]
   );
 
+  /** 统一拦截 SSH 主机密钥首次确认 / 指纹变更阻断告警；其他错误弹出 Toast */
+  const handleConnectError = useCallback(
+    (err: unknown, retry?: () => Promise<void>) => {
+      const parsed = parseHostKeyError(err);
+      if (parsed) {
+        setHostKeyPrompt({
+          prompt: parsed,
+          retry: parsed.kind === "unknown" ? retry : undefined,
+        });
+        return;
+      }
+      pushToast(String(err), "error");
+    },
+    [pushToast]
+  );
+
   const handleQuickConnect = async (uri: string) => {
     setConnecting(true);
     try {
@@ -429,7 +468,7 @@ export default function App() {
       await activateSession(sess);
       pushToast(`已连接到 ${sess.host}`, "success");
     } catch (err) {
-      pushToast(String(err), "error");
+      handleConnectError(err, () => handleQuickConnect(uri));
     } finally {
       setConnecting(false);
     }
@@ -442,7 +481,7 @@ export default function App() {
       await activateSession(sess);
       pushToast(`已连接到 ${site.name}`, "success");
     } catch (err) {
-      pushToast(String(err), "error");
+      handleConnectError(err, () => handleConnectSite(site));
     } finally {
       setConnectingSiteId(null);
     }
@@ -461,21 +500,24 @@ export default function App() {
     }
 
     if (connectAfter) {
-      setConnectingSiteId(saved.id);
-      try {
-        const sess = await api.connectSavedSite(
-          saved.id,
-          input.secret ?? undefined,
-          input.passphrase ?? undefined,
-          input.jumpSecret ?? undefined,
-          input.jumpPassphrase ?? undefined
-        );
-        await activateSession(sess);
-      } catch (err) {
-        pushToast(String(err), "error");
-      } finally {
-        setConnectingSiteId(null);
-      }
+      const doConnect = async () => {
+        setConnectingSiteId(saved.id);
+        try {
+          const sess = await api.connectSavedSite(
+            saved.id,
+            input.secret ?? undefined,
+            input.passphrase ?? undefined,
+            input.jumpSecret ?? undefined,
+            input.jumpPassphrase ?? undefined
+          );
+          await activateSession(sess);
+        } catch (err) {
+          handleConnectError(err, doConnect);
+        } finally {
+          setConnectingSiteId(null);
+        }
+      };
+      await doConnect();
     }
   };
 
@@ -815,7 +857,13 @@ export default function App() {
 
   // 全局桌面快捷键：Ctrl+K 聚焦快速直连，Ctrl+N 新建站点，F5 刷新目录
   useEffect(() => {
-    const anyModalOpen = siteModal.open || Boolean(editor) || Boolean(dialog) || knownHostsOpen;
+    const anyModalOpen =
+      siteModal.open ||
+      Boolean(editor) ||
+      Boolean(dialog) ||
+      knownHostsOpen ||
+      auditLogsOpen ||
+      Boolean(hostKeyPrompt);
     const onKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k" && !anyModalOpen) {
         e.preventDefault();
@@ -835,7 +883,7 @@ export default function App() {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [dialog, editor, knownHostsOpen, loadLocalDir, loadRemoteDir, siteModal.open]);
+  }, [auditLogsOpen, dialog, editor, hostKeyPrompt, knownHostsOpen, loadLocalDir, loadRemoteDir, siteModal.open]);
 
   // 拖拽双栏分割条实时调整左右宽度
   const handleStartResize = (e: React.MouseEvent) => {
@@ -903,6 +951,7 @@ export default function App() {
             onExport={handleExportSites}
             onImport={handleImportSites}
             onOpenKnownHosts={() => setKnownHostsOpen(true)}
+            onOpenAuditLogs={() => setAuditLogsOpen(true)}
           />
         )}
 
@@ -1161,6 +1210,23 @@ export default function App() {
             : "就绪 · 未连接远程站点"}
         </span>
 
+        {activeSession?.insecureTransport && (
+          <span
+            className="metric-pill hot"
+            title="当前会话使用明文协议传输，密码与文件内容在网络上未加密，请仅在受信任内网使用"
+          >
+            明文连接
+          </span>
+        )}
+        {activeSession?.tlsSkipVerify && (
+          <span
+            className="metric-pill warn"
+            title="当前会话已勾选忽略 TLS 证书校验，存在中间人攻击风险，仅限内网自签名测试"
+          >
+            已跳过 TLS 校验
+          </span>
+        )}
+
         {activeSession?.supportsShell && serverMetrics && (
           <div className="metrics-strip">
             <span
@@ -1305,9 +1371,37 @@ export default function App() {
         />
       )}
 
+      {hostKeyPrompt && (
+        <HostKeyModal
+          prompt={hostKeyPrompt.prompt}
+          onTrustUnknown={async (hostPort, algorithm, fingerprint) => {
+            try {
+              await api.trustKnownHost(hostPort, algorithm, fingerprint);
+              const retryFn = hostKeyPrompt.retry;
+              setHostKeyPrompt(null);
+              pushToast(`已信任主机 ${hostPort} 的公钥指纹，正在继续连接...`, "info");
+              if (retryFn) {
+                await retryFn();
+              }
+            } catch (err) {
+              pushToast(String(err), "error");
+            }
+          }}
+          onOpenKnownHosts={() => setKnownHostsOpen(true)}
+          onClose={() => setHostKeyPrompt(null)}
+        />
+      )}
+
       {knownHostsOpen && (
         <KnownHostsModal
           onClose={() => setKnownHostsOpen(false)}
+          onNotify={pushToast}
+        />
+      )}
+
+      {auditLogsOpen && (
+        <AuditLogModal
+          onClose={() => setAuditLogsOpen(false)}
           onNotify={pushToast}
         />
       )}

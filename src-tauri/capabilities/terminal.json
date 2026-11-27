@@ -1,0 +1,11 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "terminal-capability",
+  "description": "xiaorui_FTP 独立终端窗口最小权限配置（仅允许本地文件选择上传与终端日志保存对话框）",
+  "windows": ["term-*"],
+  "permissions": [
+    "core:default",
+    "dialog:allow-open",
+    "dialog:allow-save"
+  ]
+}

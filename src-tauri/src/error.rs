@@ -1,7 +1,7 @@
 //! 统一错误类型定义模块
 //!
-//! 将底层 IO、网络、认证、协议与存储异常转换为对用户友好的中文错误描述，
-//! 并实现 `serde::Serialize` 以便直接返回给 Tauri 前端提示。
+//! 将底层 IO、网络、认证、主机密钥校验、安全策略、协议与存储异常
+//! 转换为结构化且对用户友好的中文错误描述，并实现 `serde::Serialize` 供 Tauri 前端识别。
 
 use serde::Serialize;
 use thiserror::Error;
@@ -20,6 +20,22 @@ pub enum AppError {
     /// 用户名、密码、私钥、SSH Agent 或访问密钥校验未通过
     #[error("认证失败: {0}")]
     Auth(String),
+
+    /// 首次连接未知 SSH 主机，需用户在前端核对算法与 SHA-256 指纹并显式确认
+    #[error("HOST_KEY_UNKNOWN::{0}")]
+    HostKeyUnknown(String),
+
+    /// SSH 主机公钥指纹发生变更，已立即阻断连接以防范中间人攻击
+    #[error("HOST_KEY_MISMATCH::{0}")]
+    HostKeyMismatch(String),
+
+    /// 命中安全策略阻断（如路径穿越、控制字符注入、危险删除或已知主机仓库损坏）
+    #[error("安全策略拦截: {0}")]
+    SecurityPolicy(String),
+
+    /// 权限校验未通过（如跨窗口越权访问）
+    #[error("权限拒绝: {0}")]
+    PermissionDenied(String),
 
     /// 远程协议交互错误（SFTP/FTP/S3/WebDAV）
     #[error("协议错误: {0}")]

@@ -24,6 +24,10 @@ use suppaftp::{Mode, RustlsConnector, RustlsFtpStream};
 use crate::error::{AppError, AppResult};
 use crate::models::{join_remote_path, normalize_remote_path, FileEntry, Protocol};
 use crate::protocols::{ProgressCallback, RemoteFs};
+use crate::security::{
+    commit_staging_file, ensure_not_symlink_target, staging_part_path,
+    validate_remote_path_no_control,
+};
 
 /// 允许跳过证书校验的自定义验证器（仅在用户主动勾选「忽略自签名证书」时启用）
 #[derive(Debug)]
@@ -121,13 +125,14 @@ impl FtpClient {
         } else {
             username.to_string()
         };
-        let pass = password
+        let mut pass = password
             .unwrap_or("anonymous@xiaorui-ftp.local")
             .to_string();
 
         let stream = tokio::time::timeout(
             Duration::from_secs(20),
             tokio::task::spawn_blocking(move || -> AppResult<RustlsFtpStream> {
+                use zeroize::Zeroize;
                 let addr = format!("{}:{}", host, port);
                 let mut ftp = match protocol {
                     Protocol::FtpsImplicit => {
@@ -150,8 +155,11 @@ impl FtpClient {
                     })?,
                 };
 
-                ftp.login(&user, &pass)
-                    .map_err(|e| AppError::Auth(format!("FTP 登录失败: {}", e)))?;
+                let login_res = ftp
+                    .login(&user, &pass)
+                    .map_err(|e| AppError::Auth(format!("FTP 登录失败: {}", e)));
+                pass.zeroize();
+                login_res?;
                 // 强制二进制传输模式，避免文本换行符被服务端篡改
                 let _ = ftp.transfer_type(FileType::Binary);
                 ftp.set_mode(Mode::ExtendedPassive);
@@ -171,6 +179,7 @@ impl FtpClient {
 #[async_trait]
 impl RemoteFs for FtpClient {
     async fn list_dir(&self, path: &str) -> AppResult<Vec<FileEntry>> {
+        validate_remote_path_no_control(path)?;
         let norm = normalize_remote_path(path);
         let stream = self.stream.clone();
 
@@ -231,6 +240,7 @@ impl RemoteFs for FtpClient {
     }
 
     async fn mkdir(&self, path: &str) -> AppResult<()> {
+        validate_remote_path_no_control(path)?;
         let norm = normalize_remote_path(path);
         let stream = self.stream.clone();
         tokio::task::spawn_blocking(move || -> AppResult<()> {
@@ -246,7 +256,11 @@ impl RemoteFs for FtpClient {
     }
 
     async fn remove(&self, path: &str, is_dir: bool) -> AppResult<()> {
+        validate_remote_path_no_control(path)?;
         let norm = normalize_remote_path(path);
+        if norm == "/" {
+            return Err(AppError::SecurityPolicy("禁止删除远程根目录 '/'".into()));
+        }
         let stream = self.stream.clone();
         tokio::task::spawn_blocking(move || -> AppResult<()> {
             let mut ftp = stream
@@ -310,6 +324,8 @@ impl RemoteFs for FtpClient {
     }
 
     async fn rename(&self, from: &str, to: &str) -> AppResult<()> {
+        validate_remote_path_no_control(from)?;
+        validate_remote_path_no_control(to)?;
         let src = normalize_remote_path(from);
         let dst = normalize_remote_path(to);
         let stream = self.stream.clone();
@@ -326,6 +342,7 @@ impl RemoteFs for FtpClient {
     }
 
     async fn chmod(&self, path: &str, mode: u32) -> AppResult<()> {
+        validate_remote_path_no_control(path)?;
         let norm = normalize_remote_path(path);
         let stream = self.stream.clone();
         tokio::task::spawn_blocking(move || -> AppResult<()> {
@@ -342,6 +359,7 @@ impl RemoteFs for FtpClient {
     }
 
     async fn read_bytes(&self, path: &str, max_bytes: usize) -> AppResult<Vec<u8>> {
+        validate_remote_path_no_control(path)?;
         let norm = normalize_remote_path(path);
         let stream = self.stream.clone();
         tokio::task::spawn_blocking(move || -> AppResult<Vec<u8>> {
@@ -365,6 +383,7 @@ impl RemoteFs for FtpClient {
     }
 
     async fn write_bytes(&self, path: &str, data: &[u8]) -> AppResult<()> {
+        validate_remote_path_no_control(path)?;
         let norm = normalize_remote_path(path);
         let bytes = data.to_vec();
         let stream = self.stream.clone();
@@ -388,8 +407,11 @@ impl RemoteFs for FtpClient {
         progress: ProgressCallback,
         cancel: Arc<AtomicBool>,
     ) -> AppResult<u64> {
+        validate_remote_path_no_control(remote_path)?;
+        ensure_not_symlink_target(local_path)?;
         let norm = normalize_remote_path(remote_path);
         let local_pb = local_path.to_path_buf();
+        let part_pb = staging_part_path(local_path);
         let stream = self.stream.clone();
 
         tokio::task::spawn_blocking(move || -> AppResult<u64> {
@@ -403,8 +425,8 @@ impl RemoteFs for FtpClient {
 
             let mut transferred: u64 = 0;
             ftp.retr(&norm, |reader| {
-                let mut out = std::fs::File::create(&local_pb)
-                    .map_err(suppaftp::FtpError::ConnectionError)?;
+                let mut out =
+                    std::fs::File::create(&part_pb).map_err(suppaftp::FtpError::ConnectionError)?;
                 let mut buf = [0u8; 64 * 1024];
                 loop {
                     if cancel.load(Ordering::Relaxed) {
@@ -428,13 +450,14 @@ impl RemoteFs for FtpClient {
                 Ok(())
             })
             .map_err(|e| {
+                let _ = std::fs::remove_file(&part_pb);
                 if cancel.load(Ordering::Relaxed) {
-                    let _ = std::fs::remove_file(&local_pb);
                     AppError::Cancelled
                 } else {
                     AppError::Protocol(format!("FTP 下载失败: {}", e))
                 }
             })?;
+            commit_staging_file(&part_pb, &local_pb)?;
             Ok(transferred)
         })
         .await
@@ -448,6 +471,7 @@ impl RemoteFs for FtpClient {
         progress: ProgressCallback,
         cancel: Arc<AtomicBool>,
     ) -> AppResult<u64> {
+        validate_remote_path_no_control(remote_path)?;
         let norm = normalize_remote_path(remote_path);
         let local_pb = local_path.to_path_buf();
         let stream = self.stream.clone();

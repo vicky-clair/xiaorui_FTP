@@ -1,11 +1,11 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
-  "identifier": "default",
-  "description": "xiaorui_FTP 主窗口与独立终端窗口默认权限配置",
-  "windows": ["main", "term-*"],
+  "identifier": "main-capability",
+  "description": "xiaorui_FTP 主窗口最小权限配置（移除未使用的 opener 权限，仅保留核心窗口与系统文件对话框）",
+  "windows": ["main"],
   "permissions": [
     "core:default",
-    "dialog:default",
-    "opener:default"
+    "dialog:allow-open",
+    "dialog:allow-save"
   ]
 }

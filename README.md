@@ -13,11 +13,14 @@
 - **高效文件浏览**：顶部命令栏式快速直连（`Ctrl+K`）、独立全宽可点击路径面包屑、点击列头按名称/大小/时间升降序排序、语义化文件类型图标、原生级右键上下文菜单与目录即时过滤。
 - **关闭最小化到系统托盘**：默认点击关闭按钮隐藏至系统托盘（不中断后台传输与会话），左键单击托盘图标恢复窗口，右键提供「显示主窗口 / 退出」，底部状态栏可一键切换「关闭→托盘 / 关闭→退出」。
 
-### 2. 全协议现代加密栈（纯 Rust `rustls` + `russh`，零 OpenSSL 依赖）
-- **SFTP over SSH**：支持 Curve25519、Ed25519、RSA-SHA2-256、ECDSA、AES-GCM、ChaCha20-Poly1305；兼容 OpenSSH 8.8+/9.x 服务端与 Windows OpenSSH；自动识别软链接目录；全量内置 20 秒连接超时保护。
+### 2. 全协议现代加密栈与零信任安全防护（纯 Rust `rustls` + `russh`，零 OpenSSL 依赖）
+- **SFTP over SSH**：支持 Curve25519、Ed25519、RSA-SHA2-256、ECDSA、AES-GCM、ChaCha20-Poly1305；兼容 OpenSSH 8.8+/9.x 服务端与 Windows OpenSSH；自动识别软链接目录且删除时后端 `lstat` 核实真实类型绝不误删软链接目标；连接、认证与 SFTP 子系统初始化均带 20 秒独立超时保护。
 - **SSH 跳板机（ProxyJump）与本地 Agent**：纯 Rust `direct-tcpip` 隧道直连内网主机；安全适配 Windows OpenSSH Authentication Agent、Pageant 及 macOS/Linux `SSH_AUTH_SOCK`。
-- **SSH 主机公钥 TOFU 校验**：首次连接自动记录主机（含跳板机）SHA-256 指纹至 `known_hosts.json`，指纹变更立即拦截告警防范中间人攻击，支持在「主机」弹窗中按条管理。
-- **FTPS / FTP**：显式 FTPS（`AUTH TLS`）与隐式 FTPS（990 端口），原生 TLS 1.2 / TLS 1.3、二进制传输、EPSV/PASV 自动回退、支持非空目录递归删除。
+- **SSH 主机公钥严格核验（零信任 + Fail Secure）**：首次连接未知主机（含跳板机）**弹窗展示公钥算法与 SHA-256 指纹**，经用户明确核对确认后才持久化至 `known_hosts.json`；后续指纹变化弹出**高危阻断性中间人告警**并禁止静默覆盖；`known_hosts.json` 损坏时采用 Fail Secure 直接拒绝连接。
+- **文件传输纵深安全**：全协议下载先写同目录 `.part` 临时文件完成后原子提交，异常中断或取消自动清理残缺文件；严格拦截路径穿越、盘符覆盖、Windows 保留设备名与本地符号链接覆写；拦截删除根目录/主目录/系统目录。
+- **终端输出与粘贴防护**：交互式 `xterm.js` 显式拦截远端 OSC 52（剪贴板读写）与 OSC 8（隐藏链接）控制序列，剪贴板粘贴含换行符的多行内容时触发内联二次确认条，后端 PTY 启用 1 MB/s 刷屏限流。
+- **本地脱敏安全审计日志与窗口最小权限隔离**：记录主机指纹、会话连接、凭据变更、高危文件操作与安全策略拦截（绝不记录密码/私钥/按键流），侧边栏点击 **「日志」** 可随时筛选与导出；主窗口与独立终端窗口采用独立 Capability 与后端会话/PTY 归属校验。
+- **FTPS / FTP**：显式 FTPS（`AUTH TLS`）与隐式 FTPS（990 端口），原生 TLS 1.2 / TLS 1.3、二进制传输、EPSV/PASV 自动回退、支持非空目录递归删除与防 CRLF 控制通道注入；明文 FTP 或跳过 TLS 校验会话在状态栏持续展示警示徽章。
 - **S3 兼容对象存储**：内置 AWS Signature V4，提供 **AWS S3 / 阿里云 OSS / 腾讯云 COS / MinIO / Cloudflare R2** 一键预设，支持 64 KB 流式上传、千级以上对象自动分页列举与递归删除、STS 临时凭证与 Path-Style。
 - **WebDAV / HTTPS**：兼容 **Nextcloud / Alist / 群晖 NAS / 坚果云**，支持 Basic 认证、Bearer Token（OAuth2）、匿名访问、中文路径编解码与流式传输。
 
@@ -134,8 +137,8 @@ webdav://user:pass@192.168.1.20:5244/dav
      ssh-add $env:USERPROFILE\.ssh\id_ed25519
      ```
    - **方式 B（Pageant）**：启动 PuTTY Pageant、KeePassXC 或 1Password 的 Pageant 兼容模式并加载私钥，软件会自动安全检测并回退使用（未启动任何 Agent 时会安全提示，绝不崩溃）。
-5. **服务器重装后连接 SSH 提示主机指纹不匹配**
-   - 本软件默认启用严格 TOFU 主机指纹校验以防范中间人攻击。确认服务器确实重装或更换了主机密钥后，点击左侧站点栏底部的 **「主机」** 按钮，移除对应 `host:port` 的旧指纹记录即可重新信任连接。
+5. **首次连接 SSH 弹窗与服务器重装后指纹不匹配阻断**
+   - 首次连接未知 SSH 服务器（含跳板机）时，软件会弹窗展示公钥算法与 SHA-256 指纹，请通过云控制台或带外渠道核对一致后点击「确认指纹并继续连接」。若服务器后续重装导致指纹变更，系统会弹出红色高危阻断告警并禁止静默覆盖；确认系合法重装后，请点击左侧站点栏底部的 **「主机」** 按钮移除旧记录再重连。
 6. **部分 SFTP 账号底部不显示硬件监控或无法打开终端**
    - 若远端管理员配置了仅允许 `internal-sftp` 的受限账号（禁用了 SSH Shell/exec 通道），硬件采样会自动静默跳过，不影响正常文件上传下载。
 7. **S3 连接报 `SignatureDoesNotMatch` 或 `403 Forbidden`**
@@ -167,10 +170,11 @@ npm install
 # 2. 启动桌面端热重载开发模式
 npm run tauri:dev
 
-# 3. 执行前端类型检查与生产构建
+# 3. 执行前端安全单元测试（Vitest）、类型检查与生产构建
+npm test
 npm run build
 
-# 4. 运行 Rust 格式检查、Clippy 零警告门禁与全部单元测试
+# 4. 运行 Rust 格式检查、Clippy 零警告门禁与全部单元测试（22 项）
 cd src-tauri
 cargo fmt -- --check
 cargo clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings
@@ -183,4 +187,8 @@ npm run release:win64
 bash scripts/build-release.sh
 ```
 
-更多架构设计与模块接口细节请参阅 [docs/DEVELOPMENT_PLAN.md](docs/DEVELOPMENT_PLAN.md)；与主流商业 FTP 软件（FlashFXP / SmartFTP / CuteFTP / Wing FTP Server）的架构与功能对照分析请参阅 [docs/COMPETITIVE_COMPARISON.md](docs/COMPETITIVE_COMPARISON.md)。
+更多文档：
+- 系统架构与模块接口：[docs/DEVELOPMENT_PLAN.md](docs/DEVELOPMENT_PLAN.md)
+- 安全威胁模型与缓解矩阵：[docs/security/THREAT_MODEL.md](docs/security/THREAT_MODEL.md)
+- 安全政策与漏洞披露：[SECURITY.md](SECURITY.md) · 更新日志：[CHANGELOG.md](CHANGELOG.md)
+- 主流商业 FTP 竞品对照分析：[docs/COMPETITIVE_COMPARISON.md](docs/COMPETITIVE_COMPARISON.md)

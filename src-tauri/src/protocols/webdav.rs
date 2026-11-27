@@ -24,6 +24,7 @@ use url::Url;
 use crate::error::{AppError, AppResult};
 use crate::models::{normalize_remote_path, AuthType, FileEntry};
 use crate::protocols::{ProgressCallback, RemoteFs};
+use crate::security::{commit_staging_file, ensure_not_symlink_target, staging_part_path};
 
 /// WebDAV URL 路径段百分号编码集合
 const PATH_ENCODE_SET: &AsciiSet = &CONTROLS
@@ -38,11 +39,20 @@ const PATH_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b'{')
     .add(b'}');
 
-/// WebDAV 客户端实例
+/// WebDAV 客户端实例（释放时自动覆写清零 Authorization 敏感请求头）
 pub struct WebDavClient {
     http: Client,
     base_url: Url,
     auth_header: Option<String>,
+}
+
+impl Drop for WebDavClient {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        if let Some(auth) = self.auth_header.as_mut() {
+            auth.zeroize();
+        }
+    }
 }
 
 impl WebDavClient {
@@ -406,6 +416,7 @@ impl RemoteFs for WebDavClient {
         progress: ProgressCallback,
         cancel: Arc<AtomicBool>,
     ) -> AppResult<u64> {
+        ensure_not_symlink_target(local_path)?;
         let url = self.build_url(remote_path, false)?;
         let resp = self
             .http
@@ -420,22 +431,32 @@ impl RemoteFs for WebDavClient {
         if let Some(parent) = local_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let mut file = tokio::fs::File::create(local_path).await?;
+        let part_path = staging_part_path(local_path);
+        let mut file = tokio::fs::File::create(&part_path).await?;
         let mut stream = resp.bytes_stream();
         let mut transferred: u64 = 0;
 
-        while let Some(item) = stream.next().await {
-            if cancel.load(Ordering::Relaxed) {
-                drop(file);
-                let _ = tokio::fs::remove_file(local_path).await;
-                return Err(AppError::Cancelled);
+        let res: AppResult<()> = async {
+            while let Some(item) = stream.next().await {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(AppError::Cancelled);
+                }
+                let chunk = item.map_err(|e| AppError::Protocol(format!("下载中断: {}", e)))?;
+                file.write_all(&chunk).await?;
+                transferred += chunk.len() as u64;
+                progress(transferred, total.max(transferred));
             }
-            let chunk = item.map_err(|e| AppError::Protocol(format!("下载中断: {}", e)))?;
-            file.write_all(&chunk).await?;
-            transferred += chunk.len() as u64;
-            progress(transferred, total.max(transferred));
+            file.flush().await?;
+            Ok(())
         }
-        file.flush().await?;
+        .await;
+
+        drop(file);
+        if let Err(err) = res {
+            let _ = tokio::fs::remove_file(&part_path).await;
+            return Err(err);
+        }
+        commit_staging_file(&part_path, local_path)?;
         Ok(transferred)
     }
 

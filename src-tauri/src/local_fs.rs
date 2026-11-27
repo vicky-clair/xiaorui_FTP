@@ -137,8 +137,9 @@ pub async fn mkdir(path: &str) -> AppResult<()> {
     Ok(())
 }
 
-/// 删除本地文件或递归删除整个目录
+/// 删除本地文件或递归删除整个目录（后端安全拦截根目录、用户主目录及核心系统目录）
 pub async fn delete(path: &str, is_dir: bool) -> AppResult<()> {
+    crate::security::ensure_safe_local_delete_target(std::path::Path::new(path))?;
     if is_dir {
         tokio::fs::remove_dir_all(path).await?;
     } else {

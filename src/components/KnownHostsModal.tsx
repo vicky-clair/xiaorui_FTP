@@ -70,7 +70,7 @@ export const KnownHostsModal: React.FC<KnownHostsModalProps> = ({
 
         <div className="modal-body" style={{ maxHeight: 420 }}>
           <div style={{ fontSize: 12, color: "var(--text-muted)" }}>
-            首次连接 SSH 主机时会自动记录其公钥 SHA-256 指纹并在后续连接中严格核验。若某台服务器已重装系统导致指纹变化，请在此移除旧记录后再重连。
+            首次连接 SSH 主机时会弹出公钥算法与 SHA-256 指纹供您核对确认；信任后将在后续每次连接中严格比对。若某台服务器已合法重装系统导致指纹变化，请先在此移除旧记录后再重连。
           </div>
 
           {loading ? (

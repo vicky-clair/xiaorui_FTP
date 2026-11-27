@@ -12,30 +12,42 @@ use base64::Engine;
 use chrono::Utc;
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use serde::Deserialize;
-use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+use crate::audit::{AuditCategory, AuditEntry, AuditLogger, AuditSeverity};
 use crate::error::{AppError, AppResult};
 use crate::known_hosts::{KnownHostEntry, KnownHostsStore};
 use crate::local_fs;
 use crate::models::parse_quick_connect_uri;
 use crate::models::{
     join_remote_path, normalize_remote_path, AgentStatus, AppSettings, FileEntry, LocalRoot,
-    PtyDataEvent, PtyExitEvent, ServerMetrics, SessionInfo, ShellOutput, SiteConfig, SiteInput,
+    Protocol, PtyDataEvent, PtyExitEvent, ServerMetrics, SessionInfo, SiteConfig, SiteInput,
     SiteSecrets, TransferDirection, TransferTask,
 };
 use crate::protocols::{connect_protocol, sftp, PtyCommand, RemoteFs};
-use crate::storage::{load_secrets, SiteStore};
+use crate::security::{
+    ensure_not_symlink_target, resolve_safe_download_path, validate_scoped_file_path,
+    write_private_file,
+};
+use crate::storage::{load_secrets_strict, SiteStore};
 use crate::transfer::{TransferManager, TRANSFER_EVENT};
 
 /// 向前端推送交互式 SSH PTY 原始输出与退出状态的事件名
 pub const PTY_DATA_EVENT: &str = "pty://data";
 pub const PTY_EXIT_EVENT: &str = "pty://exit";
 
-/// 活跃交互式 SSH PTY 实例
+/// 单个 PTY 单次推送事件最大字节片（16 KB）与每秒输出限流阈值（1 MB/s），防范恶意服务端刷屏耗尽内存
+const PTY_MAX_CHUNK_BYTES: usize = 16 * 1024;
+const PTY_MAX_BYTES_PER_SEC: usize = 1024 * 1024;
+/// 本地日志导出文件最大体积（10 MB）
+const MAX_TEXT_EXPORT_BYTES: usize = 10 * 1024 * 1024;
+
+/// 活跃交互式 SSH PTY 实例（绑定所属会话与创建窗口，防范跨窗口越权操控）
 pub struct ActivePty {
     pub session_id: String,
+    pub owner_window: String,
     pub cmd_tx: tokio::sync::mpsc::Sender<PtyCommand>,
 }
 
@@ -51,6 +63,8 @@ pub struct AppState {
     pub store: SiteStore,
     /// SSH 已知主机公钥指纹仓库（`known_hosts.json`，独立于站点配置）
     pub known_hosts: Arc<KnownHostsStore>,
+    /// 本地脱敏安全审计日志管理器（`audit.log.jsonl`）
+    pub audit: AuditLogger,
     /// 轻量偏好配置文件路径（`settings.json`）
     settings_file: PathBuf,
     /// 关闭主窗口时是否最小化到系统托盘（原子无锁读取，供窗口事件钩子安全使用）
@@ -59,6 +73,8 @@ pub struct AppState {
     pub sessions: RwLock<HashMap<String, ActiveSession>>,
     /// 当前所有活跃的交互式 SSH PTY 伪终端映射表（terminal_id -> ActivePty）
     pub ptys: Arc<RwLock<HashMap<String, ActivePty>>>,
+    /// 独立终端窗口与远程会话的绑定表（window_label -> session_id）
+    pub terminal_windows: RwLock<HashMap<String, String>>,
     /// 后台并发传输队列管理器
     pub transfers: TransferManager,
 }
@@ -73,13 +89,70 @@ impl AppState {
             .unwrap_or_default();
         Ok(Self {
             store: SiteStore::new(app_data_dir.clone())?,
-            known_hosts: Arc::new(KnownHostsStore::new(app_data_dir)?),
+            known_hosts: Arc::new(KnownHostsStore::new(app_data_dir.clone())?),
+            audit: AuditLogger::new(app_data_dir)?,
             settings_file,
             minimize_to_tray: AtomicBool::new(loaded_settings.minimize_to_tray),
             sessions: RwLock::new(HashMap::new()),
             ptys: Arc::new(RwLock::new(HashMap::new())),
+            terminal_windows: RwLock::new(HashMap::new()),
             transfers: TransferManager::new(3),
         })
+    }
+
+    /// 校验调用方是否为主窗口（禁止独立终端窗口 `term-*` 越权调用站点/本地删除/系统配置等高危 IPC）
+    fn ensure_main_window(&self, window: &WebviewWindow, action: &str) -> AppResult<()> {
+        if window.label() != "main" {
+            self.audit.record(
+                AuditSeverity::High,
+                AuditCategory::SecurityPolicy,
+                "ipc_window_denied",
+                window.label(),
+                &format!("拦截来自非主窗口的敏感操作: {}", action),
+            );
+            return Err(AppError::PermissionDenied(format!(
+                "安全策略拒绝：操作 '{}' 仅允许在主窗口执行",
+                action
+            )));
+        }
+        Ok(())
+    }
+
+    /// 校验窗口对指定 `session_id` 的访问授权（主窗口可访问全部会话；`term-*` 仅限访问其绑定会话）
+    async fn ensure_window_session_access(
+        &self,
+        window: &WebviewWindow,
+        session_id: &str,
+        action: &str,
+    ) -> AppResult<()> {
+        let label = window.label();
+        if label == "main" {
+            return Ok(());
+        }
+        let allowed = self
+            .terminal_windows
+            .read()
+            .await
+            .get(label)
+            .is_some_and(|bound| bound == session_id);
+        if !allowed {
+            self.audit.record(
+                AuditSeverity::High,
+                AuditCategory::SecurityPolicy,
+                "ipc_session_denied",
+                label,
+                &format!("拦截跨会话越权调用 '{}' (session={})", action, session_id),
+            );
+            return Err(AppError::PermissionDenied(
+                "安全策略拒绝：当前独立终端窗口无权访问其他远程会话".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// 在独立终端窗口关闭时回收其会话绑定记录
+    pub async fn unregister_terminal_window(&self, label: &str) {
+        self.terminal_windows.write().await.remove(label);
     }
 
     /// 供窗口关闭事件钩子无锁查询是否启用“关闭时最小化到托盘”
@@ -94,18 +167,13 @@ impl AppState {
         }
     }
 
-    /// 持久化偏好设置至独立文件 `settings.json`
+    /// 持久化偏好设置至独立文件 `settings.json`（Unix 下收紧权限至 `0o600`）
     pub fn set_minimize_to_tray(&self, enabled: bool) -> AppResult<AppSettings> {
         self.minimize_to_tray.store(enabled, Ordering::Relaxed);
         let settings = self.current_settings();
         let json = serde_json::to_string_pretty(&settings)
             .map_err(|e| AppError::Storage(format!("序列化偏好设置失败: {}", e)))?;
-        let tmp = self.settings_file.with_extension("json.tmp");
-        std::fs::write(&tmp, &json)?;
-        if std::fs::rename(&tmp, &self.settings_file).is_err() {
-            std::fs::write(&self.settings_file, &json)?;
-            let _ = std::fs::remove_file(&tmp);
-        }
+        write_private_file(&self.settings_file, &json)?;
         Ok(settings)
     }
 
@@ -146,34 +214,93 @@ pub async fn list_sites(state: State<'_, AppState>) -> AppResult<Vec<SiteConfig>
     state.store.list()
 }
 
-/// 新增或更新站点配置（密钥自动托管至操作系统凭据库）
+/// 新增或更新站点配置（密钥自动托管至操作系统凭据库，仅主窗口可调用）
 #[tauri::command]
-pub async fn save_site(state: State<'_, AppState>, input: SiteInput) -> AppResult<SiteConfig> {
-    state.store.save(input)
+pub async fn save_site(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    input: SiteInput,
+) -> AppResult<SiteConfig> {
+    state.ensure_main_window(&window, "save_site")?;
+    let save_secret = input.save_secret;
+    let saved = state.store.save(input)?;
+    state.audit.record(
+        AuditSeverity::Info,
+        AuditCategory::Credential,
+        "site_saved",
+        &format!("{}:{}", saved.host, saved.port),
+        &format!(
+            "保存站点「{}」(协议={:?}, 凭据托管={})",
+            saved.name, saved.protocol, save_secret
+        ),
+    );
+    Ok(saved)
 }
 
-/// 删除站点配置并清理对应的系统凭据
+/// 删除站点配置并清理对应的系统凭据（仅主窗口可调用）
 #[tauri::command]
-pub async fn delete_site(state: State<'_, AppState>, site_id: String) -> AppResult<()> {
-    state.store.delete(&site_id)
-}
-
-/// 将站点列表导出为本地 JSON 备份文件（不包含敏感密钥）
-#[tauri::command]
-pub async fn export_sites_to_file(state: State<'_, AppState>, file_path: String) -> AppResult<()> {
-    let json = state.store.export_json()?;
-    tokio::fs::write(&file_path, json).await?;
+pub async fn delete_site(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    site_id: String,
+) -> AppResult<()> {
+    state.ensure_main_window(&window, "delete_site")?;
+    let target = state
+        .store
+        .get(&site_id)
+        .map(|s| format!("{} ({}:{})", s.name, s.host, s.port))
+        .unwrap_or_else(|_| site_id.clone());
+    state.store.delete(&site_id)?;
+    state.audit.record(
+        AuditSeverity::Warn,
+        AuditCategory::Credential,
+        "site_deleted",
+        &target,
+        "已删除站点配置并清理系统凭据库中的关联密钥",
+    );
     Ok(())
 }
 
-/// 从本地 JSON 备份文件导入站点配置，返回成功导入的站点数量
+/// 将站点列表导出为本地 JSON 备份文件（不包含敏感密钥，仅主窗口且限 `.json` 文件）
+#[tauri::command]
+pub async fn export_sites_to_file(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    file_path: String,
+) -> AppResult<()> {
+    state.ensure_main_window(&window, "export_sites_to_file")?;
+    validate_scoped_file_path(Path::new(&file_path), &["json"])?;
+    let json = state.store.export_json()?;
+    tokio::fs::write(&file_path, json).await?;
+    state.audit.record(
+        AuditSeverity::Info,
+        AuditCategory::Credential,
+        "sites_exported",
+        &file_path,
+        "已导出脱敏站点配置备份（不含密钥）",
+    );
+    Ok(())
+}
+
+/// 从本地 JSON 备份文件导入站点配置，返回成功导入的站点数量（仅主窗口且限 `.json` 文件）
 #[tauri::command]
 pub async fn import_sites_from_file(
+    window: WebviewWindow,
     state: State<'_, AppState>,
     file_path: String,
 ) -> AppResult<usize> {
+    state.ensure_main_window(&window, "import_sites_from_file")?;
+    validate_scoped_file_path(Path::new(&file_path), &["json"])?;
     let json = tokio::fs::read_to_string(&file_path).await?;
-    state.store.import_json(&json)
+    let count = state.store.import_json(&json)?;
+    state.audit.record(
+        AuditSeverity::Info,
+        AuditCategory::Credential,
+        "sites_imported",
+        &file_path,
+        &format!("已导入 {} 个站点元数据（无密钥）", count),
+    );
+    Ok(count)
 }
 
 /// 检测本地 SSH Agent（Windows OpenSSH Agent / Pageant / Unix ssh-agent）运行状态与密钥数量
@@ -182,25 +309,92 @@ pub async fn check_ssh_agent_status() -> AgentStatus {
     sftp::check_ssh_agent_status().await
 }
 
-/// 列出所有已信任的 SSH 主机公钥指纹记录（TOFU）
+/// 列出所有已信任的 SSH 主机公钥指纹记录
 #[tauri::command]
 pub async fn list_known_hosts(state: State<'_, AppState>) -> AppResult<Vec<KnownHostEntry>> {
     state.known_hosts.list()
 }
 
-/// 移除指定 `host:port` 的已知 SSH 主机公钥指纹（用于服务器重装后重新信任）
+/// 移除指定 `host:port` 的已知 SSH 主机公钥指纹（仅主窗口可调用）
 #[tauri::command]
-pub async fn remove_known_host(state: State<'_, AppState>, host_port: String) -> AppResult<bool> {
-    state.known_hosts.remove(&host_port)
+pub async fn remove_known_host(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    host_port: String,
+) -> AppResult<bool> {
+    state.ensure_main_window(&window, "remove_known_host")?;
+    let removed = state.known_hosts.remove(&host_port)?;
+    if removed {
+        state.audit.record(
+            AuditSeverity::Warn,
+            AuditCategory::HostKey,
+            "host_key_removed",
+            &host_port,
+            "用户主动移除了已固定的 SSH 主机公钥指纹记录",
+        );
+    }
+    Ok(removed)
+}
+
+/// 经用户核对主机算法与 SHA-256 指纹并明确确认后，信任并保存该 SSH 主机指纹（仅主窗口可调用）
+#[tauri::command]
+pub async fn trust_known_host(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    host_port: String,
+    algorithm: String,
+    fingerprint: String,
+) -> AppResult<KnownHostEntry> {
+    state.ensure_main_window(&window, "trust_known_host")?;
+    let entry = state
+        .known_hosts
+        .trust_host(&host_port, &algorithm, &fingerprint)?;
+    state.audit.record(
+        AuditSeverity::Info,
+        AuditCategory::HostKey,
+        "host_key_trusted",
+        &entry.host_port,
+        &format!(
+            "用户确认信任 SSH 主机公钥 ({} / {})",
+            entry.algorithm, entry.fingerprint
+        ),
+    );
+    Ok(entry)
+}
+
+/// 查询最近的脱敏安全审计日志（仅主窗口可调用）
+#[tauri::command]
+pub async fn list_audit_logs(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    limit: Option<usize>,
+) -> AppResult<Vec<AuditEntry>> {
+    state.ensure_main_window(&window, "list_audit_logs")?;
+    state.audit.recent(limit.unwrap_or(200))
+}
+
+/// 将安全审计日志导出为本地 JSON 文件（仅主窗口且限 `.json` 文件）
+#[tauri::command]
+pub async fn export_audit_logs(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    file_path: String,
+) -> AppResult<()> {
+    state.ensure_main_window(&window, "export_audit_logs")?;
+    validate_scoped_file_path(Path::new(&file_path), &["json"])?;
+    let json = state.audit.export_json(1000)?;
+    tokio::fs::write(&file_path, json).await?;
+    Ok(())
 }
 
 // ============================================================================
 // 会话连接与生命周期管理
 // ============================================================================
 
-/// 连接已保存站点（优先读取系统凭据库中的密钥，支持本次临时覆盖）
+/// 连接已保存站点（严格读取系统凭据库中的密钥，仅主窗口可调用）
 #[tauri::command]
 pub async fn connect_saved_site(
+    window: WebviewWindow,
     state: State<'_, AppState>,
     site_id: String,
     override_secret: Option<String>,
@@ -208,8 +402,25 @@ pub async fn connect_saved_site(
     override_jump_secret: Option<String>,
     override_jump_passphrase: Option<String>,
 ) -> AppResult<SessionInfo> {
+    state.ensure_main_window(&window, "connect_saved_site")?;
     let site = state.store.get(&site_id)?;
-    let mut secrets = load_secrets(&site_id);
+    let has_override = override_secret.as_deref().is_some_and(|v| !v.is_empty())
+        || override_passphrase
+            .as_deref()
+            .is_some_and(|v| !v.is_empty());
+    let mut secrets = match load_secrets_strict(&site_id, site.has_saved_secret && !has_override) {
+        Ok(s) => s,
+        Err(e) => {
+            state.audit.record(
+                AuditSeverity::High,
+                AuditCategory::Credential,
+                "credential_load_failed",
+                &format!("{}:{}", site.host, site.port),
+                &e.to_string(),
+            );
+            return Err(e);
+        }
+    };
     if let Some(s) = override_secret.filter(|v| !v.is_empty()) {
         secrets.secret = Some(s);
     }
@@ -225,75 +436,143 @@ pub async fn connect_saved_site(
     create_session(&state, site, secrets).await
 }
 
-/// 使用临时表单参数建立一次性连接（不落盘保存）
+/// 使用临时表单参数建立一次性连接（不落盘保存，仅主窗口可调用）
 #[tauri::command]
-pub async fn connect_adhoc(state: State<'_, AppState>, input: SiteInput) -> AppResult<SessionInfo> {
+pub async fn connect_adhoc(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    mut input: SiteInput,
+) -> AppResult<SessionInfo> {
+    state.ensure_main_window(&window, "connect_adhoc")?;
     let secrets = SiteSecrets {
-        secret: input.secret.clone(),
-        passphrase: input.passphrase.clone(),
-        session_token: input.session_token.clone(),
-        jump_secret: input.jump_secret.clone(),
-        jump_passphrase: input.jump_passphrase.clone(),
+        secret: input.secret.take(),
+        passphrase: input.passphrase.take(),
+        session_token: input.session_token.take(),
+        jump_secret: input.jump_secret.take(),
+        jump_passphrase: input.jump_passphrase.take(),
     };
-    let jump_host = input.jump_host.filter(|s| !s.trim().is_empty());
+    let jump_host = input.jump_host.take().filter(|s| !s.trim().is_empty());
     let site = SiteConfig {
-        id: input.id.unwrap_or_default(),
+        id: input.id.take().unwrap_or_default(),
         name: if input.name.trim().is_empty() {
             format!("{}@{}", input.username, input.host)
         } else {
             input.name.trim().to_string()
         },
-        group: input.group,
+        group: std::mem::take(&mut input.group),
         protocol: input.protocol,
         host: input.host.trim().to_string(),
         port: input.port.unwrap_or_else(|| input.protocol.default_port()),
         username: input.username.trim().to_string(),
         auth_type: input.auth_type,
-        private_key_path: input.private_key_path.filter(|s| !s.trim().is_empty()),
+        private_key_path: input
+            .private_key_path
+            .take()
+            .filter(|s| !s.trim().is_empty()),
         remote_path: normalize_remote_path(&input.remote_path),
-        endpoint: input.endpoint.filter(|s| !s.trim().is_empty()),
-        bucket: input.bucket.filter(|s| !s.trim().is_empty()),
-        region: input.region.filter(|s| !s.trim().is_empty()),
+        endpoint: input.endpoint.take().filter(|s| !s.trim().is_empty()),
+        bucket: input.bucket.take().filter(|s| !s.trim().is_empty()),
+        region: input.region.take().filter(|s| !s.trim().is_empty()),
         path_style: input.path_style,
         tls_skip_verify: input.tls_skip_verify,
         jump_port: jump_host.as_ref().map(|_| input.jump_port.unwrap_or(22)),
         jump_username: jump_host
             .as_ref()
-            .and_then(|_| input.jump_username.filter(|s| !s.trim().is_empty())),
+            .and_then(|_| input.jump_username.take().filter(|s| !s.trim().is_empty())),
         jump_auth_type: jump_host.as_ref().and(input.jump_auth_type),
-        jump_private_key_path: jump_host
-            .as_ref()
-            .and_then(|_| input.jump_private_key_path.filter(|s| !s.trim().is_empty())),
+        jump_private_key_path: jump_host.as_ref().and_then(|_| {
+            input
+                .jump_private_key_path
+                .take()
+                .filter(|s| !s.trim().is_empty())
+        }),
         jump_host,
-        notes: input.notes,
+        notes: std::mem::take(&mut input.notes),
         has_saved_secret: false,
         updated_at: Utc::now().timestamp(),
     };
     create_session(&state, site, secrets).await
 }
 
-/// 解析地址栏快速直连 URI 并立即建立远程会话
+/// 解析地址栏快速直连 URI 并立即建立远程会话（仅主窗口可调用）
 #[tauri::command]
-pub async fn quick_connect_uri(state: State<'_, AppState>, uri: String) -> AppResult<SessionInfo> {
+pub async fn quick_connect_uri(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    uri: String,
+) -> AppResult<SessionInfo> {
+    state.ensure_main_window(&window, "quick_connect_uri")?;
     let parsed = parse_quick_connect_uri(&uri)?;
-    connect_adhoc(state, parsed).await
+    connect_adhoc(window, state, parsed).await
 }
 
-/// 建立远程连接并注册到全局活跃会话池
+/// 建立远程连接并注册到全局活跃会话池（同步写入脱敏安全审计日志）
 async fn create_session(
     state: &State<'_, AppState>,
     site: SiteConfig,
     secrets: SiteSecrets,
 ) -> AppResult<SessionInfo> {
+    let target_label = format!("{}:{}", site.host, site.port);
     let site_for_connect = site.clone();
     let secrets_for_connect = secrets.clone();
     let known_hosts = state.known_hosts.clone();
     // 在独立异步任务中完成网络握手，避免连接过程阻塞状态锁
-    let fs = tokio::spawn(async move {
+    let connect_res = tokio::spawn(async move {
         connect_protocol(site_for_connect, secrets_for_connect, known_hosts).await
     })
     .await
-    .map_err(|e| AppError::Connection(format!("连接任务异常: {}", e)))??;
+    .map_err(|e| AppError::Connection(format!("连接任务异常: {}", e)))?;
+
+    let fs = match connect_res {
+        Ok(fs) => fs,
+        Err(err) => {
+            match &err {
+                AppError::HostKeyUnknown(_) => state.audit.record(
+                    AuditSeverity::Info,
+                    AuditCategory::HostKey,
+                    "host_key_confirm_required",
+                    &target_label,
+                    "首次连接未知 SSH 主机，已暂停连接等待用户核对公钥指纹",
+                ),
+                AppError::HostKeyMismatch(_) => state.audit.record(
+                    AuditSeverity::Critical,
+                    AuditCategory::HostKey,
+                    "host_key_mismatch",
+                    &target_label,
+                    "检测到 SSH 主机公钥指纹变化，已立即阻断连接以防范中间人攻击",
+                ),
+                AppError::SecurityPolicy(msg) => state.audit.record(
+                    AuditSeverity::High,
+                    AuditCategory::SecurityPolicy,
+                    "connect_policy_blocked",
+                    &target_label,
+                    msg,
+                ),
+                AppError::Auth(msg) => state.audit.record(
+                    AuditSeverity::Warn,
+                    AuditCategory::Session,
+                    "auth_failed",
+                    &target_label,
+                    msg,
+                ),
+                other => state.audit.record(
+                    AuditSeverity::Warn,
+                    AuditCategory::Session,
+                    "connect_failed",
+                    &target_label,
+                    &other.to_string(),
+                ),
+            }
+            return Err(err);
+        }
+    };
+
+    let insecure_transport = matches!(site.protocol, Protocol::Ftp)
+        || (matches!(site.protocol, Protocol::Webdav | Protocol::S3)
+            && site
+                .endpoint
+                .as_deref()
+                .is_some_and(|e| e.to_ascii_lowercase().starts_with("http://")));
 
     let session_id = Uuid::new_v4().to_string();
     let info = SessionInfo {
@@ -310,6 +589,8 @@ async fn create_session(
         current_path: normalize_remote_path(&site.remote_path),
         supports_shell: site.protocol.supports_shell(),
         supports_chmod: site.protocol.supports_chmod(),
+        insecure_transport,
+        tls_skip_verify: site.tls_skip_verify,
     };
 
     state.sessions.write().await.insert(
@@ -319,12 +600,42 @@ async fn create_session(
             fs,
         },
     );
+
+    let severity = if insecure_transport || site.tls_skip_verify {
+        AuditSeverity::Warn
+    } else {
+        AuditSeverity::Info
+    };
+    state.audit.record(
+        severity,
+        AuditCategory::Session,
+        "session_connected",
+        &target_label,
+        &format!(
+            "已建立 {:?} 会话「{}」(明文={}, 跳过TLS校验={})",
+            site.protocol, site.name, insecure_transport, site.tls_skip_verify
+        ),
+    );
     Ok(info)
 }
 
-/// 主动断开指定远程会话并释放底层连接及关联的 PTY 终端资源
+/// 主动断开指定远程会话并彻底释放底层连接、关联传输任务、PTY 通道与独立终端窗口
 #[tauri::command]
-pub async fn disconnect_session(state: State<'_, AppState>, session_id: String) -> AppResult<()> {
+pub async fn disconnect_session(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    session_id: String,
+) -> AppResult<()> {
+    state.ensure_main_window(&window, "disconnect_session")?;
+
+    // 1. 取消该会话名下所有尚未完成的排队/运行中传输任务并同步通知前端
+    let cancelled_tasks = state.transfers.cancel_by_session(&session_id).await;
+    for task in cancelled_tasks {
+        let _ = app.emit(TRANSFER_EVENT, task);
+    }
+
+    // 2. 关闭该会话名下所有活跃 PTY 通道
     let to_close: Vec<tokio::sync::mpsc::Sender<PtyCommand>> = {
         let mut ptys = state.ptys.write().await;
         let ids: Vec<String> = ptys
@@ -339,7 +650,40 @@ pub async fn disconnect_session(state: State<'_, AppState>, session_id: String) 
     for tx in to_close {
         let _ = tx.send(PtyCommand::Close).await;
     }
-    state.sessions.write().await.remove(&session_id);
+
+    // 3. 关闭所有绑定到该会话的独立终端窗口（term-*）
+    let bound_windows: Vec<String> = {
+        let mut map = state.terminal_windows.write().await;
+        let labels: Vec<String> = map
+            .iter()
+            .filter(|(_, sid)| *sid == &session_id)
+            .map(|(lbl, _)| lbl.clone())
+            .collect();
+        for lbl in &labels {
+            map.remove(lbl);
+        }
+        labels
+    };
+    for lbl in bound_windows {
+        if let Some(win) = app.get_webview_window(&lbl) {
+            let _ = win.close();
+        }
+    }
+
+    // 4. 移除会话并记录审计日志
+    let removed = state.sessions.write().await.remove(&session_id);
+    if let Some(sess) = removed {
+        state.audit.record(
+            AuditSeverity::Info,
+            AuditCategory::Session,
+            "session_disconnected",
+            &format!("{}:{}", sess.info.host, sess.info.port),
+            &format!(
+                "已断开 {:?} 会话「{}」并清理全部关联资源",
+                sess.info.protocol, sess.info.name
+            ),
+        );
+    }
     Ok(())
 }
 
@@ -381,68 +725,114 @@ pub async fn remote_mkdir(
     fs.mkdir(&path).await
 }
 
-/// 删除远程文件或目录
+/// 删除远程文件或目录（仅主窗口可调用，并写入安全审计日志）
 #[tauri::command]
 pub async fn remote_delete(
+    window: WebviewWindow,
     state: State<'_, AppState>,
     session_id: String,
     path: String,
     is_dir: bool,
 ) -> AppResult<()> {
+    state.ensure_main_window(&window, "remote_delete")?;
     let fs = state.get_fs(&session_id).await?;
-    fs.remove(&path, is_dir).await
+    fs.remove(&path, is_dir).await?;
+    state.audit.record(
+        AuditSeverity::Warn,
+        AuditCategory::FileOp,
+        "remote_delete",
+        &path,
+        &format!(
+            "删除远程{} (session={})",
+            if is_dir { "目录" } else { "文件" },
+            session_id
+        ),
+    );
+    Ok(())
 }
 
-/// 重命名或移动远程文件/目录
+/// 重命名或移动远程文件/目录（仅主窗口可调用）
 #[tauri::command]
 pub async fn remote_rename(
+    window: WebviewWindow,
     state: State<'_, AppState>,
     session_id: String,
     from: String,
     to: String,
 ) -> AppResult<()> {
+    state.ensure_main_window(&window, "remote_rename")?;
     let fs = state.get_fs(&session_id).await?;
-    fs.rename(&from, &to).await
+    fs.rename(&from, &to).await?;
+    state.audit.record(
+        AuditSeverity::Info,
+        AuditCategory::FileOp,
+        "remote_rename",
+        &from,
+        &format!("重命名为 {}", to),
+    );
+    Ok(())
 }
 
-/// 修改远程文件/目录 Unix 权限（CHMOD）
+/// 修改远程文件/目录 Unix 权限（CHMOD，仅主窗口可调用并记录审计日志）
 #[tauri::command]
 pub async fn remote_chmod(
+    window: WebviewWindow,
     state: State<'_, AppState>,
     session_id: String,
     path: String,
     mode: u32,
 ) -> AppResult<()> {
+    state.ensure_main_window(&window, "remote_chmod")?;
     let fs = state.get_fs(&session_id).await?;
-    fs.chmod(&path, mode).await
+    fs.chmod(&path, mode).await?;
+    state.audit.record(
+        AuditSeverity::Warn,
+        AuditCategory::FileOp,
+        "remote_chmod",
+        &path,
+        &format!("修改远程权限为 {:03o}", mode & 0o7777),
+    );
+    Ok(())
 }
 
 /// 读取远程文本文件内容用于在线快速预览与编辑（限制 2 MB 以防内存溢出）
 #[tauri::command]
 pub async fn remote_read_text(
+    window: WebviewWindow,
     state: State<'_, AppState>,
     session_id: String,
     path: String,
 ) -> AppResult<String> {
+    state.ensure_main_window(&window, "remote_read_text")?;
     let fs = state.get_fs(&session_id).await?;
     let bytes = fs.read_bytes(&path, 2 * 1024 * 1024).await?;
     Ok(String::from_utf8_lossy(&bytes).to_string())
 }
 
-/// 将在线编辑后的文本内容直接回传保存至远程文件
+/// 将在线编辑后的文本内容直接回传保存至远程文件（仅主窗口可调用）
 #[tauri::command]
 pub async fn remote_write_text(
+    window: WebviewWindow,
     state: State<'_, AppState>,
     session_id: String,
     path: String,
     content: String,
 ) -> AppResult<()> {
+    state.ensure_main_window(&window, "remote_write_text")?;
     let fs = state.get_fs(&session_id).await?;
-    fs.write_bytes(&path, content.as_bytes()).await
+    fs.write_bytes(&path, content.as_bytes()).await?;
+    state.audit.record(
+        AuditSeverity::Info,
+        AuditCategory::FileOp,
+        "remote_write_text",
+        &path,
+        &format!("在线编辑并覆盖保存远程文件 ({} 字节)", content.len()),
+    );
+    Ok(())
 }
 
 // ============================================================================
-// 本地文件系统操作
+// 本地文件系统操作（仅主窗口可调用，且受后端路径安全策略约束）
 // ============================================================================
 
 /// 获取本地用户主目录
@@ -457,27 +847,68 @@ pub fn local_list_roots() -> Vec<LocalRoot> {
     local_fs::list_roots()
 }
 
-/// 列举本地目录内容
+/// 列举本地目录内容（仅主窗口可调用）
 #[tauri::command]
-pub async fn local_list_dir(path: String) -> AppResult<Vec<FileEntry>> {
+pub async fn local_list_dir(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    path: String,
+) -> AppResult<Vec<FileEntry>> {
+    state.ensure_main_window(&window, "local_list_dir")?;
     local_fs::list_dir(&path).await
 }
 
-/// 在本地创建文件夹
+/// 在本地创建文件夹（仅主窗口可调用）
 #[tauri::command]
-pub async fn local_mkdir(path: String) -> AppResult<()> {
+pub async fn local_mkdir(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    path: String,
+) -> AppResult<()> {
+    state.ensure_main_window(&window, "local_mkdir")?;
     local_fs::mkdir(&path).await
 }
 
-/// 删除本地文件或文件夹
+/// 删除本地文件或文件夹（仅主窗口可调用，并记录审计日志与拦截危险路径）
 #[tauri::command]
-pub async fn local_delete(path: String, is_dir: bool) -> AppResult<()> {
-    local_fs::delete(&path, is_dir).await
+pub async fn local_delete(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    path: String,
+    is_dir: bool,
+) -> AppResult<()> {
+    state.ensure_main_window(&window, "local_delete")?;
+    if let Err(err) = local_fs::delete(&path, is_dir).await {
+        if matches!(err, AppError::SecurityPolicy(_)) {
+            state.audit.record(
+                AuditSeverity::High,
+                AuditCategory::SecurityPolicy,
+                "local_delete_blocked",
+                &path,
+                &err.to_string(),
+            );
+        }
+        return Err(err);
+    }
+    state.audit.record(
+        AuditSeverity::Warn,
+        AuditCategory::FileOp,
+        "local_delete",
+        &path,
+        &format!("删除本地{}", if is_dir { "目录" } else { "文件" }),
+    );
+    Ok(())
 }
 
-/// 重命名本地文件或文件夹
+/// 重命名本地文件或文件夹（仅主窗口可调用）
 #[tauri::command]
-pub async fn local_rename(from: String, to: String) -> AppResult<()> {
+pub async fn local_rename(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    from: String,
+    to: String,
+) -> AppResult<()> {
+    state.ensure_main_window(&window, "local_rename")?;
     local_fs::rename(&from, &to).await
 }
 
@@ -552,15 +983,19 @@ fn walk_local_dir(local_dir: &Path, remote_dir: &str, plan: &mut UploadPlan) -> 
     Ok(())
 }
 
-/// 批量上传本地文件或文件夹（支持拖拽与多选，自动递归建目录并入队）
+/// 批量上传本地文件或文件夹（支持拖拽与多选，按窗口归属校验会话权限）
 #[tauri::command]
 pub async fn enqueue_upload_paths(
     app: AppHandle,
+    window: WebviewWindow,
     state: State<'_, AppState>,
     session_id: String,
     local_paths: Vec<String>,
     remote_dir: String,
 ) -> AppResult<Vec<TransferTask>> {
+    state
+        .ensure_window_session_access(&window, &session_id, "enqueue_upload_paths")
+        .await?;
     if local_paths.is_empty() {
         return Ok(Vec::new());
     }
@@ -599,21 +1034,24 @@ pub async fn enqueue_upload_paths(
 #[tauri::command]
 pub async fn enqueue_upload(
     app: AppHandle,
+    window: WebviewWindow,
     state: State<'_, AppState>,
     session_id: String,
     local_path: String,
     remote_dir: String,
 ) -> AppResult<Vec<TransferTask>> {
-    enqueue_upload_paths(app, state, session_id, vec![local_path], remote_dir).await
+    enqueue_upload_paths(app, window, state, session_id, vec![local_path], remote_dir).await
 }
 
-/// 下载远程单个文件（支持「另存为」精确路径）或递归下载整个远程文件夹
+/// 下载远程单个文件（支持「另存为」精确路径）或递归下载整个远程文件夹（仅主窗口可调用）
 #[tauri::command]
 pub async fn enqueue_download(
     app: AppHandle,
+    window: WebviewWindow,
     state: State<'_, AppState>,
     request: DownloadRequest,
 ) -> AppResult<Vec<TransferTask>> {
+    state.ensure_main_window(&window, "enqueue_download")?;
     let fs = state.get_fs(&request.session_id).await?;
     let norm = normalize_remote_path(&request.remote_path);
     let file_name = norm
@@ -622,18 +1060,18 @@ pub async fn enqueue_download(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| AppError::InvalidInput("无法解析远程名称".into()))?;
 
-    // 单文件下载模式
+    // 单文件下载模式（严格校验文件名、防盘符覆盖与防本地符号链接覆写）
     if !request.is_dir {
         let local_path =
             if let Some(exact) = request.local_file_path.filter(|s| !s.trim().is_empty()) {
+                ensure_not_symlink_target(Path::new(&exact))?;
                 exact
             } else {
                 let dir = request
                     .local_dir
                     .filter(|s| !s.trim().is_empty())
                     .ok_or_else(|| AppError::InvalidInput("请指定本地下载保存路径".into()))?;
-                PathBuf::from(&dir)
-                    .join(file_name)
+                resolve_safe_download_path(Path::new(&dir), file_name)?
                     .to_string_lossy()
                     .to_string()
             };
@@ -652,12 +1090,12 @@ pub async fn enqueue_download(
         return Ok(vec![task]);
     }
 
-    // 远程文件夹递归下载模式
+    // 远程文件夹递归下载模式（根目录及全部嵌套子项均强制经过安全路径解析，杜绝路径穿越与保留设备名）
     let target_dir = request
         .local_dir
         .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| AppError::InvalidInput("请指定本地下载保存目录".into()))?;
-    let root_local = PathBuf::from(&target_dir).join(file_name);
+    let root_local = resolve_safe_download_path(Path::new(&target_dir), file_name)?;
     tokio::fs::create_dir_all(&root_local).await?;
 
     let mut stack = vec![(norm, root_local)];
@@ -666,20 +1104,14 @@ pub async fn enqueue_download(
     while let Some((cur_remote, cur_local)) = stack.pop() {
         let entries = fs.list_dir(&cur_remote).await?;
         for entry in entries {
-            // 防御异常服务端返回 `..` 或带路径分隔符的文件名造成目录穿越
-            if entry.name.is_empty()
-                || entry.name == "."
-                || entry.name == ".."
-                || entry.name.contains('/')
-                || entry.name.contains('\\')
-            {
+            let Ok(next_local) = resolve_safe_download_path(&cur_local, &entry.name) else {
+                // 跳过恶意服务端返回的非法/穿越/保留设备名/符号链接目标条目
                 continue;
-            }
-            let next_local = cur_local.join(&entry.name);
+            };
             if entry.is_dir && !entry.is_symlink {
                 tokio::fs::create_dir_all(&next_local).await?;
                 stack.push((entry.path, next_local));
-            } else if !entry.is_dir {
+            } else if !entry.is_dir && !entry.is_symlink {
                 let task = state
                     .transfers
                     .enqueue(
@@ -727,20 +1159,8 @@ pub async fn clear_finished_transfers(state: State<'_, AppState>) -> AppResult<(
 }
 
 // ============================================================================
-// 内置 SSH 远程命令终端
+// 交互式 SSH PTY 终端与远端服务器硬件监测
 // ============================================================================
-
-/// 在当前 SFTP/SSH 会话的指定远程目录下执行 Shell 命令
-#[tauri::command]
-pub async fn ssh_exec_command(
-    state: State<'_, AppState>,
-    session_id: String,
-    command: String,
-    cwd: Option<String>,
-) -> AppResult<ShellOutput> {
-    let fs = state.get_fs(&session_id).await?;
-    fs.exec_shell(&command, cwd.as_deref()).await
-}
 
 /// 采集当前 SFTP/SSH 会话远端服务器的硬件规格、资源占用与多磁盘挂载点
 #[tauri::command]
@@ -752,23 +1172,29 @@ pub async fn remote_server_metrics(
     fs.server_metrics().await
 }
 
-/// 打开交互式 SSH PTY 伪终端（直接启动远端服务器默认登录 Shell，如 zsh/bash/fish/PowerShell）
+/// 打开交互式 SSH PTY 伪终端（校验窗口与会话归属，并启用输出速率/分片限流防刷屏 DoS）
 #[tauri::command]
 pub async fn ssh_pty_open(
     app: AppHandle,
+    window: WebviewWindow,
     state: State<'_, AppState>,
     session_id: String,
     cols: u32,
     rows: u32,
 ) -> AppResult<String> {
+    state
+        .ensure_window_session_access(&window, &session_id, "ssh_pty_open")
+        .await?;
     let fs = state.get_fs(&session_id).await?;
     let mut handle = fs.open_pty(cols, rows).await?;
 
+    let owner_window = window.label().to_string();
     let terminal_id = Uuid::new_v4().to_string();
     state.ptys.write().await.insert(
         terminal_id.clone(),
         ActivePty {
             session_id,
+            owner_window: owner_window.clone(),
             cmd_tx: handle.cmd_tx,
         },
     );
@@ -776,79 +1202,131 @@ pub async fn ssh_pty_open(
     let ptys_ref = state.ptys.clone();
     let tid = terminal_id.clone();
     tokio::spawn(async move {
+        let mut window_start = std::time::Instant::now();
+        let mut bytes_in_window: usize = 0;
+
         while let Some(chunk) = handle.output_rx.recv().await {
-            let data_b64 = base64::engine::general_purpose::STANDARD.encode(&chunk);
-            let _ = app.emit(
-                PTY_DATA_EVENT,
-                PtyDataEvent {
-                    terminal_id: tid.clone(),
-                    data_b64,
-                },
-            );
+            // 按 16 KB 切片发送，并对每秒超 1 MB 的远端异常刷屏输出进行轻量限流，防止前端内存耗尽
+            for slice in chunk.chunks(PTY_MAX_CHUNK_BYTES) {
+                if window_start.elapsed().as_secs() >= 1 {
+                    window_start = std::time::Instant::now();
+                    bytes_in_window = 0;
+                }
+                bytes_in_window = bytes_in_window.saturating_add(slice.len());
+                if bytes_in_window > PTY_MAX_BYTES_PER_SEC {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                let data_b64 = base64::engine::general_purpose::STANDARD.encode(slice);
+                let _ = app.emit_to(
+                    &owner_window,
+                    PTY_DATA_EVENT,
+                    PtyDataEvent {
+                        terminal_id: tid.clone(),
+                        data_b64,
+                    },
+                );
+            }
         }
         ptys_ref.write().await.remove(&tid);
-        let _ = app.emit(PTY_EXIT_EVENT, PtyExitEvent { terminal_id: tid });
+        let _ = app.emit_to(
+            &owner_window,
+            PTY_EXIT_EVENT,
+            PtyExitEvent { terminal_id: tid },
+        );
     });
 
     Ok(terminal_id)
 }
 
-/// 向活跃的交互式 SSH PTY 写入用户输入数据（支持按键、Tab、Ctrl+C、粘贴与中文）
+/// 向活跃的交互式 SSH PTY 写入用户输入数据（严格校验窗口归属，防范跨窗口劫持输入）
 #[tauri::command]
 pub async fn ssh_pty_write(
+    window: WebviewWindow,
     state: State<'_, AppState>,
     terminal_id: String,
     data: String,
 ) -> AppResult<()> {
-    let tx = state
-        .ptys
-        .read()
-        .await
-        .get(&terminal_id)
-        .map(|p| p.cmd_tx.clone())
-        .ok_or_else(|| AppError::SessionNotFound("终端会话已关闭".into()))?;
+    let tx = {
+        let guard = state.ptys.read().await;
+        let active = guard
+            .get(&terminal_id)
+            .ok_or_else(|| AppError::SessionNotFound("终端会话已关闭".into()))?;
+        if active.owner_window != window.label() {
+            return Err(AppError::PermissionDenied(
+                "安全策略拒绝：禁止跨窗口向他人 PTY 终端写入数据".into(),
+            ));
+        }
+        active.cmd_tx.clone()
+    };
     tx.send(PtyCommand::Input(data.into_bytes()))
         .await
         .map_err(|_| AppError::Protocol("终端输入通道已断开".into()))
 }
 
-/// 同步调整交互式 SSH PTY 窗口行列尺寸
+/// 同步调整交互式 SSH PTY 窗口行列尺寸（严格校验窗口归属）
 #[tauri::command]
 pub async fn ssh_pty_resize(
+    window: WebviewWindow,
     state: State<'_, AppState>,
     terminal_id: String,
     cols: u32,
     rows: u32,
 ) -> AppResult<()> {
-    if let Some(tx) = state
-        .ptys
-        .read()
-        .await
-        .get(&terminal_id)
-        .map(|p| p.cmd_tx.clone())
-    {
+    let tx = {
+        let guard = state.ptys.read().await;
+        match guard.get(&terminal_id) {
+            Some(active) if active.owner_window == window.label() => Some(active.cmd_tx.clone()),
+            Some(_) => {
+                return Err(AppError::PermissionDenied(
+                    "安全策略拒绝：禁止跨窗口修改他人 PTY 终端尺寸".into(),
+                ));
+            }
+            None => None,
+        }
+    };
+    if let Some(tx) = tx {
         let _ = tx.send(PtyCommand::Resize { cols, rows }).await;
     }
     Ok(())
 }
 
-/// 主动关闭指定交互式 SSH PTY 伪终端
+/// 主动关闭指定交互式 SSH PTY 伪终端（仅所属窗口或主窗口可关闭）
 #[tauri::command]
-pub async fn ssh_pty_close(state: State<'_, AppState>, terminal_id: String) -> AppResult<()> {
-    if let Some(active) = state.ptys.write().await.remove(&terminal_id) {
+pub async fn ssh_pty_close(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    terminal_id: String,
+) -> AppResult<()> {
+    let active = {
+        let mut guard = state.ptys.write().await;
+        match guard.get(&terminal_id) {
+            Some(p) if p.owner_window == window.label() || window.label() == "main" => {
+                guard.remove(&terminal_id)
+            }
+            Some(_) => {
+                return Err(AppError::PermissionDenied(
+                    "安全策略拒绝：无权关闭其他窗口的 PTY 终端".into(),
+                ));
+            }
+            None => None,
+        }
+    };
+    if let Some(active) = active {
         let _ = active.cmd_tx.send(PtyCommand::Close).await;
     }
     Ok(())
 }
 
-/// 为当前 SSH 会话打开独立的原生操作系统终端窗口（支持自由移动、最大化、缩小与副屏使用）
+/// 为当前 SSH 会话打开独立的原生操作系统终端窗口（仅主窗口可创建，并严格绑定会话归属）
 #[tauri::command]
 pub async fn open_terminal_window(
     app: AppHandle,
+    window: WebviewWindow,
     state: State<'_, AppState>,
     session_id: String,
     cwd: Option<String>,
 ) -> AppResult<String> {
+    state.ensure_main_window(&window, "open_terminal_window")?;
     let info = {
         let guard = state.sessions.read().await;
         guard
@@ -875,15 +1353,25 @@ pub async fn open_terminal_window(
         enc_sid, enc_name, enc_host, enc_cwd
     );
 
+    // 先登记窗口与会话绑定关系，避免新窗口启动瞬间调用 ssh_pty_open 时发生竞态
+    state
+        .terminal_windows
+        .write()
+        .await
+        .insert(label.clone(), session_id.clone());
+
     let title = format!("{} ({}) — xiaorui_FTP 终端", info.name, info.host);
-    WebviewWindowBuilder::new(&app, &label, WebviewUrl::App(url.into()))
+    if let Err(e) = WebviewWindowBuilder::new(&app, &label, WebviewUrl::App(url.into()))
         .title(&title)
         .inner_size(980.0, 620.0)
         .min_inner_size(560.0, 340.0)
         .center()
         .resizable(true)
         .build()
-        .map_err(|e| AppError::Protocol(format!("创建独立终端窗口失败: {}", e)))?;
+    {
+        state.terminal_windows.write().await.remove(&label);
+        return Err(AppError::Protocol(format!("创建独立终端窗口失败: {}", e)));
+    }
 
     Ok(label)
 }
@@ -899,9 +1387,15 @@ pub fn focus_main_window(app: AppHandle) -> AppResult<()> {
     Ok(())
 }
 
-/// 将终端缓冲区日志内容导出保存到本地指定文件路径
+/// 将终端缓冲区日志内容导出保存到本地指定文件（严格限制 `.log`/`.txt` 扩展名、非符号链接与 10 MB 上限）
 #[tauri::command]
 pub async fn save_text_file(file_path: String, content: String) -> AppResult<()> {
+    if content.len() > MAX_TEXT_EXPORT_BYTES {
+        return Err(AppError::SecurityPolicy(
+            "导出日志超过 10 MB 大小上限，已被安全策略拦截".into(),
+        ));
+    }
+    validate_scoped_file_path(Path::new(&file_path), &["log", "txt"])?;
     tokio::fs::write(&file_path, content).await?;
     Ok(())
 }
@@ -916,9 +1410,14 @@ pub fn get_app_settings(state: State<'_, AppState>) -> AppSettings {
     state.current_settings()
 }
 
-/// 更新「关闭时最小化到系统托盘」设置并持久化
+/// 更新「关闭时最小化到系统托盘」设置并持久化（仅主窗口可调用）
 #[tauri::command]
-pub fn set_minimize_to_tray(state: State<'_, AppState>, enabled: bool) -> AppResult<AppSettings> {
+pub fn set_minimize_to_tray(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> AppResult<AppSettings> {
+    state.ensure_main_window(&window, "set_minimize_to_tray")?;
     state.set_minimize_to_tray(enabled)
 }
 
