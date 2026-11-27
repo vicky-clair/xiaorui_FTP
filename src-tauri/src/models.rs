@@ -331,6 +331,21 @@ pub struct ShellOutput {
     pub exit_code: i32,
 }
 
+/// 交互式 SSH PTY 输出流事件载荷（使用 Base64 传输原始字节流，避免多字节 UTF-8 中文跨包截断乱码）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PtyDataEvent {
+    pub terminal_id: String,
+    pub data_b64: String,
+}
+
+/// 交互式 SSH PTY 退出事件载荷
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PtyExitEvent {
+    pub terminal_id: String,
+}
+
 /// 本地快捷根位置（主目录、桌面、下载或 Windows 盘符）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

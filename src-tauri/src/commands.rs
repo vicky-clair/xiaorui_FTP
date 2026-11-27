@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use base64::Engine;
 use chrono::Utc;
 use serde::Deserialize;
 use tauri::{AppHandle, Emitter, State};
@@ -20,12 +21,22 @@ use crate::local_fs;
 use crate::models::parse_quick_connect_uri;
 use crate::models::{
     join_remote_path, normalize_remote_path, AgentStatus, AppSettings, FileEntry, LocalRoot,
-    ServerMetrics, SessionInfo, ShellOutput, SiteConfig, SiteInput, SiteSecrets, TransferDirection,
-    TransferTask,
+    PtyDataEvent, PtyExitEvent, ServerMetrics, SessionInfo, ShellOutput, SiteConfig, SiteInput,
+    SiteSecrets, TransferDirection, TransferTask,
 };
-use crate::protocols::{connect_protocol, sftp, RemoteFs};
+use crate::protocols::{connect_protocol, sftp, PtyCommand, RemoteFs};
 use crate::storage::{load_secrets, SiteStore};
 use crate::transfer::{TransferManager, TRANSFER_EVENT};
+
+/// 向前端推送交互式 SSH PTY 原始输出与退出状态的事件名
+pub const PTY_DATA_EVENT: &str = "pty://data";
+pub const PTY_EXIT_EVENT: &str = "pty://exit";
+
+/// 活跃交互式 SSH PTY 实例
+pub struct ActivePty {
+    pub session_id: String,
+    pub cmd_tx: tokio::sync::mpsc::Sender<PtyCommand>,
+}
 
 /// 活跃远程会话实例（包含元数据与协议适配器句柄）
 pub struct ActiveSession {
@@ -45,6 +56,8 @@ pub struct AppState {
     minimize_to_tray: AtomicBool,
     /// 当前所有活跃的远程会话映射表（session_id -> ActiveSession）
     pub sessions: RwLock<HashMap<String, ActiveSession>>,
+    /// 当前所有活跃的交互式 SSH PTY 伪终端映射表（terminal_id -> ActivePty）
+    pub ptys: Arc<RwLock<HashMap<String, ActivePty>>>,
     /// 后台并发传输队列管理器
     pub transfers: TransferManager,
 }
@@ -63,6 +76,7 @@ impl AppState {
             settings_file,
             minimize_to_tray: AtomicBool::new(loaded_settings.minimize_to_tray),
             sessions: RwLock::new(HashMap::new()),
+            ptys: Arc::new(RwLock::new(HashMap::new())),
             transfers: TransferManager::new(3),
         })
     }
@@ -307,9 +321,23 @@ async fn create_session(
     Ok(info)
 }
 
-/// 主动断开指定远程会话并释放底层连接资源
+/// 主动断开指定远程会话并释放底层连接及关联的 PTY 终端资源
 #[tauri::command]
 pub async fn disconnect_session(state: State<'_, AppState>, session_id: String) -> AppResult<()> {
+    let to_close: Vec<tokio::sync::mpsc::Sender<PtyCommand>> = {
+        let mut ptys = state.ptys.write().await;
+        let ids: Vec<String> = ptys
+            .iter()
+            .filter(|(_, p)| p.session_id == session_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.into_iter()
+            .filter_map(|id| ptys.remove(&id).map(|p| p.cmd_tx))
+            .collect()
+    };
+    for tx in to_close {
+        let _ = tx.send(PtyCommand::Close).await;
+    }
     state.sessions.write().await.remove(&session_id);
     Ok(())
 }
@@ -721,6 +749,95 @@ pub async fn remote_server_metrics(
 ) -> AppResult<ServerMetrics> {
     let fs = state.get_fs(&session_id).await?;
     fs.server_metrics().await
+}
+
+/// 打开交互式 SSH PTY 伪终端（直接启动远端服务器默认登录 Shell，如 zsh/bash/fish/PowerShell）
+#[tauri::command]
+pub async fn ssh_pty_open(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    session_id: String,
+    cols: u32,
+    rows: u32,
+) -> AppResult<String> {
+    let fs = state.get_fs(&session_id).await?;
+    let mut handle = fs.open_pty(cols, rows).await?;
+
+    let terminal_id = Uuid::new_v4().to_string();
+    state.ptys.write().await.insert(
+        terminal_id.clone(),
+        ActivePty {
+            session_id,
+            cmd_tx: handle.cmd_tx,
+        },
+    );
+
+    let ptys_ref = state.ptys.clone();
+    let tid = terminal_id.clone();
+    tokio::spawn(async move {
+        while let Some(chunk) = handle.output_rx.recv().await {
+            let data_b64 = base64::engine::general_purpose::STANDARD.encode(&chunk);
+            let _ = app.emit(
+                PTY_DATA_EVENT,
+                PtyDataEvent {
+                    terminal_id: tid.clone(),
+                    data_b64,
+                },
+            );
+        }
+        ptys_ref.write().await.remove(&tid);
+        let _ = app.emit(PTY_EXIT_EVENT, PtyExitEvent { terminal_id: tid });
+    });
+
+    Ok(terminal_id)
+}
+
+/// 向活跃的交互式 SSH PTY 写入用户输入数据（支持按键、Tab、Ctrl+C、粘贴与中文）
+#[tauri::command]
+pub async fn ssh_pty_write(
+    state: State<'_, AppState>,
+    terminal_id: String,
+    data: String,
+) -> AppResult<()> {
+    let tx = state
+        .ptys
+        .read()
+        .await
+        .get(&terminal_id)
+        .map(|p| p.cmd_tx.clone())
+        .ok_or_else(|| AppError::SessionNotFound("终端会话已关闭".into()))?;
+    tx.send(PtyCommand::Input(data.into_bytes()))
+        .await
+        .map_err(|_| AppError::Protocol("终端输入通道已断开".into()))
+}
+
+/// 同步调整交互式 SSH PTY 窗口行列尺寸
+#[tauri::command]
+pub async fn ssh_pty_resize(
+    state: State<'_, AppState>,
+    terminal_id: String,
+    cols: u32,
+    rows: u32,
+) -> AppResult<()> {
+    if let Some(tx) = state
+        .ptys
+        .read()
+        .await
+        .get(&terminal_id)
+        .map(|p| p.cmd_tx.clone())
+    {
+        let _ = tx.send(PtyCommand::Resize { cols, rows }).await;
+    }
+    Ok(())
+}
+
+/// 主动关闭指定交互式 SSH PTY 伪终端
+#[tauri::command]
+pub async fn ssh_pty_close(state: State<'_, AppState>, terminal_id: String) -> AppResult<()> {
+    if let Some(active) = state.ptys.write().await.remove(&terminal_id) {
+        let _ = active.cmd_tx.send(PtyCommand::Close).await;
+    }
+    Ok(())
 }
 
 // ============================================================================

@@ -12,6 +12,8 @@ import type {
   FileEntry,
   KnownHostEntry,
   LocalRoot,
+  PtyDataEvent,
+  PtyExitEvent,
   ServerMetrics,
   SessionInfo,
   ShellOutput,
@@ -116,7 +118,7 @@ export const api = {
   onTransferUpdate: (cb: (task: TransferTask) => void): Promise<UnlistenFn> =>
     listen<TransferTask>("transfer://update", (ev) => cb(ev.payload)),
 
-  // ---------------- SSH 远程终端与服务器硬件监测 ----------------
+  // ---------------- SSH 远程终端、交互式 PTY 与服务器硬件监测 ----------------
   sshExecCommand: (sessionId: string, command: string, cwd?: string) =>
     invoke<ShellOutput>("ssh_exec_command", {
       sessionId,
@@ -125,4 +127,16 @@ export const api = {
     }),
   remoteServerMetrics: (sessionId: string) =>
     invoke<ServerMetrics>("remote_server_metrics", { sessionId }),
+  sshPtyOpen: (sessionId: string, cols: number, rows: number) =>
+    invoke<string>("ssh_pty_open", { sessionId, cols, rows }),
+  sshPtyWrite: (terminalId: string, data: string) =>
+    invoke<void>("ssh_pty_write", { terminalId, data }),
+  sshPtyResize: (terminalId: string, cols: number, rows: number) =>
+    invoke<void>("ssh_pty_resize", { terminalId, cols, rows }),
+  sshPtyClose: (terminalId: string) =>
+    invoke<void>("ssh_pty_close", { terminalId }),
+  onPtyData: (cb: (ev: PtyDataEvent) => void): Promise<UnlistenFn> =>
+    listen<PtyDataEvent>("pty://data", (ev) => cb(ev.payload)),
+  onPtyExit: (cb: (ev: PtyExitEvent) => void): Promise<UnlistenFn> =>
+    listen<PtyExitEvent>("pty://exit", (ev) => cb(ev.payload)),
 };

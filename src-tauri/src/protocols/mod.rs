@@ -23,6 +23,22 @@ use crate::models::{
 /// 传输进度回调函数类型：参数依次为 `(已传输字节数, 总字节数)`
 pub type ProgressCallback = Arc<dyn Fn(u64, u64) + Send + Sync>;
 
+/// 向交互式远端 PTY 发送的控制指令
+pub enum PtyCommand {
+    /// 写入原始用户输入字节（含方向键、Tab、Ctrl+C、中文 UTF-8 等）
+    Input(Vec<u8>),
+    /// 同步终端行列尺寸（触发远端 SIGWINCH）
+    Resize { cols: u32, rows: u32 },
+    /// 主动关闭 PTY 通道
+    Close,
+}
+
+/// 已打开的交互式远端 PTY 双向异步流句柄
+pub struct PtyHandle {
+    pub cmd_tx: tokio::sync::mpsc::Sender<PtyCommand>,
+    pub output_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+}
+
 /// 统一异步远程文件系统抽象接口
 #[async_trait]
 pub trait RemoteFs: Send + Sync {
@@ -80,6 +96,13 @@ pub trait RemoteFs: Send + Sync {
     async fn server_metrics(&self) -> AppResult<ServerMetrics> {
         Err(AppError::Unsupported(
             "仅 SFTP/SSH 会话支持采集远端硬件规格与磁盘信息".into(),
+        ))
+    }
+
+    /// 打开交互式远端 PTY 伪终端并启动服务器默认登录 Shell（如 zsh / bash / fish / PowerShell）
+    async fn open_pty(&self, _cols: u32, _rows: u32) -> AppResult<PtyHandle> {
+        Err(AppError::Unsupported(
+            "仅 SFTP/SSH 会话支持交互式伪终端 (PTY)".into(),
         ))
     }
 }

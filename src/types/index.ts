@@ -151,6 +151,17 @@ export interface ShellOutput {
   exitCode: number;
 }
 
+/** 交互式 SSH PTY 输出流事件（Base64 原始字节） */
+export interface PtyDataEvent {
+  terminalId: string;
+  dataB64: string;
+}
+
+/** 交互式 SSH PTY 退出事件 */
+export interface PtyExitEvent {
+  terminalId: string;
+}
+
 /** 本地快捷位置或盘符项 */
 export interface LocalRoot {
   name: string;

@@ -1089,6 +1089,7 @@ export default function App() {
 
           {terminalOpen && activeSession?.supportsShell && (
             <TerminalDrawer
+              key={activeSession.sessionId}
               sessionId={activeSession.sessionId}
               sessionName={activeSession.name}
               cwd={remotePath}

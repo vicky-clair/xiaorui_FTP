@@ -28,7 +28,7 @@ use crate::models::{
     format_unix_mode, join_remote_path, normalize_remote_path, AgentStatus, AuthType, FileEntry,
     RemoteDisk, ServerMetrics, ShellOutput,
 };
-use crate::protocols::{ProgressCallback, RemoteFs};
+use crate::protocols::{ProgressCallback, PtyCommand, PtyHandle, RemoteFs};
 
 /// SSH 客户端事件回调处理器（负责 TOFU 主机公钥指纹固定与变更拦截）
 struct ClientHandler {
@@ -913,6 +913,74 @@ echo "DISKS_END"
         let out = self.exec_shell(win_probe, None).await?;
         parse_server_metrics(&out.stdout)
             .ok_or_else(|| AppError::Protocol("无法解析远端服务器硬件与磁盘信息".into()))
+    }
+
+    async fn open_pty(&self, cols: u32, rows: u32) -> AppResult<PtyHandle> {
+        // 仅在申请新通道期间短暂持有 SSH 句柄锁，随后释放锁，不阻塞 SFTP 浏览与硬件监测
+        let mut channel = {
+            let ssh = self.ssh.lock().await;
+            ssh.channel_open_session()
+                .await
+                .map_err(|e| AppError::Protocol(format!("打开 SSH PTY 通道失败: {}", e)))?
+        };
+
+        let safe_cols = cols.clamp(20, 500);
+        let safe_rows = rows.clamp(5, 200);
+
+        // 申请标准 xterm-256color 伪终端并启动远端默认登录 Shell（zsh/bash/fish/PowerShell）
+        channel
+            .request_pty(false, "xterm-256color", safe_cols, safe_rows, 0, 0, &[])
+            .await
+            .map_err(|e| AppError::Protocol(format!("申请远程 PTY 伪终端失败: {}", e)))?;
+        channel
+            .request_shell(true)
+            .await
+            .map_err(|e| AppError::Protocol(format!("启动远程默认 Shell 失败: {}", e)))?;
+
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<PtyCommand>(256);
+        let (output_tx, output_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    cmd = cmd_rx.recv() => {
+                        match cmd {
+                            Some(PtyCommand::Input(bytes)) => {
+                                if channel.data(bytes.as_slice()).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Some(PtyCommand::Resize { cols, rows }) => {
+                                let _ = channel
+                                    .window_change(cols.clamp(20, 500), rows.clamp(5, 200), 0, 0)
+                                    .await;
+                            }
+                            Some(PtyCommand::Close) | None => {
+                                let _ = channel.eof().await;
+                                let _ = channel.close().await;
+                                break;
+                            }
+                        }
+                    }
+                    msg = channel.wait() => {
+                        match msg {
+                            Some(ChannelMsg::Data { data })
+                            | Some(ChannelMsg::ExtendedData { data, .. }) => {
+                                if output_tx.send(data.to_vec()).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Some(ChannelMsg::Eof | ChannelMsg::Close) | None => {
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(PtyHandle { cmd_tx, output_rx })
     }
 }
 
