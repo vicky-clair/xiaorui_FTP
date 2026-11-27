@@ -135,6 +135,11 @@ export const api = {
     invoke<void>("ssh_pty_resize", { terminalId, cols, rows }),
   sshPtyClose: (terminalId: string) =>
     invoke<void>("ssh_pty_close", { terminalId }),
+  openTerminalWindow: (sessionId: string, cwd?: string) =>
+    invoke<string>("open_terminal_window", { sessionId, cwd: cwd ?? null }),
+  focusMainWindow: () => invoke<void>("focus_main_window"),
+  saveTextFile: (filePath: string, content: string) =>
+    invoke<void>("save_text_file", { filePath, content }),
   onPtyData: (cb: (ev: PtyDataEvent) => void): Promise<UnlistenFn> =>
     listen<PtyDataEvent>("pty://data", (ev) => cb(ev.payload)),
   onPtyExit: (cb: (ev: PtyExitEvent) => void): Promise<UnlistenFn> =>

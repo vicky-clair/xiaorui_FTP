@@ -136,13 +136,16 @@ pub fn run() {
             commands::list_transfers,
             commands::cancel_transfer,
             commands::clear_finished_transfers,
-            // SFTP 内置远程命令终端、交互式 PTY 与服务器硬件监测
+            // SFTP 内置远程命令终端、交互式 PTY、独立终端窗口与服务器硬件监测
             commands::ssh_exec_command,
             commands::remote_server_metrics,
             commands::ssh_pty_open,
             commands::ssh_pty_write,
             commands::ssh_pty_resize,
             commands::ssh_pty_close,
+            commands::open_terminal_window,
+            commands::focus_main_window,
+            commands::save_text_file,
         ])
         .run(tauri::generate_context!())
         .expect("启动 xiaorui_FTP 应用程序失败");

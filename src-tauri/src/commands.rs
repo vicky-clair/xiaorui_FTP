@@ -10,8 +10,9 @@ use std::sync::Arc;
 
 use base64::Engine;
 use chrono::Utc;
+use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use serde::Deserialize;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -837,6 +838,71 @@ pub async fn ssh_pty_close(state: State<'_, AppState>, terminal_id: String) -> A
     if let Some(active) = state.ptys.write().await.remove(&terminal_id) {
         let _ = active.cmd_tx.send(PtyCommand::Close).await;
     }
+    Ok(())
+}
+
+/// 为当前 SSH 会话打开独立的原生操作系统终端窗口（支持自由移动、最大化、缩小与副屏使用）
+#[tauri::command]
+pub async fn open_terminal_window(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    session_id: String,
+    cwd: Option<String>,
+) -> AppResult<String> {
+    let info = {
+        let guard = state.sessions.read().await;
+        guard
+            .get(&session_id)
+            .map(|s| s.info.clone())
+            .ok_or_else(|| AppError::SessionNotFound(session_id.clone()))?
+    };
+
+    if !info.supports_shell {
+        return Err(AppError::Unsupported(
+            "仅 SFTP/SSH 会话支持打开独立终端窗口".into(),
+        ));
+    }
+
+    let label = format!("term-{}", &Uuid::new_v4().simple().to_string()[..10]);
+    let enc_sid = utf8_percent_encode(&session_id, NON_ALPHANUMERIC).to_string();
+    let enc_name = utf8_percent_encode(&info.name, NON_ALPHANUMERIC).to_string();
+    let enc_host = utf8_percent_encode(&info.host, NON_ALPHANUMERIC).to_string();
+    let cur_cwd = cwd.unwrap_or_else(|| info.current_path.clone());
+    let enc_cwd = utf8_percent_encode(&cur_cwd, NON_ALPHANUMERIC).to_string();
+
+    let url = format!(
+        "index.html?mode=terminal&sessionId={}&name={}&host={}&cwd={}",
+        enc_sid, enc_name, enc_host, enc_cwd
+    );
+
+    let title = format!("{} ({}) — xiaorui_FTP 终端", info.name, info.host);
+    WebviewWindowBuilder::new(&app, &label, WebviewUrl::App(url.into()))
+        .title(&title)
+        .inner_size(980.0, 620.0)
+        .min_inner_size(560.0, 340.0)
+        .center()
+        .resizable(true)
+        .build()
+        .map_err(|e| AppError::Protocol(format!("创建独立终端窗口失败: {}", e)))?;
+
+    Ok(label)
+}
+
+/// 呼出并聚焦主窗口（供独立终端窗口一键切回文件双栏视图）
+#[tauri::command]
+pub fn focus_main_window(app: AppHandle) -> AppResult<()> {
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.unminimize();
+        let _ = win.show();
+        let _ = win.set_focus();
+    }
+    Ok(())
+}
+
+/// 将终端缓冲区日志内容导出保存到本地指定文件路径
+#[tauri::command]
+pub async fn save_text_file(file_path: String, content: String) -> AppResult<()> {
+    tokio::fs::write(&file_path, content).await?;
     Ok(())
 }
 

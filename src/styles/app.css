@@ -1376,9 +1376,24 @@ select:focus-visible {
   flex-shrink: 0;
 }
 
-/* Terminal (xterm.js interactive PTY) */
+/* Terminal (Xshell-style multi-tab interactive PTY) */
 .terminal-drawer {
   position: relative;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+}
+
+.terminal-maximized {
+  flex: 1;
+  min-height: 0;
+  border-top: none;
+}
+
+.terminal-standalone {
+  width: 100%;
+  height: 100%;
+  border-top: none;
 }
 
 .drawer-resizer {
@@ -1398,6 +1413,150 @@ select:focus-visible {
   background: var(--accent);
 }
 
+.terminal-toolbar {
+  height: 36px;
+  gap: 8px;
+  padding: 0 10px;
+  flex-shrink: 0;
+}
+
+.term-tabs {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  overflow-x: auto;
+}
+
+.term-tabs::-webkit-scrollbar {
+  height: 2px;
+}
+
+.term-session-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-right: 4px;
+}
+
+.term-tab {
+  height: 24px;
+  padding: 0 6px 0 8px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
+}
+
+.term-tab:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.term-tab.active {
+  background: var(--surface-subtle);
+  border-color: var(--border);
+  color: var(--text);
+}
+
+.term-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.term-zoom-group {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--surface-subtle);
+  height: 23px;
+  overflow: hidden;
+  font-size: 11px;
+}
+
+.term-zoom-group button {
+  height: 100%;
+  padding: 0 6px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.term-zoom-group button:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.term-zoom-group span {
+  padding: 0 4px;
+  color: var(--text-muted);
+  border-left: 1px solid var(--border);
+  border-right: 1px solid var(--border);
+}
+
+.term-theme-select {
+  height: 23px;
+  padding: 0 5px;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: var(--surface-subtle);
+  font-size: 11px;
+  color: var(--text-secondary);
+  outline: none;
+  cursor: pointer;
+}
+
+.term-search-bar {
+  height: 32px;
+  padding: 0 10px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--surface-subtle);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.term-search-bar input {
+  flex: 1;
+  min-width: 120px;
+  height: 24px;
+  padding: 0 8px;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  font-size: 12px;
+  outline: none;
+}
+
+.term-search-bar input:focus {
+  border-color: var(--accent);
+}
+
+.term-viewport-wrap {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+}
+
 .xterm-host {
   flex: 1;
   min-height: 0;
@@ -1413,6 +1572,84 @@ select:focus-visible {
 
 .xterm-host .xterm-viewport {
   overflow-y: auto !important;
+}
+
+/* Xshell Quick Command Bar */
+.term-snippets-bar {
+  min-height: 30px;
+  padding: 4px 10px;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.term-snippets-label {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text-muted);
+  margin-right: 2px;
+  user-select: none;
+}
+
+.term-snippet-chip {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: var(--surface-subtle);
+  overflow: hidden;
+}
+
+.term-snippet-run {
+  height: 21px;
+  padding: 0 7px;
+  font-size: 11.25px;
+  color: var(--text-secondary);
+  transition: background 0.12s, color 0.12s;
+}
+
+.term-snippet-run:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.term-snippet-del {
+  height: 21px;
+  width: 18px;
+  display: grid;
+  place-items: center;
+  color: var(--text-muted);
+  border-left: 1px solid var(--border);
+}
+
+.term-snippet-del:hover {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.term-snippet-form {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.term-snippet-form input {
+  height: 22px;
+  padding: 0 7px;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: var(--surface-subtle);
+  font-size: 11.5px;
+  outline: none;
+}
+
+.term-snippet-form input:focus {
+  border-color: var(--accent);
+  background: var(--surface);
 }
 
 /* Modal */

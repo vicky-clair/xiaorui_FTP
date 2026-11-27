@@ -31,6 +31,7 @@ import {
   RefreshCw,
   Search,
   Shield,
+  Terminal,
   Trash2,
   Upload,
 } from "lucide-react";
@@ -60,6 +61,8 @@ interface FilePaneProps {
   onDropEntryFromOtherPane?: (entry: FileEntry) => void;
   onEditFile?: (entry: FileEntry) => void;
   onChmod?: (entry: FileEntry) => void;
+  onOpenInTerminal?: (dirPath: string) => void;
+  onInsertPathToTerminal?: (path: string) => void;
 }
 
 type SortKey = "name" | "size" | "modified";
@@ -221,6 +224,8 @@ export const FilePane: React.FC<FilePaneProps> = ({
   onDropEntryFromOtherPane,
   onEditFile,
   onChmod,
+  onOpenInTerminal,
+  onInsertPathToTerminal,
 }) => {
   const [pathInput, setPathInput] = useState(currentPath);
   const [editingPath, setEditingPath] = useState(false);
@@ -801,6 +806,30 @@ export const FilePane: React.FC<FilePaneProps> = ({
             >
               <Shield size={14} />
               修改权限 (CHMOD)
+            </button>
+          )}
+          {mode === "remote" && onOpenInTerminal && contextMenu.entry.isDir && (
+            <button
+              className="context-menu-item"
+              onClick={() => {
+                onOpenInTerminal(contextMenu.entry.path);
+                setContextMenu(null);
+              }}
+            >
+              <Terminal size={14} color="var(--accent)" />
+              在此目录打开 SSH 终端
+            </button>
+          )}
+          {mode === "remote" && onInsertPathToTerminal && (
+            <button
+              className="context-menu-item"
+              onClick={() => {
+                onInsertPathToTerminal(contextMenu.entry.path);
+                setContextMenu(null);
+              }}
+            >
+              <Terminal size={14} />
+              将路径插入终端光标
             </button>
           )}
           <div className="context-menu-sep" />

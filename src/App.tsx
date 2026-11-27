@@ -32,7 +32,7 @@ import { FilePane } from "./components/FilePane";
 import { KnownHostsModal } from "./components/KnownHostsModal";
 import { SiteModal } from "./components/SiteModal";
 import { SiteSidebar } from "./components/SiteSidebar";
-import { TerminalDrawer } from "./components/TerminalDrawer";
+import { TerminalDrawer, type TerminalCommandRequest } from "./components/TerminalDrawer";
 import { TopBar } from "./components/TopBar";
 import { TransferDrawer } from "./components/TransferDrawer";
 import {
@@ -63,6 +63,8 @@ export default function App() {
   const [dualPane, setDualPane] = useState(true);
   const [transferOpen, setTransferOpen] = useState(false);
   const [terminalOpen, setTerminalOpen] = useState(false);
+  const [terminalMaximized, setTerminalMaximized] = useState(false);
+  const [terminalCommand, setTerminalCommand] = useState<TerminalCommandRequest | null>(null);
 
   // Sites & Modal
   const [sites, setSites] = useState<SiteConfig[]>([]);
@@ -197,6 +199,39 @@ export default function App() {
       window.clearInterval(timer);
     };
   }, [activeSession?.sessionId, activeSession?.supportsShell]);
+
+  /** 从远程文件面板一键在 SSH 终端进入指定目录 */
+  const handleOpenDirInTerminal = useCallback((dirPath: string) => {
+    setTransferOpen(false);
+    setTerminalOpen(true);
+    const isWinDrive = /^\/[A-Za-z]:/.test(dirPath);
+    const cmd = isWinDrive
+      ? `cd "${dirPath.slice(1).replace(/\//g, "\\")}"\r`
+      : `cd '${dirPath.replace(/'/g, "'\\''")}'\r`;
+    setTerminalCommand({ id: Date.now() + Math.random(), text: cmd });
+  }, []);
+
+  /** 从远程文件面板将文件/目录完整路径插入 SSH 终端当前光标位置 */
+  const handleInsertPathToTerminal = useCallback((filePath: string) => {
+    setTransferOpen(false);
+    setTerminalOpen(true);
+    const needsQuote = /\s|['"\\$`&;|<>()]/.test(filePath);
+    const formatted = needsQuote ? `'${filePath.replace(/'/g, "'\\''")}' ` : `${filePath} `;
+    setTerminalCommand({ id: Date.now() + Math.random(), text: formatted });
+  }, []);
+
+  /** 将当前 SSH 会话终端弹出为独立原生操作系统窗口 */
+  const handlePopOutTerminal = async () => {
+    if (!activeSession?.supportsShell) return;
+    try {
+      await api.openTerminalWindow(activeSession.sessionId, remotePath);
+      setTerminalOpen(false);
+      setTerminalMaximized(false);
+      pushToast(`已打开独立终端窗口：${activeSession.name}`, "info");
+    } catch (err) {
+      pushToast(String(err), "error");
+    }
+  };
 
   /** 切换「关闭窗口时最小化到系统托盘」偏好并持久化 */
   const handleToggleMinimizeToTray = async () => {
@@ -914,7 +949,11 @@ export default function App() {
             </div>
           )}
 
-          <div className="panes" ref={panesRef}>
+          <div
+            className="panes"
+            ref={panesRef}
+            style={terminalOpen && terminalMaximized ? { display: "none" } : undefined}
+          >
             {dualPane && (
               <FilePane
                 mode="local"
@@ -968,6 +1007,12 @@ export default function App() {
                 onDropEntryFromOtherPane={(e) => void handleUploadEntry(e)}
                 onEditFile={(e) => void handleOpenEditor(e)}
                 onChmod={(e) => void handleRemoteChmod(e)}
+                onOpenInTerminal={
+                  activeSession.supportsShell ? handleOpenDirInTerminal : undefined
+                }
+                onInsertPathToTerminal={
+                  activeSession.supportsShell ? handleInsertPathToTerminal : undefined
+                }
               />
             ) : (
               <section className="pane">
@@ -1093,7 +1138,15 @@ export default function App() {
               sessionId={activeSession.sessionId}
               sessionName={activeSession.name}
               cwd={remotePath}
-              onClose={() => setTerminalOpen(false)}
+              maximized={terminalMaximized}
+              pendingCommand={terminalCommand}
+              onToggleMaximize={() => setTerminalMaximized((v) => !v)}
+              onPopOut={() => void handlePopOutTerminal()}
+              onNotify={pushToast}
+              onClose={() => {
+                setTerminalOpen(false);
+                setTerminalMaximized(false);
+              }}
             />
           )}
         </main>
