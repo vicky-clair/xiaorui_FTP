@@ -339,6 +339,65 @@ pub struct LocalRoot {
     pub path: String,
 }
 
+fn default_true() -> bool {
+    true
+}
+
+/// 应用轻量偏好设置（独立存储于 `settings.json`，绝不触碰 `sites.json` 与凭据库）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppSettings {
+    /// 点击窗口关闭按钮时是否最小化到系统托盘（默认开启）
+    #[serde(default = "default_true")]
+    pub minimize_to_tray: bool,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            minimize_to_tray: true,
+        }
+    }
+}
+
+/// 远端服务器物理磁盘 / 挂载点信息（兼容 Linux 多挂载盘与 Windows 多盘符）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDisk {
+    /// 磁盘展示名（如 `/`、`/data`、`D:\`）
+    pub label: String,
+    /// 可直接跳转浏览的远程路径（如 `/`、`/data`、`/D:/`）
+    pub mount_path: String,
+    /// 总容量（字节）
+    pub total_bytes: u64,
+    /// 已用容量（字节）
+    pub used_bytes: u64,
+    /// 可用容量（字节）
+    pub avail_bytes: u64,
+    /// 使用率百分比（0–100）
+    pub use_percent: u8,
+}
+
+/// 远端服务器硬件规格与实时资源占用快照（SFTP / SSH 会话自动采集）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerMetrics {
+    /// 操作系统名称（如 Ubuntu 22.04 LTS / Windows Server）
+    pub os_name: String,
+    /// CPU 逻辑核心数
+    pub cpu_cores: u32,
+    /// CPU 实时占用率百分比（0.0–100.0）
+    pub cpu_usage_pct: Option<f32>,
+    /// 系统 1 分钟负载均值（Linux/macOS）
+    pub load_avg: Option<String>,
+    /// 内存已用字节数
+    pub mem_used_bytes: u64,
+    /// 内存总字节数
+    pub mem_total_bytes: u64,
+    /// 全部已挂载物理磁盘 / 盘符列表
+    pub disks: Vec<RemoteDisk>,
+}
+
 /// 规范化 POSIX 风格远程路径：统一斜杠方向、消除 `.` / `..` 与重复斜杠，始终以 `/` 开头
 pub fn normalize_remote_path(path: &str) -> String {
     let trimmed = path.trim().replace('\\', "/");

@@ -34,7 +34,7 @@ import {
   Trash2,
   Upload,
 } from "lucide-react";
-import { formatBytes, formatTime, type FileEntry, type LocalRoot } from "../types";
+import { formatBytes, formatTime, type FileEntry, type LocalRoot, type RemoteDisk } from "../types";
 
 interface FilePaneProps {
   mode: "local" | "remote";
@@ -43,6 +43,7 @@ interface FilePaneProps {
   entries: FileEntry[];
   loading: boolean;
   roots?: LocalRoot[];
+  remoteDisks?: RemoteDisk[];
   canTransfer: boolean;
   supportsChmod?: boolean;
   externalDropActive?: boolean;
@@ -203,6 +204,7 @@ export const FilePane: React.FC<FilePaneProps> = ({
   entries,
   loading,
   roots,
+  remoteDisks,
   canTransfer,
   supportsChmod,
   externalDropActive,
@@ -434,6 +436,26 @@ export const FilePane: React.FC<FilePaneProps> = ({
             {roots.map((r) => (
               <option key={r.path} value={r.path}>
                 {r.name}
+              </option>
+            ))}
+          </select>
+        )}
+
+        {mode === "remote" && remoteDisks && remoteDisks.length > 0 && (
+          <select
+            className="root-select remote-disk-select"
+            value=""
+            onChange={(e) => {
+              if (e.target.value) onNavigate(e.target.value);
+            }}
+            title="快速切换远端服务器磁盘 / 挂载点"
+          >
+            <option value="" disabled>
+              磁盘 ({remoteDisks.length})...
+            </option>
+            {remoteDisks.map((d) => (
+              <option key={d.mountPath} value={d.mountPath}>
+                {d.label} · {d.usePercent}% ({formatBytes(d.usedBytes)} / {formatBytes(d.totalBytes)})
               </option>
             ))}
           </select>

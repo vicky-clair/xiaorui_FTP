@@ -1,7 +1,7 @@
 //! xiaorui_FTP Rust 后端核心库
 //!
-//! 负责初始化 Tauri 运行时、注册插件、管理全局应用状态（站点、会话、传输队列）
-//! 以及向前端暴露所有类型安全的 IPC 命令。
+//! 负责初始化 Tauri 运行时、注册插件、系统托盘与关闭最小化行为、
+//! 管理全局应用状态（站点、会话、传输队列、偏好设置）以及向前端暴露所有类型安全的 IPC 命令。
 
 mod commands;
 mod error;
@@ -12,9 +12,20 @@ mod protocols;
 mod storage;
 mod transfer;
 
-use tauri::Manager;
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{Manager, WindowEvent};
 
 use crate::commands::AppState;
+
+/// 恢复并聚焦主窗口
+fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.unminimize();
+        let _ = win.show();
+        let _ = win.set_focus();
+    }
+}
 
 /// 启动 Tauri 桌面应用程序
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -24,7 +35,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            // 获取操作系统标准应用数据目录用于持久化站点列表
+            // 获取操作系统标准应用数据目录用于持久化站点列表与轻量偏好
             let data_dir = app
                 .path()
                 .app_data_dir()
@@ -32,11 +43,61 @@ pub fn run() {
             let state =
                 AppState::new(data_dir).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
             app.manage(state);
+
+            // 初始化系统托盘图标与右键菜单（左键单击呼出主窗口，右键支持显示/彻底退出）
+            let show_item = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app, "quit", "退出 xiaorui_FTP", true, None::<&str>)?;
+            let tray_menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+
+            let mut tray_builder = TrayIconBuilder::with_id("main-tray")
+                .menu(&tray_menu)
+                .tooltip("xiaorui_FTP — 现代文件传输客户端")
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    "show" => show_main_window(app),
+                    "quit" => app.exit(0),
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    }
+                    | TrayIconEvent::DoubleClick {
+                        button: MouseButton::Left,
+                        ..
+                    } = event
+                    {
+                        show_main_window(tray.app_handle());
+                    }
+                });
+
+            if let Some(icon) = app.default_window_icon().cloned() {
+                tray_builder = tray_builder.icon(icon);
+            }
+            let _ = tray_builder.build(app);
+
             Ok(())
+        })
+        // 拦截主窗口关闭事件：当用户开启“关闭时最小化到托盘”时隐藏窗口而非退出进程
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main" {
+                    let should_hide = window
+                        .try_state::<AppState>()
+                        .map(|s| s.is_minimize_to_tray())
+                        .unwrap_or(false);
+                    if should_hide {
+                        api.prevent_close();
+                        let _ = window.hide();
+                    }
+                }
+            }
         })
         // 注册前端可调用的 Tauri IPC 命令清单
         .invoke_handler(tauri::generate_handler![
-            // 站点管理与本地备份导入导出
+            // 站点管理、偏好设置与本地备份导入导出
             commands::list_sites,
             commands::save_site,
             commands::delete_site,
@@ -45,6 +106,8 @@ pub fn run() {
             commands::check_ssh_agent_status,
             commands::list_known_hosts,
             commands::remove_known_host,
+            commands::get_app_settings,
+            commands::set_minimize_to_tray,
             // 会话连接与生命周期管理
             commands::connect_saved_site,
             commands::connect_adhoc,
@@ -73,8 +136,9 @@ pub fn run() {
             commands::list_transfers,
             commands::cancel_transfer,
             commands::clear_finished_transfers,
-            // SFTP 内置远程命令终端
+            // SFTP 内置远程命令终端与服务器硬件监测
             commands::ssh_exec_command,
+            commands::remote_server_metrics,
         ])
         .run(tauri::generate_context!())
         .expect("启动 xiaorui_FTP 应用程序失败");

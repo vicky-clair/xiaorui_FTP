@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -16,9 +17,10 @@ use uuid::Uuid;
 use crate::error::{AppError, AppResult};
 use crate::known_hosts::{KnownHostEntry, KnownHostsStore};
 use crate::local_fs;
+use crate::models::parse_quick_connect_uri;
 use crate::models::{
-    join_remote_path, normalize_remote_path, parse_quick_connect_uri, AgentStatus, FileEntry,
-    LocalRoot, SessionInfo, ShellOutput, SiteConfig, SiteInput, SiteSecrets, TransferDirection,
+    join_remote_path, normalize_remote_path, AgentStatus, AppSettings, FileEntry, LocalRoot,
+    ServerMetrics, SessionInfo, ShellOutput, SiteConfig, SiteInput, SiteSecrets, TransferDirection,
     TransferTask,
 };
 use crate::protocols::{connect_protocol, sftp, RemoteFs};
@@ -37,6 +39,10 @@ pub struct AppState {
     pub store: SiteStore,
     /// SSH 已知主机公钥指纹仓库（`known_hosts.json`，独立于站点配置）
     pub known_hosts: Arc<KnownHostsStore>,
+    /// 轻量偏好配置文件路径（`settings.json`）
+    settings_file: PathBuf,
+    /// 关闭主窗口时是否最小化到系统托盘（原子无锁读取，供窗口事件钩子安全使用）
+    minimize_to_tray: AtomicBool,
     /// 当前所有活跃的远程会话映射表（session_id -> ActiveSession）
     pub sessions: RwLock<HashMap<String, ActiveSession>>,
     /// 后台并发传输队列管理器
@@ -46,12 +52,46 @@ pub struct AppState {
 impl AppState {
     /// 初始化全局状态（默认最大 3 并发传输）
     pub fn new(app_data_dir: PathBuf) -> AppResult<Self> {
+        let settings_file = app_data_dir.join("settings.json");
+        let loaded_settings = std::fs::read_to_string(&settings_file)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<AppSettings>(&raw).ok())
+            .unwrap_or_default();
         Ok(Self {
             store: SiteStore::new(app_data_dir.clone())?,
             known_hosts: Arc::new(KnownHostsStore::new(app_data_dir)?),
+            settings_file,
+            minimize_to_tray: AtomicBool::new(loaded_settings.minimize_to_tray),
             sessions: RwLock::new(HashMap::new()),
             transfers: TransferManager::new(3),
         })
+    }
+
+    /// 供窗口关闭事件钩子无锁查询是否启用“关闭时最小化到托盘”
+    pub fn is_minimize_to_tray(&self) -> bool {
+        self.minimize_to_tray.load(Ordering::Relaxed)
+    }
+
+    /// 读取当前偏好设置快照
+    pub fn current_settings(&self) -> AppSettings {
+        AppSettings {
+            minimize_to_tray: self.is_minimize_to_tray(),
+        }
+    }
+
+    /// 持久化偏好设置至独立文件 `settings.json`
+    pub fn set_minimize_to_tray(&self, enabled: bool) -> AppResult<AppSettings> {
+        self.minimize_to_tray.store(enabled, Ordering::Relaxed);
+        let settings = self.current_settings();
+        let json = serde_json::to_string_pretty(&settings)
+            .map_err(|e| AppError::Storage(format!("序列化偏好设置失败: {}", e)))?;
+        let tmp = self.settings_file.with_extension("json.tmp");
+        std::fs::write(&tmp, &json)?;
+        if std::fs::rename(&tmp, &self.settings_file).is_err() {
+            std::fs::write(&self.settings_file, &json)?;
+            let _ = std::fs::remove_file(&tmp);
+        }
+        Ok(settings)
     }
 
     /// 按会话 ID 查找对应的远程文件系统实现
@@ -671,6 +711,32 @@ pub async fn ssh_exec_command(
 ) -> AppResult<ShellOutput> {
     let fs = state.get_fs(&session_id).await?;
     fs.exec_shell(&command, cwd.as_deref()).await
+}
+
+/// 采集当前 SFTP/SSH 会话远端服务器的硬件规格、资源占用与多磁盘挂载点
+#[tauri::command]
+pub async fn remote_server_metrics(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> AppResult<ServerMetrics> {
+    let fs = state.get_fs(&session_id).await?;
+    fs.server_metrics().await
+}
+
+// ============================================================================
+// 应用偏好设置（最小化到系统托盘等）
+// ============================================================================
+
+/// 获取当前应用偏好设置
+#[tauri::command]
+pub fn get_app_settings(state: State<'_, AppState>) -> AppSettings {
+    state.current_settings()
+}
+
+/// 更新「关闭时最小化到系统托盘」设置并持久化
+#[tauri::command]
+pub fn set_minimize_to_tray(state: State<'_, AppState>, enabled: bool) -> AppResult<AppSettings> {
+    state.set_minimize_to_tray(enabled)
 }
 
 #[cfg(test)]

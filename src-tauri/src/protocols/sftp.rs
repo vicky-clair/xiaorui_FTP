@@ -26,7 +26,7 @@ use crate::error::{AppError, AppResult};
 use crate::known_hosts::KnownHostsStore;
 use crate::models::{
     format_unix_mode, join_remote_path, normalize_remote_path, AgentStatus, AuthType, FileEntry,
-    ShellOutput,
+    RemoteDisk, ServerMetrics, ShellOutput,
 };
 use crate::protocols::{ProgressCallback, RemoteFs};
 
@@ -575,9 +575,19 @@ impl SftpClient {
 impl RemoteFs for SftpClient {
     async fn list_dir(&self, path: &str) -> AppResult<Vec<FileEntry>> {
         let norm = normalize_remote_path(path);
+        // 兼容 Windows OpenSSH SFTP 盘符根目录（如 `/D:` -> `/D:/`）
+        let is_win_drive_root = norm.len() == 3
+            && norm.starts_with('/')
+            && norm.as_bytes()[1].is_ascii_alphabetic()
+            && norm.as_bytes()[2] == b':';
+        let query_path = if is_win_drive_root {
+            format!("{}/", norm)
+        } else {
+            norm.clone()
+        };
         let dir = self
             .sftp
-            .read_dir(&norm)
+            .read_dir(&query_path)
             .await
             .map_err(|e| AppError::Protocol(format!("读取目录 '{}' 失败: {}", norm, e)))?;
 
@@ -856,6 +866,250 @@ impl RemoteFs for SftpClient {
             exit_code,
         })
     }
+
+    async fn server_metrics(&self) -> AppResult<ServerMetrics> {
+        // 1. 优先尝试标准 POSIX/Linux/macOS 轻量采样脚本（单次 exec 完成，耗时约 250ms）
+        let posix_probe = r#"sh -c '
+OS=$(grep -m1 "^PRETTY_NAME=" /etc/os-release 2>/dev/null | cut -d= -f2- | tr -d "\"")
+[ -z "$OS" ] && OS=$(uname -s 2>/dev/null || echo "Unix")
+CORES=$(nproc 2>/dev/null || grep -c "^processor" /proc/cpuinfo 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 0)
+LOAD=$(awk "{print \$1}" /proc/loadavg 2>/dev/null || true)
+CPU=""
+if [ -r /proc/stat ]; then
+  set -- $(head -n1 /proc/stat)
+  t1=$(($2+$3+$4+$5+$6+$7+$8)); i1=$(($5+$6))
+  sleep 0.2
+  set -- $(head -n1 /proc/stat)
+  t2=$(($2+$3+$4+$5+$6+$7+$8)); i2=$(($5+$6))
+  dt=$((t2-t1)); di=$((i2-i1))
+  [ "$dt" -gt 0 ] && CPU=$(awk "BEGIN{printf \"%.1f\", (1 - $di/$dt) * 100}")
+fi
+MEM_T=0; MEM_U=0
+if [ -r /proc/meminfo ]; then
+  MEM_T=$(awk "/^MemTotal:/{print \$2*1024}" /proc/meminfo)
+  MEM_A=$(awk "/^MemAvailable:/{print \$2*1024}" /proc/meminfo)
+  [ -z "$MEM_A" ] && MEM_A=$(awk "/^MemFree:/{print \$2*1024}" /proc/meminfo)
+  MEM_U=$((MEM_T - MEM_A))
+fi
+echo "OS=$OS"
+echo "CORES=$CORES"
+echo "CPU=$CPU"
+echo "LOAD=$LOAD"
+echo "MEM=$MEM_U:$MEM_T"
+echo "DISKS_BEGIN"
+(df -kP -T 2>/dev/null || df -kP 2>/dev/null) | tail -n +2
+echo "DISKS_END"
+'"#;
+
+        if let Ok(out) = self.exec_shell(posix_probe, None).await {
+            if let Some(metrics) = parse_server_metrics(&out.stdout) {
+                return Ok(metrics);
+            }
+        }
+
+        // 2. 若远端为 Windows OpenSSH 服务器，自动回退 PowerShell CIM 采集
+        let win_probe = r#"powershell -NoProfile -Command "$os=Get-CimInstance Win32_OperatingSystem;$cs=Get-CimInstance Win32_ComputerSystem;$cpu=(Get-CimInstance Win32_Processor|Measure-Object -Property LoadPercentage -Average).Average;Write-Output ('OS='+$os.Caption);Write-Output ('CORES='+$cs.NumberOfLogicalProcessors);Write-Output ('CPU='+$cpu);Write-Output ('MEM='+(($os.TotalVisibleMemorySize-$os.FreePhysicalMemory)*1024)+':'+($os.TotalVisibleMemorySize*1024));Write-Output 'DISKS_BEGIN';Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3'|ForEach-Object{$u=$_.Size-$_.FreeSpace;Write-Output ('WIN|'+$_.DeviceID+'|'+$_.Size+'|'+$u+'|'+$_.FreeSpace)};Write-Output 'DISKS_END'""#;
+
+        let out = self.exec_shell(win_probe, None).await?;
+        parse_server_metrics(&out.stdout)
+            .ok_or_else(|| AppError::Protocol("无法解析远端服务器硬件与磁盘信息".into()))
+    }
+}
+
+/// 过滤 Linux/macOS 伪文件系统与系统临时挂载点，仅保留真实业务磁盘
+fn is_ignored_fs(fs_type: Option<&str>, dev: &str, mount: &str) -> bool {
+    if let Some(t) = fs_type {
+        let lt = t.to_ascii_lowercase();
+        if matches!(
+            lt.as_str(),
+            "tmpfs"
+                | "devtmpfs"
+                | "squashfs"
+                | "overlay"
+                | "proc"
+                | "sysfs"
+                | "cgroup"
+                | "cgroup2"
+                | "efivarfs"
+                | "devfs"
+                | "autofs"
+                | "tracefs"
+                | "debugfs"
+                | "fuse.lxcfs"
+                | "nsfs"
+                | "ramfs"
+        ) {
+            return true;
+        }
+    }
+    if dev.starts_with("tmpfs") || dev.starts_with("devtmpfs") || dev.starts_with("overlay") {
+        return true;
+    }
+    mount.starts_with("/snap/")
+        || mount.starts_with("/run")
+        || mount.starts_with("/dev")
+        || mount.starts_with("/sys")
+        || mount.starts_with("/proc")
+        || mount == "/boot/efi"
+}
+
+/// 解析 POSIX 或 Windows 远端硬件与多磁盘采集输出
+pub fn parse_server_metrics(raw: &str) -> Option<ServerMetrics> {
+    if !raw.contains("DISKS_BEGIN") {
+        return None;
+    }
+
+    let mut os_name = String::new();
+    let mut cpu_cores: u32 = 0;
+    let mut cpu_usage_pct: Option<f32> = None;
+    let mut load_avg: Option<String> = None;
+    let mut mem_used_bytes: u64 = 0;
+    let mut mem_total_bytes: u64 = 0;
+    let mut disks: Vec<RemoteDisk> = Vec::new();
+    let mut seen_mounts = std::collections::HashSet::new();
+    let mut in_disks = false;
+
+    for raw_line in raw.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line == "DISKS_BEGIN" {
+            in_disks = true;
+            continue;
+        }
+        if line == "DISKS_END" {
+            in_disks = false;
+            continue;
+        }
+
+        if !in_disks {
+            if let Some(v) = line.strip_prefix("OS=") {
+                os_name = v.trim().to_string();
+            } else if let Some(v) = line.strip_prefix("CORES=") {
+                cpu_cores = v.trim().parse().unwrap_or(0);
+            } else if let Some(v) = line.strip_prefix("CPU=") {
+                if let Ok(pct) = v.trim().parse::<f32>() {
+                    if pct.is_finite() {
+                        cpu_usage_pct = Some(pct.clamp(0.0, 100.0));
+                    }
+                }
+            } else if let Some(v) = line.strip_prefix("LOAD=") {
+                let s = v.trim();
+                if !s.is_empty() {
+                    load_avg = Some(s.to_string());
+                }
+            } else if let Some(v) = line.strip_prefix("MEM=") {
+                if let Some((u, t)) = v.split_once(':') {
+                    mem_used_bytes = u.trim().parse().unwrap_or(0);
+                    mem_total_bytes = t.trim().parse().unwrap_or(0);
+                }
+            }
+            continue;
+        }
+
+        // Windows 盘符格式：WIN|C:|total|used|free
+        if let Some(rest) = line.strip_prefix("WIN|") {
+            let parts: Vec<&str> = rest.split('|').collect();
+            if parts.len() >= 4 {
+                let drive = parts[0].trim().trim_end_matches('\\');
+                let total: u64 = parts[1].trim().parse().unwrap_or(0);
+                let used: u64 = parts[2].trim().parse().unwrap_or(0);
+                let avail: u64 = parts[3].trim().parse().unwrap_or(0);
+                if total > 0 && !drive.is_empty() {
+                    let mount_path = format!("/{}/", drive);
+                    if seen_mounts.insert(mount_path.clone()) {
+                        let pct = ((used as f64 / total as f64) * 100.0).round() as u8;
+                        disks.push(RemoteDisk {
+                            label: format!("{}\\", drive),
+                            mount_path,
+                            total_bytes: total,
+                            used_bytes: used,
+                            avail_bytes: avail,
+                            use_percent: pct.min(100),
+                        });
+                    }
+                }
+            }
+            continue;
+        }
+
+        // POSIX `df -kP -T` (7+ 列: fs type 1024-blocks used avail cap% mount...)
+        // 或 `df -kP` (6+ 列: fs 1024-blocks used avail cap% mount...)
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() >= 7 && cols[2].parse::<u64>().is_ok() && cols[3].parse::<u64>().is_ok() {
+            let dev = cols[0];
+            let fs_type = cols[1];
+            let total = cols[2].parse::<u64>().unwrap_or(0).saturating_mul(1024);
+            let used = cols[3].parse::<u64>().unwrap_or(0).saturating_mul(1024);
+            let avail = cols[4].parse::<u64>().unwrap_or(0).saturating_mul(1024);
+            let cap: u8 = cols[5].trim_end_matches('%').parse().unwrap_or(0).min(100);
+            let mount = cols[6..].join(" ");
+            if total == 0 || is_ignored_fs(Some(fs_type), dev, &mount) {
+                continue;
+            }
+            if seen_mounts.insert(mount.clone()) {
+                disks.push(RemoteDisk {
+                    label: mount.clone(),
+                    mount_path: mount,
+                    total_bytes: total,
+                    used_bytes: used,
+                    avail_bytes: avail,
+                    use_percent: cap,
+                });
+            }
+        } else if cols.len() >= 6
+            && cols[1].parse::<u64>().is_ok()
+            && cols[2].parse::<u64>().is_ok()
+        {
+            let dev = cols[0];
+            let total = cols[1].parse::<u64>().unwrap_or(0).saturating_mul(1024);
+            let used = cols[2].parse::<u64>().unwrap_or(0).saturating_mul(1024);
+            let avail = cols[3].parse::<u64>().unwrap_or(0).saturating_mul(1024);
+            let cap: u8 = cols[4].trim_end_matches('%').parse().unwrap_or(0).min(100);
+            let mount = cols[5..].join(" ");
+            if total == 0 || is_ignored_fs(None, dev, &mount) {
+                continue;
+            }
+            if seen_mounts.insert(mount.clone()) {
+                disks.push(RemoteDisk {
+                    label: mount.clone(),
+                    mount_path: mount,
+                    total_bytes: total,
+                    used_bytes: used,
+                    avail_bytes: avail,
+                    use_percent: cap,
+                });
+            }
+        }
+    }
+
+    // 根挂载点 `/` 或 `C:\` 优先排在最前面，其余按路径字典序排列
+    disks.sort_by(|a, b| {
+        let a_root = a.mount_path == "/" || a.mount_path.eq_ignore_ascii_case("/C:/");
+        let b_root = b.mount_path == "/" || b.mount_path.eq_ignore_ascii_case("/C:/");
+        b_root
+            .cmp(&a_root)
+            .then_with(|| a.mount_path.cmp(&b.mount_path))
+    });
+
+    if os_name.is_empty() && cpu_cores == 0 && mem_total_bytes == 0 && disks.is_empty() {
+        return None;
+    }
+
+    Some(ServerMetrics {
+        os_name: if os_name.is_empty() {
+            "Remote Server".to_string()
+        } else {
+            os_name
+        },
+        cpu_cores,
+        cpu_usage_pct,
+        load_avg,
+        mem_used_bytes,
+        mem_total_bytes,
+        disks,
+    })
 }
 
 #[cfg(test)]
@@ -867,5 +1121,53 @@ mod tests {
         // 即使本机未启动 OpenSSH Agent 或 Pageant，检测也必须安全返回而非触发 panic/abort
         let status = check_ssh_agent_status().await;
         assert!(!status.message.is_empty());
+    }
+
+    #[test]
+    fn test_parse_server_metrics_linux_multi_disk() {
+        let sample = r#"
+OS=Ubuntu 22.04.4 LTS
+CORES=8
+CPU=23.5
+LOAD=0.64
+MEM=4294967296:17179869184
+DISKS_BEGIN
+tmpfs tmpfs 1638400 1200 1637200 1% /run
+/dev/sda1 ext4 52428800 20971520 31457280 40% /
+/dev/sdb1 xfs 1048576000 629145600 419430400 60% /data
+/dev/loop0 squashfs 102400 102400 0 100% /snap/core20/123
+DISKS_END
+"#;
+        let m = parse_server_metrics(sample).expect("should parse linux metrics");
+        assert_eq!(m.os_name, "Ubuntu 22.04.4 LTS");
+        assert_eq!(m.cpu_cores, 8);
+        assert_eq!(m.cpu_usage_pct, Some(23.5));
+        assert_eq!(m.load_avg.as_deref(), Some("0.64"));
+        assert_eq!(m.mem_total_bytes, 17_179_869_184);
+        assert_eq!(m.disks.len(), 2);
+        assert_eq!(m.disks[0].mount_path, "/");
+        assert_eq!(m.disks[1].mount_path, "/data");
+        assert_eq!(m.disks[1].use_percent, 60);
+    }
+
+    #[test]
+    fn test_parse_server_metrics_windows_multi_disk() {
+        let sample = r#"
+OS=Microsoft Windows Server 2022 Standard
+CORES=16
+CPU=12
+MEM=8589934592:34359738368
+DISKS_BEGIN
+WIN|C:|214748364800|107374182400|107374182400
+WIN|D:|1099511627776|329853488332|769658139444
+DISKS_END
+"#;
+        let m = parse_server_metrics(sample).expect("should parse windows metrics");
+        assert_eq!(m.cpu_cores, 16);
+        assert_eq!(m.disks.len(), 2);
+        assert_eq!(m.disks[0].label, "C:\\");
+        assert_eq!(m.disks[0].mount_path, "/C:/");
+        assert_eq!(m.disks[1].label, "D:\\");
+        assert_eq!(m.disks[1].mount_path, "/D:/");
     }
 }

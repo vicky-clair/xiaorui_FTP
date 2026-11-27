@@ -157,6 +157,32 @@ export interface LocalRoot {
   path: string;
 }
 
+/** 应用轻量偏好设置 */
+export interface AppSettings {
+  minimizeToTray: boolean;
+}
+
+/** 远端服务器物理磁盘 / 挂载点信息 */
+export interface RemoteDisk {
+  label: string;
+  mountPath: string;
+  totalBytes: number;
+  usedBytes: number;
+  availBytes: number;
+  usePercent: number;
+}
+
+/** 远端服务器硬件规格与实时资源占用快照（SFTP/SSH 会话） */
+export interface ServerMetrics {
+  osName: string;
+  cpuCores: number;
+  cpuUsagePct?: number | null;
+  loadAvg?: string | null;
+  memUsedBytes: number;
+  memTotalBytes: number;
+  disks: RemoteDisk[];
+}
+
 /** 各协议的展示名称、徽章样式与默认端口配置 */
 export const PROTOCOL_META: Record<
   Protocol,

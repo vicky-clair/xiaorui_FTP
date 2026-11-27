@@ -8,9 +8,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AgentStatus,
+  AppSettings,
   FileEntry,
   KnownHostEntry,
   LocalRoot,
+  ServerMetrics,
   SessionInfo,
   ShellOutput,
   SiteConfig,
@@ -31,6 +33,9 @@ export const api = {
   listKnownHosts: () => invoke<KnownHostEntry[]>("list_known_hosts"),
   removeKnownHost: (hostPort: string) =>
     invoke<boolean>("remove_known_host", { hostPort }),
+  getAppSettings: () => invoke<AppSettings>("get_app_settings"),
+  setMinimizeToTray: (enabled: boolean) =>
+    invoke<AppSettings>("set_minimize_to_tray", { enabled }),
 
   // ---------------- 会话连接管理 ----------------
   connectSavedSite: (
@@ -111,11 +116,13 @@ export const api = {
   onTransferUpdate: (cb: (task: TransferTask) => void): Promise<UnlistenFn> =>
     listen<TransferTask>("transfer://update", (ev) => cb(ev.payload)),
 
-  // ---------------- SSH 远程终端 ----------------
+  // ---------------- SSH 远程终端与服务器硬件监测 ----------------
   sshExecCommand: (sessionId: string, command: string, cwd?: string) =>
     invoke<ShellOutput>("ssh_exec_command", {
       sessionId,
       command,
       cwd: cwd ?? null,
     }),
+  remoteServerMetrics: (sessionId: string) =>
+    invoke<ServerMetrics>("remote_server_metrics", { sessionId }),
 };

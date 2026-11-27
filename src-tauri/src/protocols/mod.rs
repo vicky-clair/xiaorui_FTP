@@ -16,7 +16,9 @@ use async_trait::async_trait;
 
 use crate::error::{AppError, AppResult};
 use crate::known_hosts::KnownHostsStore;
-use crate::models::{AuthType, FileEntry, Protocol, ShellOutput, SiteConfig, SiteSecrets};
+use crate::models::{
+    AuthType, FileEntry, Protocol, ServerMetrics, ShellOutput, SiteConfig, SiteSecrets,
+};
 
 /// 传输进度回调函数类型：参数依次为 `(已传输字节数, 总字节数)`
 pub type ProgressCallback = Arc<dyn Fn(u64, u64) + Send + Sync>;
@@ -71,6 +73,13 @@ pub trait RemoteFs: Send + Sync {
     async fn exec_shell(&self, _command: &str, _cwd: Option<&str>) -> AppResult<ShellOutput> {
         Err(AppError::Unsupported(
             "仅 SFTP/SSH 会话支持远程命令终端".into(),
+        ))
+    }
+
+    /// 采集远端服务器硬件规格、资源占用与多磁盘挂载列表（仅 SFTP/SSH 会话支持）
+    async fn server_metrics(&self) -> AppResult<ServerMetrics> {
+        Err(AppError::Unsupported(
+            "仅 SFTP/SSH 会话支持采集远端硬件规格与磁盘信息".into(),
         ))
     }
 }

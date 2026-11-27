@@ -13,9 +13,13 @@ import {
   ArrowDownUp,
   CheckCircle2,
   Cloud,
+  Cpu,
   Globe,
+  HardDrive,
   Info,
   Lock,
+  MemoryStick,
+  Minimize2,
   Server,
   ShieldCheck,
   Sparkles,
@@ -37,6 +41,8 @@ import {
   type FileEntry,
   type LocalRoot,
   type Protocol,
+  type RemoteDisk,
+  type ServerMetrics,
   type SessionInfo,
   type SiteConfig,
   type SiteInput,
@@ -98,9 +104,11 @@ export default function App() {
     content: string;
   } | null>(null);
 
-  // 跨平台确认/输入弹窗与 SSH 已知主机管理弹窗
+  // 跨平台确认/输入弹窗、SSH 已知主机管理弹窗、托盘偏好与远端硬件指标
   const [dialog, setDialog] = useState<DialogRequest | null>(null);
   const [knownHostsOpen, setKnownHostsOpen] = useState(false);
+  const [minimizeToTray, setMinimizeToTray] = useState(true);
+  const [serverMetrics, setServerMetrics] = useState<ServerMetrics | null>(null);
 
   // 可拖拽双栏宽度比例（左侧本地栏百分比）与命令栏聚焦引用
   const [splitRatio, setSplitRatio] = useState(46);
@@ -164,6 +172,68 @@ export default function App() {
 
   const activeSession = sessions.find((s) => s.sessionId === activeSessionId) ?? null;
 
+  // SFTP/SSH 会话激活时，自动采集远端服务器硬件规格、资源占用与多磁盘挂载点（每 15 秒轻量刷新）
+  useEffect(() => {
+    if (!activeSession?.supportsShell) {
+      setServerMetrics(null);
+      return;
+    }
+    let cancelled = false;
+    const sid = activeSession.sessionId;
+    const fetchMetrics = async () => {
+      try {
+        const m = await api.remoteServerMetrics(sid);
+        if (!cancelled) setServerMetrics(m);
+      } catch {
+        // 受限 SFTP-only 账号不支持 exec 通道时静默忽略，不影响文件浏览
+      }
+    };
+    void fetchMetrics();
+    const timer = window.setInterval(() => {
+      void fetchMetrics();
+    }, 15000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [activeSession?.sessionId, activeSession?.supportsShell]);
+
+  /** 切换「关闭窗口时最小化到系统托盘」偏好并持久化 */
+  const handleToggleMinimizeToTray = async () => {
+    const next = !minimizeToTray;
+    try {
+      const updated = await api.setMinimizeToTray(next);
+      setMinimizeToTray(updated.minimizeToTray);
+      pushToast(
+        updated.minimizeToTray
+          ? "已开启：关闭窗口时将最小化到系统托盘"
+          : "已关闭：点击关闭按钮将直接退出程序",
+        "info"
+      );
+    } catch (err) {
+      pushToast(String(err), "error");
+    }
+  };
+
+  /** 根据当前远程路径匹配所属远端磁盘（最长前缀优先） */
+  const activeRemoteDisk: RemoteDisk | null = useMemo(() => {
+    const disks = serverMetrics?.disks;
+    if (!disks || disks.length === 0) return null;
+    const norm = remotePath || "/";
+    let best: RemoteDisk | null = null;
+    for (const d of disks) {
+      const mp = d.mountPath.endsWith("/") && d.mountPath.length > 1
+        ? d.mountPath.slice(0, -1)
+        : d.mountPath;
+      const matches =
+        mp === "/" || norm === mp || norm.startsWith(`${mp}/`);
+      if (matches && (!best || mp.length > best.mountPath.length)) {
+        best = d;
+      }
+    }
+    return best ?? disks[0];
+  }, [serverMetrics, remotePath]);
+
   useEffect(() => {
     activeSessionIdRef.current = activeSessionId;
   }, [activeSessionId]);
@@ -217,15 +287,17 @@ export default function App() {
 
     (async () => {
       try {
-        const [siteList, roots, home, existingTransfers] = await Promise.all([
+        const [siteList, roots, home, existingTransfers, appSettings] = await Promise.all([
           api.listSites(),
           api.localListRoots(),
           api.localHomeDir(),
           api.listTransfers(),
+          api.getAppSettings().catch(() => ({ minimizeToTray: true })),
         ]);
         setSites(siteList);
         setLocalRoots(roots);
         setTransfers(existingTransfers);
+        setMinimizeToTray(appSettings.minimizeToTray);
         await loadLocalDir(home);
       } catch (err) {
         pushToast(`初始化失败: ${String(err)}`, "error");
@@ -880,6 +952,7 @@ export default function App() {
                 currentPath={remotePath}
                 entries={remoteEntries}
                 loading={remoteLoading}
+                remoteDisks={serverMetrics?.disks}
                 canTransfer={true}
                 supportsChmod={activeSession.supportsChmod}
                 externalDropActive={osDragOver}
@@ -1025,23 +1098,102 @@ export default function App() {
         </main>
       </div>
 
-      {/* 底部现代桌面状态栏 */}
+      {/* 底部现代桌面状态栏（含远端硬件规格/占用、多磁盘快切与托盘模式开关） */}
       <footer className="status-bar">
-        <span className="status-bar-item">
+        <span className="status-bar-item" title={serverMetrics?.osName || undefined}>
           <span className={`status-dot ${activeSession ? "online" : ""}`} />
           {activeSession
-            ? `已连接 · ${PROTOCOL_META[activeSession.protocol].short} · ${activeSession.host}`
+            ? `${PROTOCOL_META[activeSession.protocol].short} · ${activeSession.host}`
             : "就绪 · 未连接远程站点"}
         </span>
 
-        <span className="status-bar-item tabular-nums">
-          {dualPane ? `本地 ${localEntries.length} 项` : ""}
-          {dualPane && activeSession ? " · " : ""}
-          {activeSession ? `远程 ${remoteEntries.length} 项` : ""}
-        </span>
+        {activeSession?.supportsShell && serverMetrics && (
+          <div className="metrics-strip">
+            <span
+              className={`metric-pill tabular-nums ${
+                (serverMetrics.cpuUsagePct ?? 0) >= 85
+                  ? "hot"
+                  : (serverMetrics.cpuUsagePct ?? 0) >= 65
+                    ? "warn"
+                    : ""
+              }`}
+              title={`系统：${serverMetrics.osName}${serverMetrics.loadAvg ? ` · 1分钟负载：${serverMetrics.loadAvg}` : ""}`}
+            >
+              <Cpu size={11} />
+              {serverMetrics.cpuCores > 0 ? `${serverMetrics.cpuCores}C` : "CPU"}
+              {serverMetrics.cpuUsagePct != null
+                ? ` ${Math.round(serverMetrics.cpuUsagePct)}%`
+                : serverMetrics.loadAvg
+                  ? ` L:${serverMetrics.loadAvg}`
+                  : ""}
+            </span>
+
+            {serverMetrics.memTotalBytes > 0 && (() => {
+              const memPct = Math.min(
+                100,
+                Math.round((serverMetrics.memUsedBytes / serverMetrics.memTotalBytes) * 100)
+              );
+              return (
+                <span
+                  className={`metric-pill tabular-nums ${
+                    memPct >= 88 ? "hot" : memPct >= 72 ? "warn" : ""
+                  }`}
+                  title={`远端内存：已用 ${formatBytes(serverMetrics.memUsedBytes)} / 总计 ${formatBytes(serverMetrics.memTotalBytes)} (${memPct}%)`}
+                >
+                  <MemoryStick size={11} />
+                  {formatBytes(serverMetrics.memUsedBytes)}/{formatBytes(serverMetrics.memTotalBytes)} ({memPct}%)
+                </span>
+              );
+            })()}
+
+            {activeRemoteDisk && (
+              <button
+                type="button"
+                className={`metric-pill metric-pill-btn tabular-nums ${
+                  activeRemoteDisk.usePercent >= 90
+                    ? "hot"
+                    : activeRemoteDisk.usePercent >= 78
+                      ? "warn"
+                      : ""
+                }`}
+                onClick={() => {
+                  const disks = serverMetrics.disks;
+                  if (disks.length <= 1) {
+                    void loadRemoteDir(activeSession.sessionId, activeRemoteDisk.mountPath);
+                    return;
+                  }
+                  const idx = disks.findIndex((d) => d.mountPath === activeRemoteDisk.mountPath);
+                  const next = disks[(idx + 1) % disks.length];
+                  void loadRemoteDir(activeSession.sessionId, next.mountPath);
+                  pushToast(`已切换至远端磁盘 ${next.label} (${next.mountPath})`, "info");
+                }}
+                title={
+                  `远端磁盘（点击${serverMetrics.disks.length > 1 ? "切换下一块磁盘" : "进入挂载根目录"}）：\n` +
+                  serverMetrics.disks
+                    .map(
+                      (d) =>
+                        `${d.label}  ${d.usePercent}%  (${formatBytes(d.usedBytes)} / ${formatBytes(d.totalBytes)}，剩余 ${formatBytes(d.availBytes)})`
+                    )
+                    .join("\n")
+                }
+              >
+                <HardDrive size={11} />
+                {activeRemoteDisk.label} {activeRemoteDisk.usePercent}%
+                {serverMetrics.disks.length > 1 ? ` · 共${serverMetrics.disks.length}盘` : ""}
+              </button>
+            )}
+          </div>
+        )}
 
         <div className="status-bar-right">
+          <span className="status-bar-item tabular-nums">
+            {dualPane ? `本地 ${localEntries.length}` : ""}
+            {dualPane && activeSession ? " / " : ""}
+            {activeSession ? `远程 ${remoteEntries.length}` : ""}
+          </span>
+
           <button
+            type="button"
             className="status-bar-btn tabular-nums"
             onClick={() => {
               setTransferOpen((v) => !v);
@@ -1052,10 +1204,22 @@ export default function App() {
             <ArrowDownUp size={12} color={activeTransferCount > 0 ? "var(--accent)" : undefined} />
             {activeTransferCount > 0
               ? `传输中 ${activeTransferCount}${totalTransferSpeed > 0 ? ` · ${formatBytes(totalTransferSpeed)}/s` : ""}`
-              : `传输队列 (${transfers.length})`}
+              : `队列 (${transfers.length})`}
           </button>
 
-          <span className="status-bar-item">Ctrl+K 直连 · F5 刷新</span>
+          <button
+            type="button"
+            className={`status-bar-btn ${minimizeToTray ? "active" : ""}`}
+            onClick={() => void handleToggleMinimizeToTray()}
+            title={
+              minimizeToTray
+                ? "当前：点击关闭按钮将最小化到系统托盘（点击切换为直接退出）"
+                : "当前：点击关闭按钮将直接退出程序（点击开启关闭最小化到托盘）"
+            }
+          >
+            <Minimize2 size={11} />
+            {minimizeToTray ? "关闭→托盘" : "关闭→退出"}
+          </button>
         </div>
       </footer>
 
