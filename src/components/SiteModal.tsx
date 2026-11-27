@@ -62,7 +62,7 @@ export const SiteModal: React.FC<SiteModalProps> = ({
   const [pathStyle, setPathStyle] = useState(initial?.pathStyle ?? true);
   const [tlsSkipVerify, setTlsSkipVerify] = useState(initial?.tlsSkipVerify ?? false);
 
-  // ProxyJump (Bastion)
+  // SSH 跳板机（ProxyJump / Bastion）表单状态
   const [useJump, setUseJump] = useState(Boolean(initial?.jumpHost));
   const [jumpHost, setJumpHost] = useState(initial?.jumpHost ?? "");
   const [jumpPort, setJumpPort] = useState(String(initial?.jumpPort ?? 22));
@@ -72,7 +72,7 @@ export const SiteModal: React.FC<SiteModalProps> = ({
   const [jumpSecret, setJumpSecret] = useState("");
   const [jumpPassphrase, setJumpPassphrase] = useState("");
 
-  // Local ssh-agent status
+  // 本地 ssh-agent 可用性检测与表单提交状态
   const [agentStatus, setAgentStatus] = useState<AgentStatus | null>(null);
   const [saveSecret, setSaveSecret] = useState(true);
   const [submitting, setSubmitting] = useState(false);
@@ -407,7 +407,7 @@ export const SiteModal: React.FC<SiteModalProps> = ({
                         setHost(u.hostname);
                         setPort(u.port || (u.protocol === "http:" ? "80" : "443"));
                       } catch {
-                        // typing in progress
+                        // 用户正在输入完整 URL，暂忽略解析异常
                       }
                     }}
                     placeholder="https://nas.example.com/dav 或 https://cloud.example.com/remote.php/dav/files/user"

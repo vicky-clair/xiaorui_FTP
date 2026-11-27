@@ -1043,10 +1043,6 @@ select:focus-visible {
   border-color: var(--border-strong);
 }
 
-.remote-disk-select {
-  max-width: 148px;
-}
-
 .pane-subbar {
   padding: 5px 10px;
   border-bottom: 1px solid var(--border);

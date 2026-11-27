@@ -1,48 +1,51 @@
 # xiaorui_FTP — 系统架构与开发文档
 
-本文档面向参与 **xiaorui_FTP** 开发、维护与二次扩展的开发者，详细说明系统分层架构、核心协议实现、IPC 通信契约、安全模型以及全平台 x64 构建发布流程。
+本文档面向参与 **xiaorui_FTP** 开发、维护与二次扩展的工程师，完整说明系统分层架构、核心协议与交互式终端实现、IPC 通信契约、数据持久化与安全模型以及全平台 x64 构建发布流程。
 
 ---
 
 ## 1. 产品定位与设计原则
 
-1. **全平台原生 x64 构架**：基于 Rust + Tauri v2，针对 `x86_64-pc-windows-msvc`、`x86_64-apple-darwin`、`x86_64-unknown-linux-gnu` 原生编译打包，安装包小巧（Windows x64 NSIS 安装包约 2.7 MB）、内存占用低。
-2. **纯 Rust 现代密码学栈**：零外部 C/OpenSSL 编译依赖，全面使用 `rustls`（TLS 1.2/1.3）与 `russh`（Curve25519 / Ed25519 / RSA-SHA2-256 / AES-GCM / ChaCha20-Poly1305），保证跨平台可复现构建。
-3. **极简、直觉化交互**：
-   - 顶部集成快速直连地址栏与核心视图开关；
-   - 左侧可折叠站点分组收藏夹（支持即时搜索与 JSON 备份导入导出）；
-   - 主区域支持双栏（本地 ↔ 远程）与单栏（纯远程）无缝切换，支持多会话标签页；
-   - 底部可折叠并发传输队列与 SFTP 内置命令终端，不干扰主文件列表视野。
+1. **全平台原生 x64 构架**：基于 Rust + Tauri v2，面向 `x86_64-pc-windows-msvc`、`x86_64-apple-darwin`、`x86_64-unknown-linux-gnu` 原生编译打包，Windows x64 NSIS 安装包约 **3.7 MB**，运行时内存远低于 Electron 客户端。
+2. **纯 Rust 现代密码学栈**：零外部 C/OpenSSL 依赖，传输层全面采用 `rustls`（TLS 1.2/1.3）与 `russh`（Curve25519 / Ed25519 / RSA-SHA2-256 / AES-GCM / ChaCha20-Poly1305），保证跨平台一致行为与可复现构建。
+3. **现代桌面交互与零崩溃韧性**：
+   - 双行防挤压文件面板工具栏（独立全宽路径面包屑、带容量进度条的自定义磁盘切换浮层、列头排序、语义图标、右键上下文菜单）；
+   - 完整 Xshell 风格交互式 SSH 终端（底部停靠 / 工作区全屏 / 独立原生窗口三形态 + 多标签 + 快捷命令 + 与 SFTP 双向联动）；
+   - 前端全局 `ErrorBoundary` + 后端全协议连接超时、原子落盘与防 panic 封装。
 
 ---
 
 ## 2. 总体分层架构
 
 ```text
-┌──────────────────────────────────────────────────────────────────────┐
-│               Frontend (React 19 + TypeScript + Vite)                │
-│  TopBar 快速直连 · SiteSidebar 站点管理 · FilePane 通用双栏/单栏     │
-│  SiteModal 动态多协议表单 · TransferDrawer · EditorModal · Terminal  │
-└─────────────────────────────┬────────────────────────────────────────┘
-                              │ Tauri v2 Typed IPC Commands & Events
-┌─────────────────────────────▼────────────────────────────────────────┐
-│                    Rust Core Backend (x86_64)                        │
-│  ┌──────────────────┐  ┌───────────────────┐  ┌───────────────────┐ │
-│  │  AppState / IPC  │  │  TransferManager  │  │ SiteStore/Keyring │ │
-│  │  多会话生命周期   │  │ Semaphore 3 并发  │  │ OS 原生凭据库托管  │ │
-│  └────────┬─────────┘  └─────────┬─────────┘  └───────────────────┘ │
-│           │ 统一异步远程文件系统抽象 (`RemoteFs` Trait)               │
-│  ┌────────▼───────────────────────────────────────────────────────┐ │
-│  │ Protocol Adapters (`src-tauri/src/protocols/`)                 │ │
-│  │  • sftp.rs   — russh + russh-sftp (Agent / ProxyJump / Shell)  │ │
-│  │  • ftp.rs    — suppaftp + rustls (显式/隐式 FTPS & FTP)        │ │
-│  │  • s3.rs     — reqwest + AWS SigV4 (S3 / OSS / COS / MinIO/R2) │ │
-│  │  • webdav.rs — reqwest + RFC 4918 XML (Nextcloud / Alist / NAS)│ │
-│  └────────────────────────────────────────────────────────────────┘ │
-│  ┌────────────────────────────────────────────────────────────────┐ │
-│  │ Local FS (`local_fs.rs`) — 跨平台本地目录与 Windows 盘符枚举    │ │
-│  └────────────────────────────────────────────────────────────────┘ │
-└──────────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────┐
+│                   Frontend (React 19 + TypeScript + Vite)                  │
+│  ErrorBoundary · TopBar (Ctrl+K) · SiteSidebar (在线态/备份/TOFU主机管理)   │
+│  FilePane (双行工具栏/面包屑/磁盘浮层/右键联动) · TransferDrawer · StatusBar│
+│  SiteModal (分段协议卡) · DialogModal · EditorModal · KnownHostsModal      │
+│  TerminalDrawer (xterm.js 多标签/搜索/缩放/快捷命令) · StandaloneTerminalApp│
+└──────────────────────────────┬─────────────────────────────────────────────┘
+                               │ Tauri v2 Typed IPC Commands & Events
+                               │ (transfer://update · pty://data · pty://exit)
+┌──────────────────────────────▼─────────────────────────────────────────────┐
+│                        Rust Core Backend (x86_64)                          │
+│  ┌───────────────────┐  ┌────────────────────┐  ┌────────────────────────┐ │
+│  │  AppState / IPC   │  │  TransferManager   │  │ Storage / KnownHosts   │ │
+│  │ 会话/PTY/托盘/窗口 │  │ Semaphore 3 并发   │  │ sites/known_hosts/     │ │
+│  │                   │  │ 流式节流 & 取消广播 │  │ settings + OS Keyring  │ │
+│  └─────────┬─────────┘  └─────────┬──────────┘  └────────────────────────┘ │
+│            │ 统一异步远程文件系统抽象 (`RemoteFs` Trait)                    │
+│  ┌─────────▼─────────────────────────────────────────────────────────────┐ │
+│  │ Protocol Adapters (`src-tauri/src/protocols/`)                        │ │
+│  │  • sftp.rs   — russh + russh-sftp (Agent/ProxyJump/TOFU/PTY/Metrics) │ │
+│  │  • ftp.rs    — suppaftp + rustls (显/隐式 FTPS/FTP + 递归删目录)      │ │
+│  │  • s3.rs     — reqwest + AWS SigV4 (流式上传/分页列举/分页删除/去重)   │ │
+│  │  • webdav.rs — reqwest + RFC 4918 XML (流式上传/中文路径/Bearer认证)   │ │
+│  └───────────────────────────────────────────────────────────────────────┘ │
+│  ┌───────────────────────────────────────────────────────────────────────┐ │
+│  │ Local FS (`local_fs.rs`) — 跨平台本地目录与 Windows 盘符枚举           │ │
+│  └───────────────────────────────────────────────────────────────────────┘ │
+└────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -52,50 +55,58 @@
 ```text
 xiaorui_FTP/
 ├── .github/workflows/
-│   └── build-x64.yml            # GitHub Actions 全平台 x64 自动测试与打包流水线
+│   └── build-x64.yml                # GitHub Actions 三平台 x64 门禁（tsc/fmt/clippy/test/build）
+├── .gitattributes                   # 跨平台换行符与二进制资源属性声明
 ├── docs/
-│   └── DEVELOPMENT_PLAN.md      # 本架构与开发文档
+│   ├── DEVELOPMENT_PLAN.md          # 本架构与开发文档
+│   └── COMPETITIVE_COMPARISON.md    # 与 FlashFXP/SmartFTP/CuteFTP/Wing FTP Server 对照报告
 ├── scripts/
-│   └── build-release.ps1        # Windows x64 一键测试 + Release 打包脚本
-├── index.html                   # 前端 HTML 入口
-├── package.json                 # 前端脚本与依赖配置
-├── tsconfig.json / vite.config.ts
-├── README.md                    # 用户使用手册与常见问题
-├── src/                         # React + TypeScript 前端源码
-│   ├── main.tsx                 # React 挂载入口
-│   ├── App.tsx                  # 主工作台状态协调与系统拖放监听
-│   ├── styles/app.css           # Fluent 极简设计系统（Light / Dark）
-│   ├── types/index.ts           # 前后端共享数据类型与格式化工具
-│   ├── api/tauri.ts             # Tauri IPC 命令与事件类型安全封装
+│   ├── build-release.ps1            # Windows x64 一键验证 + NSIS/MSI Release 打包脚本
+│   └── build-release.sh             # macOS/Linux x64 一键验证 + Release 打包脚本
+├── index.html                       # 前端 HTML 入口
+├── package.json                     # 前端依赖与脚本（含 @xterm/xterm, addon-fit, addon-search）
+├── tsconfig.json / vite.config.ts   # TypeScript 严格配置与 Vite 分包（xterm / icons 独立 chunk）
+├── README.md                        # 用户使用手册、快捷键速查与 FAQ
+├── src/                             # React + TypeScript 前端源码
+│   ├── main.tsx                     # 入口路由（自动区分主工作台与 ?mode=terminal 独立终端窗口）
+│   ├── App.tsx                      # 主工作台状态协调、拖拽分栏、系统拖放、硬件监控与状态栏
+│   ├── styles/app.css               # 现代桌面设计系统（Light / Dark、自定义滚动条与动效）
+│   ├── types/index.ts               # 前后端共享数据类型与格式化工具
+│   ├── api/tauri.ts                 # Tauri IPC 命令与事件类型安全封装
 │   └── components/
-│       ├── TopBar.tsx           # 顶部快速直连栏与全局控制
-│       ├── SiteSidebar.tsx      # 左侧站点收藏夹与备份导入导出
-│       ├── SiteModal.tsx        # 动态多协议站点表单（含跳板机与 ssh-agent）
-│       ├── FilePane.tsx         # 本地/远程通用文件面板（含拖拽互传）
-│       ├── TransferDrawer.tsx   # 底部并发传输队列面板
-│       ├── EditorModal.tsx      # 远程文本在线编辑弹窗
-│       └── TerminalDrawer.tsx   # SFTP 内置 SSH 命令终端
-└── src-tauri/                   # Rust 后端与 Tauri 配置
-    ├── Cargo.toml               # 依赖与 Release LTO/strip 瘦身配置
-    ├── tauri.conf.json          # 窗口、图标与 NSIS/MSI/DMG/AppImage 打包配置
-    ├── build.rs                 # Tauri 构建脚本
-    ├── capabilities/default.json# Tauri v2 窗口安全能力声明
-    ├── icons/                   # 全平台应用图标集合
+│       ├── ErrorBoundary.tsx        # 全局 React 渲染错误边界与恢复页
+│       ├── TopBar.tsx               # 命令栏式快速直连与全局视图开关
+│       ├── SiteSidebar.tsx          # 左侧站点分组收藏夹（在线绿点/跳板标记/备份/主机入口）
+│       ├── SiteModal.tsx            # 分段协议选择器 + 前置表单校验 + 跳板机与 ssh-agent 检测
+│       ├── DialogModal.tsx          # 跨平台统一确认/输入模态框（零 window.prompt/confirm）
+│       ├── KnownHostsModal.tsx      # SSH 已知主机公钥指纹（TOFU）管理弹窗
+│       ├── FilePane.tsx             # 通用文件面板（双行工具栏/面包屑/磁盘浮层/排序/右键菜单）
+│       ├── TransferDrawer.tsx       # 底部并发传输队列抽屉
+│       ├── EditorModal.tsx          # 远程文本在线轻编辑器（Ctrl+S 回传）
+│       ├── TerminalDrawer.tsx       # Xshell 风格多标签 xterm.js 交互终端工作台
+│       └── StandaloneTerminalApp.tsx# 独立原生操作系统 SSH 终端窗口应用
+└── src-tauri/                       # Rust 后端与 Tauri v2 配置
+    ├── Cargo.toml                   # 依赖（含 tauri tray-icon、zeroize、tokio-util、pageant）
+    ├── tauri.conf.json              # 窗口配置、严格 CSP 与全平台打包目标
+    ├── build.rs                     # Tauri 构建脚本
+    ├── capabilities/default.json    # Tauri v2 安全能力声明（覆盖 main 与 term-* 窗口）
+    ├── icons/                       # 全平台应用图标集合
     └── src/
-        ├── main.rs              # 桌面可执行程序入口
-        ├── lib.rs               # Tauri Builder 初始化与命令注册
-        ├── error.rs             # 统一中文错误类型 `AppError`
-        ├── models.rs            # 数据结构、路径规范化与 URI 解析
-        ├── storage.rs           # `sites.json` 持久化与系统 Keyring 凭据读写
-        ├── local_fs.rs          # 跨平台本地文件系统封装
-        ├── transfer.rs          # 基于 Semaphore 的并发传输队列与事件节流推送
-        ├── commands.rs          # 全部 Tauri IPC 命令与递归目录扫描/下载实现
+        ├── main.rs                  # 桌面可执行程序入口
+        ├── lib.rs                   # Tauri Builder、系统托盘、关闭最小化钩子与命令注册
+        ├── error.rs                 # 统一中文错误枚举 `AppError`
+        ├── models.rs                # 领域模型、路径规范化、URI 解析、硬件指标与 PTY 事件
+        ├── storage.rs               # `sites.json` 原子持久化与 OS Keyring 凭据读写
+        ├── known_hosts.rs           # `known_hosts.json` 独立 TOFU 主机指纹仓库
+        ├── local_fs.rs              # 跨平台本地文件系统封装
+        ├── transfer.rs              # Semaphore 并发传输队列、取消事件与进度竞态防护
+        ├── commands.rs              # 全部 Tauri IPC 命令、PTY 生命周期与独立窗口管理
         └── protocols/
-            ├── mod.rs           # `RemoteFs` Trait 定义与协议连接工厂
-            ├── sftp.rs          # SFTP / SSH Agent / ProxyJump / Shell 实现
-            ├── ftp.rs           # FTP / FTPS (TLS 1.2/1.3) 实现
-            ├── s3.rs            # S3 SigV4 与 ListObjectsV2 解析实现
-            └── webdav.rs        # WebDAV RFC 4918 实现
+            ├── mod.rs               # `RemoteFs` Trait、`PtyHandle` 与协议连接工厂
+            ├── sftp.rs              # SFTP / 安全 Pageant / ProxyJump / TOFU / PTY / 硬件探测
+            ├── ftp.rs               # FTP / FTPS (TLS 1.2/1.3) 与递归目录删除
+            ├── s3.rs                # S3 SigV4 流式上传、分页列举与分页删除
+            └── webdav.rs            # WebDAV RFC 4918 流式传输与中文路径解析
 ```
 
 ---
@@ -103,35 +114,29 @@ xiaorui_FTP/
 ## 4. 核心模块实现细节
 
 ### 4.1 统一远程文件系统接口 (`RemoteFs`)
-定义于 [src-tauri/src/protocols/mod.rs](../src-tauri/src/protocols/mod.rs)，所有远程协议均实现以下异步方法：
+定义于 [src-tauri/src/protocols/mod.rs](../src-tauri/src/protocols/mod.rs)，统一抽象 4 大协议，所有网络连接均强制 **20 秒超时保护**：
 
-- `list_dir(path)`：返回按「目录优先、名称不区分大小写升序」排序的 `Vec<FileEntry>`。
-- `mkdir(path)` / `remove(path, is_dir)` / `rename(from, to)`：统一目录与文件操作。
-- `chmod(path, mode)`：SFTP 与 FTP/FTPS 支持，S3/WebDAV 默认返回 `AppError::Unsupported`。
-- `read_bytes(path, max_bytes)` / `write_bytes(path, data)`：支持在线查看与回传保存文本文件（上限 2 MB）。
-- `download_file(remote, local, progress, cancel)` / `upload_file(local, remote, progress, cancel)`：64 KB 流式分块读写，实时回调字节进度并响应 `AtomicBool` 取消标记。
-- `exec_shell(command, cwd)`：仅 SFTP 会话实现，在目标主机当前远程目录下执行命令并返回 `stdout` / `stderr` / `exit_code`。
+- `list_dir(path)`：返回按「目录优先、名称不区分大小写升序」排序的 `Vec<FileEntry>`；SFTP 自动解析软链接目标是否为目录（保留 `is_symlink=true` 防递归死循环），并适配 Windows OpenSSH 盘符根路径（`/D:` → `/D:/`）；S3 自动分页并按路径去重。
+- `mkdir(path)` / `remove(path, is_dir)` / `rename(from, to)`：四大协议均完整支持非空目录递归删除（含 FTP 迭代递归删除与 S3 分页删除）。
+- `chmod(path, mode)`：SFTP 与 FTP/FTPS 支持，S3/WebDAV 优雅降级返回 `AppError::Unsupported`。
+- `read_bytes(path, max_bytes)` / `write_bytes(path, data)`：支持 2 MB 以内在线文本查看与修改回传。
+- `download_file` / `upload_file`：全协议采用 64 KB 流式分块读写，支持实时速率回调、中途取消与取消下载后自动清理残缺本地文件。
+- `exec_shell(command, cwd)` / `server_metrics()` / `open_pty(cols, rows)`：SFTP/SSH 专属能力，支持单次命令执行、硬件规格与多磁盘采样以及全双工交互式登录 Shell。
 
-### 4.2 SSH `ProxyJump` 与本地 `ssh-agent`
-位于 [src-tauri/src/protocols/sftp.rs](../src-tauri/src/protocols/sftp.rs)：
-- **本地 SSH Agent**：Windows 优先连接 `\\.\pipe\openssh-ssh-agent` 命名管道，失败时自动回退至 Pageant；macOS/Linux 连接 `SSH_AUTH_SOCK`。采用泛型 monomorphization（`try_agent_auth<S: AgentStream>`）避免 trait object 在异步 `Signer` 中触发高阶生命周期（HRTB）限制。
-- **SSH 跳板机（ProxyJump）**：先连接并认证跳板机获得 `jump_sess`，调用 `channel_open_direct_tcpip(target_host, target_port, "127.0.0.1", 0)` 获取直连转发流，再以 `russh::client::connect_stream` 在该流上建立端到端加密的目标 SSH 会话，并由 `SftpClient._jump_ssh` 持有跳板机句柄直至会话关闭。
+### 4.2 安全 SSH `ProxyJump`、本地 `ssh-agent` 与交互式 PTY
+位于 [src-tauri/src/protocols/sftp.rs](../src-tauri/src/protocols/sftp.rs) 与 [src-tauri/src/commands.rs](../src-tauri/src/commands.rs)：
+- **安全本地 Agent 探测**：Windows 优先连接 `\\.\pipe\openssh-ssh-agent`；回退 Pageant 时绕过上游 `pageant 0.0.1` 的 `.unwrap()` panic 缺陷，采用自定义的 `connect_safe_pageant()`（先调用 `is_pageant_running()`，通信置于 `spawn_blocking` 且零 panic）；macOS/Linux 连接 `SSH_AUTH_SOCK`。
+- **SSH 跳板机（ProxyJump）**：先连接认证跳板机，通过 `channel_open_direct_tcpip` 建立加密转发流，再以 `client::connect_stream` 握手目标主机（跳板机与目标机均独立执行 TOFU 公钥指纹校验）。
+- **交互式 PTY 与独立窗口**：`open_pty` 仅短暂持有 SSH 会话锁申请新通道（不阻塞文件浏览与硬件探测），请求 `xterm-256color` 伪终端并调用 `request_shell(true)` 启动远端默认登录 Shell（`zsh` / `bash` / `fish` / PowerShell）。输出字节流经 Base64 封装通过 `pty://data` 推送至 `xterm.js`，避免多字节中文跨包乱码；断开会话时自动回收所有关联 PTY 通道。
+- **远端硬件与多磁盘采集**：`server_metrics` 优先执行轻量 POSIX 探测脚本（`/etc/os-release`、`/proc/stat`、`/proc/meminfo`、`df -kP -T`），自动过滤 `/boot`、伪文件系统、容器挂载及同块设备重复 bind 挂载；若远端为 Windows OpenSSH 则自动回退 PowerShell CIM 采集（`C:\`、`D:\` 等物理磁盘）。
 
-### 4.3 递归文件夹传输与下载位置选择
-位于 [src-tauri/src/commands.rs](../src-tauri/src/commands.rs) 与 [src/App.tsx](../src/App.tsx)：
-- **上传（`enqueue_upload_paths`）**：接收来自系统原生拖放（`getCurrentWebview().onDragDropEvent`）、双栏互拖或文件/文件夹选择器的路径数组，在阻塞线程池中遍历所有本地目录树生成 `UploadPlan`，先顺序创建远程目录，再将所有文件推入 `TransferManager` 并发上传。
-- **下载（`enqueue_download`）**：通过 `DownloadRequest` 结构体同时支持：
-  1. 单文件「另存为」精确保存路径（`localFilePath`）；
-  2. 远程文件夹递归遍历并下载至用户选定的目标目录（`localDir` + `isDir: true`）；
-  3. 双栏拖拽直接下载到左侧本地面板当前目录。
-- **自动刷新**：前端监听 `transfer://update` 事件，当任务变为 `completed` 时自动刷新对应侧的文件列表。
-
-### 4.4 安全与凭据存储模型
-- **站点元数据**存储于操作系统标准应用数据目录的 `sites.json`，严禁保存明文密码或私钥口令。
-- **SSH 已知主机指纹（TOFU）**独立存储于 `known_hosts.json`（由 `known_hosts.rs` 管理），首次连接固定 SHA-256 指纹，后续不匹配时自动阻断连接以防范中间人攻击，并支持在前端「主机」管理弹窗中按条移除。
-- **应用层安全策略**：`tauri.conf.json` 启用最小可用 CSP（`default-src 'self'; script-src 'self'; object-src 'none'`），阻断外链脚本与未授权资源加载。
-- **凭据安全与内存清零**：所有敏感凭据（密码、私钥口令、S3 Secret Key、STS Token、跳板机密钥）通过 `keyring` 托管至系统凭据库（服务名 `com.xiaorui.ftp`），且 `SiteSecrets` 在 `Drop` 时自动通过 `zeroize` 覆写清零内存。
-- **全协议流式传输**：SFTP、FTP/FTPS、S3（SigV4 `UNSIGNED-PAYLOAD`）与 WebDAV 全部采用 64 KB 流式分块上传/下载，恒定低内存占用并支持中途取消与实时速率上报；S3 目录列举与递归删除均采用 `continuation-token` 分页并显式传播错误。
+### 4.3 系统托盘与独立配置持久化（零数据丢失保障）
+为确保版本迭代升级时**老用户数据绝不重置或丢失**，所有持久化文件彼此独立且保持稳定标识：
+- **应用标识与凭据库服务名永久不变**：`identifier = "com.xiaorui.ftp"`、`KEYRING_SERVICE = "com.xiaorui.ftp"`；
+- **`sites.json`**：站点元数据（不含明文密码），原子写入并向后兼容缺省新字段的旧版文件；
+- **`known_hosts.json`**：SSH 主机 SHA-256 指纹（TOFU），独立文件原子写入；
+- **`settings.json`**：轻量界面偏好（如 `minimizeToTray`，默认 `true`），由 `AppState` 内 `AtomicBool` 缓存供 `WindowEvent::CloseRequested` 无锁读取。
+- **内存清零与 CSP**：`SiteSecrets` 实现 `Drop` 通过 `zeroize` 清零内存；`tauri.conf.json` 启用严格 CSP；`capabilities/default.json` 仅授权 `["main", "term-*"]` 窗口。
 
 ---
 
@@ -139,19 +144,32 @@ xiaorui_FTP/
 
 | 分类 | 命令名称 | 说明 |
 | :--- | :--- | :--- |
-| **站点与凭据** | `list_sites`, `save_site`, `delete_site`, `export_sites_to_file`, `import_sites_from_file`, `check_ssh_agent_status` | 站点 CRUD、JSON 文件备份/恢复、本地 SSH Agent 检测 |
-| **会话管理** | `connect_saved_site`, `connect_adhoc`, `quick_connect_uri`, `disconnect_session`, `list_sessions` | 建立/断开多协议远程会话 |
-| **远程文件** | `remote_list_dir`, `remote_mkdir`, `remote_delete`, `remote_rename`, `remote_chmod`, `remote_read_text`, `remote_write_text` | 统一远程文件管理与在线轻编辑 |
-| **本地文件** | `local_home_dir`, `local_list_roots`, `local_list_dir`, `local_mkdir`, `local_delete`, `local_rename` | 跨平台本地浏览与文件操作 |
-| **传输队列** | `enqueue_upload`, `enqueue_upload_paths`, `enqueue_download`, `list_transfers`, `cancel_transfer`, `clear_finished_transfers` | 并发上传/下载队列与进度控制（事件：`transfer://update`） |
-| **远程终端** | `ssh_exec_command` | 在当前 SFTP 会话的远程目录中执行 Shell 命令 |
+| **站点与凭据** | `list_sites`, `save_site`, `delete_site`, `export_sites_to_file`, `import_sites_from_file`, `check_ssh_agent_status`, `list_known_hosts`, `remove_known_host` | 站点 CRUD、JSON 备份恢复、本地 Agent 检测、TOFU 指纹管理 |
+| **应用偏好** | `get_app_settings`, `set_minimize_to_tray`, `focus_main_window`, `save_text_file` | 关闭最小化托盘偏好、窗口聚焦与日志导出 |
+| **会话管理** | `connect_saved_site`, `connect_adhoc`, `quick_connect_uri`, `disconnect_session`, `list_sessions` | 建立/断开多协议远程会话（断开时同步关闭关联 PTY） |
+| **远程文件** | `remote_list_dir`, `remote_mkdir`, `remote_delete`, `remote_rename`, `remote_chmod`, `remote_read_text`, `remote_write_text` | 统一远程文件浏览、操作与在线轻编辑 |
+| **本地文件** | `local_home_dir`, `local_list_roots`, `local_list_dir`, `local_mkdir`, `local_delete`, `local_rename` | 跨平台本地目录与 Windows 盘符枚举 |
+| **传输队列** | `enqueue_upload`, `enqueue_upload_paths`, `enqueue_download`, `list_transfers`, `cancel_transfer`, `clear_finished_transfers` | 3 并发流式队列、防路径穿越递归下载（事件：`transfer://update`） |
+| **终端与监测** | `ssh_exec_command`, `remote_server_metrics`, `ssh_pty_open`, `ssh_pty_write`, `ssh_pty_resize`, `ssh_pty_close`, `open_terminal_window` | 交互式默认 Shell PTY、独立终端窗口与硬件/多磁盘采集（事件：`pty://data`, `pty://exit`） |
 
 ---
 
-## 6. 质量保障与发布流程
+## 6. 质量门禁、测试与发布流程
 
-1. **代码规范**：Rust 后端需通过 `cargo fmt --check` 与 `cargo clippy --all-targets -- -D warnings`；前端需通过 TypeScript 严格模式（`strict: true`, `noUnusedLocals: true`, `noUnusedParameters: true`）校验。
-2. **自动化测试**：Rust 单元测试覆盖路径规范化、多协议及跳板机 URI 解析、S3 `ListObjectsV2` XML 解析、WebDAV `PROPFIND` XML 解析以及本地目录递归上传计划生成。
+1. **静态门禁**：
+   - 前端：`npx tsc --noEmit`（严格模式，零 `@ts-ignore` / `as any` / `console.log` / `window.prompt`）与 `npm run build`（`xterm`、`icons` 独立分包无告警）；
+   - 后端：`cargo fmt -- --check` 与 `cargo clippy --all-targets -- -D warnings` 零警告。
+2. **单元测试覆盖（17 项 Rust 单测）**：
+   - 路径规范化与多协议/跳板机 URI 解析（`models.rs`）；
+   - 本地递归上传扫描计划（`commands.rs`）；
+   - 旧版 `sites.json` 兼容、导出脱敏与导入往返（`storage.rs`）；
+   - SSH TOFU 首次信任、匹配校验、篡改阻断与移除（`known_hosts.rs`）；
+   - 本地文件生命周期与排序（`local_fs.rs`）；
+   - 传输队列取消与历史清理（`transfer.rs`）；
+   - Windows/Unix 本地 SSH Agent 无崩溃检测 + Linux/Windows 多磁盘与硬件指标解析（`protocols/sftp.rs`）；
+   - S3 分页 XML 与错误 XML 解析（`protocols/s3.rs`）；
+   - WebDAV `PROPFIND` XML、中文编码基础路径与状态码校验（`protocols/webdav.rs`）。
 3. **发布打包**：
-   - Windows x64 本地一键发布：`npm run release:win64`（依次执行单元测试、前端构建与 Release LTO 打包，生成 NSIS/MSI 安装包并输出 SHA-256 校验值）。
-   - 多平台 CI 自动构建：[.github/workflows/build-x64.yml](../.github/workflows/build-x64.yml) 支持在 `windows-latest`、`macos-13`、`ubuntu-22.04` 三个 x64 矩阵环境自动运行测试与安装包构建。
+   - Windows x64：`npm run release:win64`（调用 `scripts/build-release.ps1` 执行 Clippy + 单测 + 前端构建 + `npx tauri build` 生成 NSIS/MSI 与 SHA-256）；
+   - macOS / Linux x64：`bash scripts/build-release.sh`；
+   - GitHub Actions CI：[.github/workflows/build-x64.yml](../.github/workflows/build-x64.yml) 覆盖 `windows-latest`、`macos-13`、`ubuntu-22.04` 全量检查与打包。

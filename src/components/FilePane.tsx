@@ -392,7 +392,7 @@ export const FilePane: React.FC<FilePaneProps> = ({
         onDropEntryFromOtherPane(parsed.entry);
       }
     } catch {
-      // ignore invalid payload
+      // 忽略无效的拖拽载荷
     }
   };
 
@@ -438,7 +438,7 @@ export const FilePane: React.FC<FilePaneProps> = ({
       document.body.removeChild(ta);
       onCopyPath?.(path);
     } catch {
-      // ignore
+      // 剪贴板不可用时静默忽略
     }
   };
 

@@ -66,7 +66,7 @@ export default function App() {
   const [terminalMaximized, setTerminalMaximized] = useState(false);
   const [terminalCommand, setTerminalCommand] = useState<TerminalCommandRequest | null>(null);
 
-  // Sites & Modal
+  // 站点列表与新建/编辑站点弹窗状态
   const [sites, setSites] = useState<SiteConfig[]>([]);
   const [siteModal, setSiteModal] = useState<{
     open: boolean;
@@ -74,33 +74,33 @@ export default function App() {
     defaultProtocol: Protocol;
   }>({ open: false, editing: null, defaultProtocol: "sftp" });
 
-  // Sessions
+  // 多标签远程会话状态
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [connecting, setConnecting] = useState(false);
   const [connectingSiteId, setConnectingSiteId] = useState<string | null>(null);
 
-  // Local FS
+  // 本地文件系统状态
   const [localRoots, setLocalRoots] = useState<LocalRoot[]>([]);
   const [localPath, setLocalPath] = useState("");
   const [localEntries, setLocalEntries] = useState<FileEntry[]>([]);
   const [localLoading, setLocalLoading] = useState(false);
 
-  // Remote FS
+  // 远程文件系统状态
   const [remotePath, setRemotePath] = useState("/");
   const [remoteEntries, setRemoteEntries] = useState<FileEntry[]>([]);
   const [remoteLoading, setRemoteLoading] = useState(false);
 
-  // Transfers
+  // 并发传输队列与系统拖放高亮状态
   const [transfers, setTransfers] = useState<TransferTask[]>([]);
   const [osDragOver, setOsDragOver] = useState(false);
 
-  // Refs for OS drag-and-drop & transfer completion callbacks
+  // 供原生拖放事件与传输完成回调读取最新路径/会话 ID 的引用
   const activeSessionIdRef = useRef<string | null>(null);
   const remotePathRef = useRef<string>("/");
   const localPathRef = useRef<string>("");
 
-  // Editor
+  // 远程文本在线轻编辑器状态
   const [editor, setEditor] = useState<{
     path: string;
     content: string;
@@ -157,7 +157,7 @@ export default function App() {
     []
   );
 
-  // Toasts
+  // 右下角轻提示通知队列
   const [toasts, setToasts] = useState<Toast[]>([]);
 
   const pushToast = useCallback((text: string, kind: Toast["kind"] = "info") => {
@@ -316,7 +316,7 @@ export default function App() {
     [pushToast]
   );
 
-  // Initial bootstrap
+  // 启动初始化：并行加载站点列表、本地盘符、主目录、历史传输记录与托盘偏好，并订阅传输进度事件
   useEffect(() => {
     let unlisten: (() => void) | undefined;
 
@@ -363,7 +363,7 @@ export default function App() {
     };
   }, [loadLocalDir, loadRemoteDir, pushToast]);
 
-  // Native OS File Explorer / Finder drag-and-drop -> recursive folder & file upload
+  // 监听操作系统文件资源管理器 / Finder 原生拖放事件，支持文件与文件夹递归上传
   useEffect(() => {
     let unlistenDrop: (() => void) | undefined;
     (async () => {
@@ -400,7 +400,7 @@ export default function App() {
           }
         });
       } catch {
-        // Non-Tauri browser preview mode
+        // 非 Tauri 浏览器预览模式下忽略原生拖放注册
       }
     })();
 
@@ -550,7 +550,7 @@ export default function App() {
     }
   };
 
-  // Transfers (single file + recursive folder upload/download)
+  // 文件与文件夹递归上传/下载调度
   const handleUploadEntry = async (entry: FileEntry) => {
     if (!activeSession) return;
     try {
@@ -669,7 +669,7 @@ export default function App() {
     }
   };
 
-  // Remote actions
+  // 远程文件系统操作（新建目录、重命名、删除、修改权限、在线编辑）
   const handleRemoteMkdir = async () => {
     if (!activeSession) return;
     const name = await openPrompt("新建远程文件夹", {
@@ -751,7 +751,7 @@ export default function App() {
     }
   };
 
-  // Local actions
+  // 本地文件系统操作（新建目录、重命名、删除）
   const handleLocalMkdir = async () => {
     const name = await openPrompt("新建本地文件夹", {
       placeholder: "请输入新文件夹名称",

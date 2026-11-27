@@ -69,7 +69,7 @@ export function StandaloneTerminalApp() {
           }
         });
       } catch {
-        // non-tauri preview
+        // 非 Tauri 浏览器预览模式忽略原生拖放监听
       }
     })();
     return () => {

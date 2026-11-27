@@ -310,7 +310,7 @@ const PtyTabPane = React.forwardRef<
           }
         }
       } catch {
-        // ignore layout race
+        // 忽略布局尚未稳定时的偶发尺寸计算异常
       }
     }, []);
 
@@ -505,7 +505,7 @@ const PtyTabPane = React.forwardRef<
           try {
             fitAddon.fit();
           } catch {
-            // fallback
+            // 布局未就绪时回退使用默认行列值
           }
           const cols = Math.max(40, term.cols || 100);
           const rows = Math.max(8, term.rows || 20);
