@@ -5,17 +5,18 @@
  * 以及新建站点、双栏/单栏切换、SSH 终端、传输队列与深浅主题切换入口。
  */
 
-import React, { useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
   Activity,
   ArrowLeftRight,
+  ChevronDown,
   Columns2,
   Download,
   Laptop,
   Moon,
   PanelLeft,
   Plus,
-  Square,
+  Server,
   Sun,
   Terminal,
   Zap,
@@ -24,8 +25,11 @@ import {
 interface TopBarProps {
   sidebarOpen: boolean;
   onToggleSidebar: () => void;
-  dualPane: boolean;
-  onToggleDualPane: () => void;
+  showLocalPane: boolean;
+  showRemotePane: boolean;
+  onToggleLocalPane: () => void;
+  onToggleRemotePane: () => void;
+  onShowBothPanes: () => void;
   monitorOpen: boolean;
   onToggleMonitor: () => void;
   theme: "light" | "dark";
@@ -47,8 +51,11 @@ interface TopBarProps {
 export const TopBar: React.FC<TopBarProps> = ({
   sidebarOpen,
   onToggleSidebar,
-  dualPane,
-  onToggleDualPane,
+  showLocalPane,
+  showRemotePane,
+  onToggleLocalPane,
+  onToggleRemotePane,
+  onShowBothPanes,
   monitorOpen,
   onToggleMonitor,
   theme,
@@ -68,6 +75,35 @@ export const TopBar: React.FC<TopBarProps> = ({
 }) => {
   const [uri, setUri] = useState("");
   const [focused, setFocused] = useState(false);
+  const [paneMenuOpen, setPaneMenuOpen] = useState(false);
+  const paneMenuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!paneMenuOpen) return;
+    const onDocDown = (ev: MouseEvent) => {
+      if (paneMenuRef.current && !paneMenuRef.current.contains(ev.target as Node)) {
+        setPaneMenuOpen(false);
+      }
+    };
+    const onKey = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape") setPaneMenuOpen(false);
+    };
+    window.addEventListener("mousedown", onDocDown);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("mousedown", onDocDown);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [paneMenuOpen]);
+
+  const paneLabel =
+    showLocalPane && showRemotePane
+      ? "双栏"
+      : showLocalPane
+        ? "仅本地"
+        : showRemotePane
+          ? "仅远程"
+          : "无文件栏";
 
   /** 提交快速直连 URI */
   const handleSubmit = async (e: React.FormEvent) => {
@@ -178,19 +214,71 @@ export const TopBar: React.FC<TopBarProps> = ({
           监控
         </button>
 
-        <button
-          type="button"
-          className={`btn-tool ${dualPane ? "active" : ""}`}
-          onClick={onToggleDualPane}
-          title={
-            dualPane
-              ? "当前为本地+远程双栏，点击关闭双栏并同步关闭右侧监控面板"
-              : "当前为单栏模式，点击开启本地+远程双栏"
-          }
-        >
-          {dualPane ? <Columns2 size={14} /> : <Square size={13} />}
-          {dualPane ? "双栏" : "单栏"}
-        </button>
+        <div className="term-popover-anchor" ref={paneMenuRef}>
+          <button
+            type="button"
+            className={`btn-tool ${paneMenuOpen || (showLocalPane && showRemotePane) ? "active" : ""}`}
+            onClick={() => setPaneMenuOpen((v) => !v)}
+            title="选择显示或隐藏左侧本地文件栏、右侧远程文件栏（不影响监控栏）"
+          >
+            <Columns2 size={14} />
+            {paneLabel}
+            <ChevronDown size={12} />
+          </button>
+
+          {paneMenuOpen && (
+            <div className="term-settings-popover" style={{ width: 228 }}>
+              <div className="term-popover-section-title">文件分栏显示（独立于监控栏）</div>
+
+              <button
+                type="button"
+                className="term-popover-toggle"
+                onClick={onToggleLocalPane}
+              >
+                <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                  <Laptop size={13} />
+                  左侧 · 本地文件栏
+                </span>
+                <span className={`term-toggle-pill ${showLocalPane ? "on" : ""}`}>
+                  {showLocalPane ? "显示" : "隐藏"}
+                </span>
+              </button>
+
+              <button
+                type="button"
+                className="term-popover-toggle"
+                onClick={onToggleRemotePane}
+              >
+                <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                  <Server size={13} />
+                  右侧 · 远程文件栏
+                </span>
+                <span className={`term-toggle-pill ${showRemotePane ? "on" : ""}`}>
+                  {showRemotePane ? "显示" : "隐藏"}
+                </span>
+              </button>
+
+              {(!showLocalPane || !showRemotePane) && (
+                <>
+                  <div className="term-popover-sep" />
+                  <button
+                    type="button"
+                    className="term-popover-toggle"
+                    onClick={() => {
+                      onShowBothPanes();
+                      setPaneMenuOpen(false);
+                    }}
+                  >
+                    <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                      <Columns2 size={13} color="var(--accent)" />
+                      恢复双栏（本地 + 远程）
+                    </span>
+                  </button>
+                </>
+              )}
+            </div>
+          )}
+        </div>
 
         <button
           type="button"

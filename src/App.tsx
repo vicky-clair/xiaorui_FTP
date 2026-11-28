@@ -72,7 +72,8 @@ export default function App() {
     window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"
   );
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [dualPane, setDualPane] = useState(true);
+  const [showLocalPane, setShowLocalPane] = useState(true);
+  const [showRemotePane, setShowRemotePane] = useState(true);
   const [monitorOpen, setMonitorOpen] = useState(true);
   const [transferOpen, setTransferOpen] = useState(false);
   const [terminalOpen, setTerminalOpen] = useState(false);
@@ -997,15 +998,13 @@ export default function App() {
       <TopBar
         sidebarOpen={sidebarOpen}
         onToggleSidebar={() => setSidebarOpen((v) => !v)}
-        dualPane={dualPane}
-        onToggleDualPane={() => {
-          setDualPane((prev) => {
-            const next = !prev;
-            if (!next) {
-              setMonitorOpen(false);
-            }
-            return next;
-          });
+        showLocalPane={showLocalPane}
+        showRemotePane={showRemotePane}
+        onToggleLocalPane={() => setShowLocalPane((v) => !v)}
+        onToggleRemotePane={() => setShowRemotePane((v) => !v)}
+        onShowBothPanes={() => {
+          setShowLocalPane(true);
+          setShowRemotePane(true);
         }}
         monitorOpen={monitorOpen}
         onToggleMonitor={() => setMonitorOpen((v) => !v)}
@@ -1119,9 +1118,14 @@ export default function App() {
           <div
             className="panes"
             ref={panesRef}
-            style={terminalOpen && terminalMaximized ? { display: "none" } : undefined}
+            style={
+              (terminalOpen && terminalMaximized) ||
+              (!showLocalPane && !showRemotePane && terminalOpen)
+                ? { display: "none" }
+                : undefined
+            }
           >
-            {dualPane && (
+            {showLocalPane && (
               <FilePane
                 mode="local"
                 title="本地"
@@ -1130,7 +1134,7 @@ export default function App() {
                 loading={localLoading}
                 roots={localRoots}
                 canTransfer={Boolean(activeSession)}
-                style={{ flex: `0 0 ${splitRatio}%` }}
+                style={showRemotePane ? { flex: `0 0 ${splitRatio}%` } : undefined}
                 onNavigate={(p) => void loadLocalDir(p)}
                 onRefresh={() => void loadLocalDir(localPath)}
                 onMkdir={() => void handleLocalMkdir()}
@@ -1143,7 +1147,7 @@ export default function App() {
               />
             )}
 
-            {dualPane && (
+            {showLocalPane && showRemotePane && (
               <div
                 className={`pane-resizer ${resizingPanes ? "dragging" : ""}`}
                 onMouseDown={handleStartResize}
@@ -1152,7 +1156,7 @@ export default function App() {
               />
             )}
 
-            {activeSession ? (
+            {showRemotePane && (activeSession ? (
               <FilePane
                 mode="remote"
                 title={`${PROTOCOL_META[activeSession.protocol].short} · ${activeSession.host}`}
@@ -1275,6 +1279,43 @@ export default function App() {
                   </div>
                 </div>
               </section>
+            ))}
+
+            {!showLocalPane && !showRemotePane && !terminalOpen && (
+              <section className="pane">
+                <div className="empty-state">
+                  <div className="empty-title">左右文件栏已隐藏</div>
+                  <p className="empty-desc">
+                    你可以在顶部「无文件栏 ▾」菜单中重新勾选本地或远程文件栏，或点击下方快捷恢复。
+                  </p>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button
+                      type="button"
+                      className="btn btn-primary"
+                      onClick={() => {
+                        setShowLocalPane(true);
+                        setShowRemotePane(true);
+                      }}
+                    >
+                      恢复双栏
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-outline"
+                      onClick={() => setShowLocalPane(true)}
+                    >
+                      仅显示本地栏
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-outline"
+                      onClick={() => setShowRemotePane(true)}
+                    >
+                      仅显示远程栏
+                    </button>
+                  </div>
+                </div>
+              </section>
             )}
           </div>
 
@@ -1308,7 +1349,7 @@ export default function App() {
               sessionName="本地终端"
               cwd={localTerminalCwd || localPath}
               localCwd={localTerminalCwd || localPath}
-              maximized={terminalMaximized}
+              maximized={terminalMaximized || (!showLocalPane && !showRemotePane)}
               onToggleMaximize={() => setTerminalMaximized((v) => !v)}
               onPopOut={() => void handlePopOutTerminal()}
               onNotify={pushToast}
@@ -1328,7 +1369,7 @@ export default function App() {
               sessionName={activeSession.name}
               cwd={remotePath}
               localCwd={localPath}
-              maximized={terminalMaximized}
+              maximized={terminalMaximized || (!showLocalPane && !showRemotePane)}
               pendingCommand={terminalCommand}
               onRemoteCwdDetected={(detectedPath) => {
                 if (
@@ -1500,9 +1541,9 @@ export default function App() {
           )}
 
           <span className="status-bar-item tabular-nums">
-            {dualPane ? `本地 ${localEntries.length}` : ""}
-            {dualPane && activeSession ? " / " : ""}
-            {activeSession ? `远程 ${remoteEntries.length}` : ""}
+            {showLocalPane ? `本地 ${localEntries.length}` : ""}
+            {showLocalPane && showRemotePane && activeSession ? " / " : ""}
+            {showRemotePane && activeSession ? `远程 ${remoteEntries.length}` : ""}
           </span>
 
           <button
