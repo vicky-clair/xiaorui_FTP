@@ -182,7 +182,11 @@ export const TopBar: React.FC<TopBarProps> = ({
           type="button"
           className={`btn-tool ${dualPane ? "active" : ""}`}
           onClick={onToggleDualPane}
-          title={dualPane ? "当前为本地+远程双栏，点击切换为仅远程单栏" : "当前为单栏，点击切换为本地+远程双栏"}
+          title={
+            dualPane
+              ? "当前为本地+远程双栏，点击关闭双栏并同步关闭右侧监控面板"
+              : "当前为单栏模式，点击开启本地+远程双栏"
+          }
         >
           {dualPane ? <Columns2 size={14} /> : <Square size={13} />}
           {dualPane ? "双栏" : "单栏"}

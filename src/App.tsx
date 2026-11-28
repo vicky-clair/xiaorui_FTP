@@ -998,7 +998,15 @@ export default function App() {
         sidebarOpen={sidebarOpen}
         onToggleSidebar={() => setSidebarOpen((v) => !v)}
         dualPane={dualPane}
-        onToggleDualPane={() => setDualPane((v) => !v)}
+        onToggleDualPane={() => {
+          setDualPane((prev) => {
+            const next = !prev;
+            if (!next) {
+              setMonitorOpen(false);
+            }
+            return next;
+          });
+        }}
         monitorOpen={monitorOpen}
         onToggleMonitor={() => setMonitorOpen((v) => !v)}
         theme={theme}
