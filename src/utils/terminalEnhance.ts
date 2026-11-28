@@ -155,6 +155,114 @@ export function parseOsc52Write(payload: string): string | null {
   }
 }
 
+export interface BatchPreset {
+  id: string;
+  label: string;
+  cmd: string;
+}
+
+export type TerminalOsKind = "linux" | "windows_ps" | "windows_cmd";
+
+/** 根据终端类型、远端系统家族与本地 Shell 预设精确判定当前终端操作系统与命令方言 */
+export function detectTerminalOs(
+  mode: "ssh" | "local",
+  remoteOsFamily?: string | null,
+  localProfile?: string | null
+): TerminalOsKind {
+  if (mode === "ssh") {
+    return remoteOsFamily?.toLowerCase() === "windows" ? "windows_ps" : "linux";
+  }
+  const prof = (localProfile || "").toLowerCase();
+  if (prof === "cmd") return "windows_cmd";
+  if (prof === "wsl" || prof === "gitbash" || prof === "zsh" || prof === "bash") return "linux";
+  return "windows_ps";
+}
+
+/** 按操作系统返回差异化的批量执行指令预设（Linux / Windows PowerShell / Windows CMD 互不混用） */
+export function getBatchPresets(osKind: TerminalOsKind): BatchPreset[] {
+  if (osKind === "windows_ps") {
+    return [
+      { id: "wp1", label: "系统概览", cmd: "Get-CimInstance Win32_OperatingSystem | Select Caption, Version, LastBootUpTime" },
+      { id: "wp2", label: "磁盘空间", cmd: "Get-PSDrive -PSProvider FileSystem | Format-Table Name, @{N='Used(GB)';E={[math]::Round($_.Used/1GB,1)}}, @{N='Free(GB)';E={[math]::Round($_.Free/1GB,1)}}" },
+      { id: "wp3", label: "高占用进程", cmd: "Get-Process | Sort-Object CPU -Descending | Select-Object -First 12 Name, Id, CPU, WorkingSet" },
+      { id: "wp4", label: "监听端口", cmd: "Get-NetTCPConnection -State Listen | Select-Object LocalAddress, LocalPort, OwningProcess | Sort-Object LocalPort" },
+      { id: "wp5", label: "网络配置", cmd: "Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike '127.*' } | Format-Table InterfaceAlias, IPAddress" },
+    ];
+  }
+  if (osKind === "windows_cmd") {
+    return [
+      { id: "wc1", label: "系统信息", cmd: "systeminfo | findstr /B /C:\"OS\" /C:\"System Boot\"" },
+      { id: "wc2", label: "监听端口", cmd: "netstat -ano | findstr LISTENING" },
+      { id: "wc3", label: "进程列表", cmd: "tasklist /FO TABLE" },
+      { id: "wc4", label: "网络配置", cmd: "ipconfig /all" },
+      { id: "wc5", label: "当前目录", cmd: "dir" },
+    ];
+  }
+  return [
+    { id: "lx1", label: "负载与内存", cmd: "uptime && free -h" },
+    { id: "lx2", label: "磁盘与挂载", cmd: "df -hT" },
+    { id: "lx3", label: "高占用进程", cmd: "ps aux --sort=-%cpu | head -n 12" },
+    { id: "lx4", label: "监听端口", cmd: "ss -tulpn" },
+    { id: "lx5", label: "Docker 容器", cmd: "docker ps -a" },
+    { id: "lx6", label: "系统日志", cmd: "journalctl -n 25 --no-pager" },
+  ];
+}
+
+/** 将多行批执行命令规范为对应平台 PTY 可执行的命令行序列 */
+export function formatBatchScriptForOs(script: string, osKind: TerminalOsKind): string {
+  const lines = script
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0 && !l.startsWith("#") && !(osKind === "windows_cmd" && l.toUpperCase().startsWith("REM ")));
+  if (lines.length === 0) return "";
+  return `${lines.join("\r")}\r`;
+}
+
+/** 生成与操作系统匹配的目录切换命令（拒绝控制字符注入） */
+export function buildOsCdCommand(path: string, osKind: TerminalOsKind): string | null {
+  if (!path || containsControlChars(path)) return null;
+  if (osKind === "linux") {
+    const escaped = path.replace(/'/g, "'\\''");
+    return `cd '${escaped}'\r`;
+  }
+  // 将 SFTP 风格 `/D:/foo` 转为 Windows 路径 `D:\foo`
+  let winPath = path;
+  if (/^\/[A-Za-z]:/.test(winPath)) {
+    winPath = winPath.slice(1);
+  }
+  winPath = winPath.replace(/\//g, "\\");
+  if (osKind === "windows_cmd") {
+    if (winPath.includes('"') || /[&|<>^%!]/.test(winPath)) return null;
+    return `cd /d "${winPath}"\r`;
+  }
+  const escapedPs = winPath.replace(/'/g, "''");
+  return `Set-Location -LiteralPath '${escapedPs}'\r`;
+}
+
+export interface RecordingFrame {
+  time: number;
+  text: string;
+}
+
+/** 将录制帧列表封装为标准 asciinema v2 (`.cast`) JSONL 文本 */
+export function buildAsciinemaV2(
+  cols: number,
+  rows: number,
+  title: string,
+  frames: RecordingFrame[]
+): string {
+  const header = JSON.stringify({
+    version: 2,
+    width: Math.max(40, cols),
+    height: Math.max(10, rows),
+    timestamp: Math.floor(Date.now() / 1000),
+    title,
+    env: { TERM: "xterm-256color" },
+  });
+  const body = frames.map((f) => JSON.stringify([Number(f.time.toFixed(4)), "o", f.text]));
+  return [header, ...body].join("\n") + "\n";
+}
+
 export interface HighlightRule {
   id: string;
   label: string;

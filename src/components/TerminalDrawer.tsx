@@ -20,6 +20,7 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import {
   ChevronDown,
   ChevronUp,
+  Circle,
   ClipboardPaste,
   Copy,
   ExternalLink,
@@ -32,24 +33,37 @@ import {
   Link2,
   Maximize2,
   Minimize2,
+  Network,
+  Play,
   Plus,
+  Radio,
   RotateCw,
   Search,
   ShieldAlert,
   SlidersHorizontal,
+  Square,
   Terminal as TermIcon,
   Trash2,
   Upload,
   X,
-  Zap,
 } from "lucide-react";
 import { api } from "../api/tauri";
-import type { LocalShellOption, LocalTerminalDefaults, TerminalColorScheme } from "../types";
+import type {
+  LocalShellOption,
+  LocalTerminalDefaults,
+  SshTunnelInfo,
+  TerminalColorScheme,
+} from "../types";
 import { readClipboardText, writeClipboardText } from "../utils/clipboard";
-import { buildSafeCdCommand, isDangerousMultilinePaste } from "../utils/security";
+import { isDangerousMultilinePaste } from "../utils/security";
 import {
+  buildAsciinemaV2,
+  buildOsCdCommand,
   DEFAULT_HIGHLIGHT_RULES,
+  detectTerminalOs,
   encodeTerminalPaste,
+  formatBatchScriptForOs,
+  getBatchPresets,
   hasIncompleteAnsiTail,
   highlightTerminalText,
   isPasswordPromptLine,
@@ -59,6 +73,7 @@ import {
   parseOsc7Path,
   type DangerousCommandMatch,
   type HighlightRule,
+  type RecordingFrame,
 } from "../utils/terminalEnhance";
 
 export interface TerminalCommandRequest {
@@ -68,6 +83,7 @@ export interface TerminalCommandRequest {
 
 interface TerminalDrawerProps {
   mode?: "ssh" | "local";
+  remoteOsFamily?: string | null;
   sessionId: string;
   sessionName: string;
   cwd: string;
@@ -80,12 +96,6 @@ interface TerminalDrawerProps {
   onPopOut?: () => void;
   onNotify?: (text: string, kind?: "info" | "success" | "error") => void;
   onClose?: () => void;
-}
-
-interface QuickSnippet {
-  id: string;
-  label: string;
-  cmd: string;
 }
 
 interface TabMeta {
@@ -108,6 +118,7 @@ interface PtyTabHandle {
   findPrev: (term: string, opts?: { caseSensitive?: boolean; regex?: boolean }) => boolean;
   clearSearch: () => void;
   dumpBuffer: () => string;
+  getSize: () => { cols: number; rows: number };
 }
 
 type ThemeKey = "win_default" | "github_dark" | "one_dark" | "monokai" | "solarized_light" | "matrix";
@@ -238,15 +249,6 @@ const TERMINAL_THEMES: Record<Exclude<ThemeKey, "win_default">, { label: string;
   },
 };
 
-const DEFAULT_SNIPPETS: QuickSnippet[] = [
-  { id: "s1", label: "列目录", cmd: "ls -la" },
-  { id: "s2", label: "磁盘空间", cmd: "df -h" },
-  { id: "s3", label: "内存占用", cmd: "free -h" },
-  { id: "s4", label: "进程 Top", cmd: "ps aux --sort=-%cpu | head -n 15" },
-  { id: "s5", label: "监听端口", cmd: "ss -tulpn" },
-  { id: "s6", label: "Docker", cmd: "docker ps" },
-];
-
 type FontKey =
   | "win_default"
   | "auto_nf"
@@ -284,7 +286,6 @@ const TERMINAL_FONTS: Record<Exclude<FontKey, "win_default">, { label: string; f
   },
 };
 
-const STORAGE_SNIPPETS = "xiaorui_term_snippets_v1";
 const STORAGE_FONT = "xiaorui_term_font_size";
 const STORAGE_FONT_FAMILY = "xiaorui_term_font_family";
 const STORAGE_THEME = "xiaorui_term_theme";
@@ -315,17 +316,6 @@ function loadHighlightRules(): HighlightRule[] {
     return Array.isArray(parsed) && parsed.length > 0 ? parsed : DEFAULT_HIGHLIGHT_RULES;
   } catch {
     return DEFAULT_HIGHLIGHT_RULES;
-  }
-}
-
-function loadSnippets(): QuickSnippet[] {
-  try {
-    const raw = localStorage.getItem(STORAGE_SNIPPETS);
-    if (!raw) return DEFAULT_SNIPPETS;
-    const parsed = JSON.parse(raw) as QuickSnippet[];
-    return Array.isArray(parsed) && parsed.length > 0 ? parsed : DEFAULT_SNIPPETS;
-  } catch {
-    return DEFAULT_SNIPPETS;
   }
 }
 
@@ -412,6 +402,8 @@ const PtyTabPane = React.forwardRef<
       sendCancel: () => Promise<void>
     ) => void;
     onRecordCommand: (cmd: string) => void;
+    onBroadcastInput?: (data: string) => void;
+    onOutputText?: (text: string) => void;
     onNotify?: (text: string, kind?: "info" | "success" | "error") => void;
   }
 >(
@@ -442,6 +434,8 @@ const PtyTabPane = React.forwardRef<
       onRemoteCwdDetected,
       onDangerousCommand,
       onRecordCommand,
+      onBroadcastInput,
+      onOutputText,
       onNotify,
     },
     ref
@@ -465,6 +459,8 @@ const PtyTabPane = React.forwardRef<
     const onRemoteCwdDetectedRef = useRef(onRemoteCwdDetected);
     const onDangerousCommandRef = useRef(onDangerousCommand);
     const onRecordCommandRef = useRef(onRecordCommand);
+    const onBroadcastInputRef = useRef(onBroadcastInput);
+    const onOutputTextRef = useRef(onOutputText);
     const onNotifyRef = useRef(onNotify);
 
     useEffect(() => {
@@ -509,6 +505,12 @@ const PtyTabPane = React.forwardRef<
     useEffect(() => {
       onRecordCommandRef.current = onRecordCommand;
     }, [onRecordCommand]);
+    useEffect(() => {
+      onBroadcastInputRef.current = onBroadcastInput;
+    }, [onBroadcastInput]);
+    useEffect(() => {
+      onOutputTextRef.current = onOutputText;
+    }, [onOutputText]);
     useEffect(() => {
       onNotifyRef.current = onNotify;
     }, [onNotify]);
@@ -574,6 +576,10 @@ const PtyTabPane = React.forwardRef<
           }
           return lines.join("\n").trimEnd() + "\n";
         },
+        getSize: () => ({
+          cols: termRef.current?.cols || 100,
+          rows: termRef.current?.rows || 24,
+        }),
       }),
       [fitAndNotify]
     );
@@ -873,6 +879,9 @@ const PtyTabPane = React.forwardRef<
           outputDuringTyping = true;
         }
         const preview = utf8Decoder.decode(bytes, { stream: true });
+        if (preview) {
+          onOutputTextRef.current?.(preview);
+        }
         if (
           preview.includes("\x1b[?1049h") ||
           preview.includes("\x1b[?1047h") ||
@@ -905,6 +914,7 @@ const PtyTabPane = React.forwardRef<
         // 备用屏幕模式（nvim / tmux 全屏等）下直接透传全部原始字节
         if (isAlternateScreenActive()) {
           void api.sshPtyWrite(tid, data);
+          onBroadcastInputRef.current?.(data);
           return;
         }
 
@@ -947,6 +957,7 @@ const PtyTabPane = React.forwardRef<
             onRecordCommandRef.current(submitted);
           }
           void api.sshPtyWrite(tid, data);
+          onBroadcastInputRef.current?.(data);
           return;
         }
 
@@ -966,6 +977,7 @@ const PtyTabPane = React.forwardRef<
         }
 
         void api.sshPtyWrite(tid, data);
+        onBroadcastInputRef.current?.(data);
       });
 
       onStatusChangeRef.current("connecting");
@@ -1104,6 +1116,7 @@ PtyTabPane.displayName = "PtyTabPane";
 
 export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
   mode = "ssh",
+  remoteOsFamily,
   sessionId,
   sessionName,
   cwd,
@@ -1240,15 +1253,62 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
   const [searchRegex, setSearchRegex] = useState(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
 
-  // 快捷命令栏状态与多行危险粘贴二次确认状态
-  const [snippetsOpen, setSnippetsOpen] = useState(true);
-  const [snippets, setSnippets] = useState<QuickSnippet[]>(loadSnippets);
-  const [addingSnippet, setAddingSnippet] = useState(false);
-  const [newLabel, setNewLabel] = useState("");
-  const [newCmd, setNewCmd] = useState("");
+  // 底部功能栏状态（广播输入、OS 差异化批执行、SSH 端口转发隧道、会话录制）与多行粘贴二次确认
+  const [broadcastMode, setBroadcastMode] = useState(false);
+  const broadcastModeRef = useRef(false);
+  useEffect(() => {
+    broadcastModeRef.current = broadcastMode;
+  }, [broadcastMode]);
+
+  const [batchOpen, setBatchOpen] = useState(false);
+  const [batchScript, setBatchScript] = useState("");
+  const [batchTarget, setBatchTarget] = useState<"active" | "all">("active");
+
+  const [tunnelOpen, setTunnelOpen] = useState(false);
+  const [tunnels, setTunnels] = useState<SshTunnelInfo[]>([]);
+  const [tunnelLocalPort, setTunnelLocalPort] = useState("13306");
+  const [tunnelRemoteHost, setTunnelRemoteHost] = useState("127.0.0.1");
+  const [tunnelRemotePort, setTunnelRemotePort] = useState("3306");
+  const [tunnelBusy, setTunnelBusy] = useState(false);
+
+  const [recording, setRecording] = useState(false);
+  const recordingRef = useRef(false);
+  const recordStartMsRef = useRef(0);
+  const recordFramesRef = useRef<RecordingFrame[]>([]);
+  const [recordElapsedSec, setRecordElapsedSec] = useState(0);
+
   const [pendingPaste, setPendingPaste] = useState<string | null>(null);
   const [settingsMenuOpen, setSettingsMenuOpen] = useState(false);
   const settingsMenuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!recording) {
+      setRecordElapsedSec(0);
+      return;
+    }
+    const timer = window.setInterval(() => {
+      setRecordElapsedSec(Math.floor((Date.now() - recordStartMsRef.current) / 1000));
+    }, 500);
+    return () => window.clearInterval(timer);
+  }, [recording]);
+
+  const refreshTunnels = useCallback(async () => {
+    if (isLocalOnly || !sessionId || sessionId === "__local__") return;
+    try {
+      setTunnels(await api.sshTunnelList(sessionId));
+    } catch {
+      // 忽略会话尚未就绪时的查询错误
+    }
+  }, [isLocalOnly, sessionId]);
+
+  useEffect(() => {
+    if (!tunnelOpen || isLocalOnly) return;
+    void refreshTunnels();
+    const timer = window.setInterval(() => {
+      void refreshTunnels();
+    }, 4000);
+    return () => window.clearInterval(timer);
+  }, [tunnelOpen, isLocalOnly, refreshTunnels]);
 
   useEffect(() => {
     if (!settingsMenuOpen) return;
@@ -1298,9 +1358,6 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
   useEffect(() => {
     localStorage.setItem(STORAGE_HISTORY, JSON.stringify(cmdHistory));
   }, [cmdHistory]);
-  useEffect(() => {
-    localStorage.setItem(STORAGE_SNIPPETS, JSON.stringify(snippets));
-  }, [snippets]);
 
   /** 记录已执行的安全命令到本地历史（自动去重并跳过含密码/Token 的敏感命令） */
   const handleRecordCommand = useCallback((cmd: string) => {
@@ -1417,17 +1474,178 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
     [getActiveHandle]
   );
 
-  /** 同步当前 SFTP 远程浏览目录到活跃 Shell（严格拦截非法控制字符与命令注入） */
+  // 精确识别当前活跃标签的操作系统方言（Linux/POSIX vs Windows PowerShell vs Windows CMD）
+  const activeOsKind = detectTerminalOs(
+    activeTab?.kind ?? mode,
+    remoteOsFamily,
+    activeTab?.localProfile === "default"
+      ? localDefaults?.profileId
+      : activeTab?.localProfile
+  );
+  const activeOsLabel =
+    activeOsKind === "windows_ps"
+      ? "Windows PowerShell"
+      : activeOsKind === "windows_cmd"
+        ? "Windows CMD"
+        : "Linux / POSIX";
+  const batchPresets = getBatchPresets(activeOsKind);
+
+  /** 同步当前 SFTP 远程浏览目录到活跃 Shell（按 Linux / Windows 自动切换目录跳转语法） */
   const handleSyncCwd = useCallback(async () => {
     if (!cwd) return;
-    const cmd = buildSafeCdCommand(cwd);
+    const cmd = buildOsCdCommand(cwd, activeOsKind);
     if (!cmd) {
       onNotify?.("当前远程目录包含非法控制字符或危险元字符，已阻止同步至终端", "error");
       return;
     }
     const ok = await getActiveHandle()?.writeInput(cmd);
     if (!ok) onNotify?.("当前终端尚未连接就绪", "error");
-  }, [cwd, getActiveHandle, onNotify]);
+  }, [cwd, activeOsKind, getActiveHandle, onNotify]);
+
+  /** 执行 OS 差异化批量命令（自动校验高危防呆规则，支持发往当前标签或全部已连接标签） */
+  const handleExecuteBatch = async (rawScript: string) => {
+    const formatted = formatBatchScriptForOs(rawScript, activeOsKind);
+    if (!formatted) {
+      onNotify?.("请输入要批量执行的命令", "info");
+      return;
+    }
+    const lines = rawScript
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean);
+    const targetHandles: PtyTabHandle[] =
+      batchTarget === "all"
+        ? tabs
+            .filter((t) => t.status === "connected")
+            .map((t) => tabHandlesRef.current.get(t.id))
+            .filter((h): h is PtyTabHandle => Boolean(h))
+        : [getActiveHandle()].filter((h): h is PtyTabHandle => Boolean(h));
+
+    if (targetHandles.length === 0) {
+      onNotify?.("没有已连接就绪的终端标签可执行命令", "error");
+      return;
+    }
+
+    const doSend = async () => {
+      for (const l of lines) handleRecordCommand(l);
+      for (const h of targetHandles) {
+        await h.writeInput(formatted);
+      }
+      onNotify?.(
+        `已按 ${activeOsLabel} 方式向 ${targetHandles.length} 个终端标签发送批执行命令`,
+        "success"
+      );
+    };
+
+    if (commandGuard) {
+      for (const line of lines) {
+        const danger = matchDangerousCommand(line);
+        if (danger) {
+          setPendingDanger({
+            cmd: line,
+            match: danger,
+            proceed: doSend,
+            cancel: async () => {
+              getActiveHandle()?.focus();
+            },
+          });
+          return;
+        }
+      }
+    }
+    await doSend();
+  };
+
+  /** 启动一条 SSH 本地回环端口转发隧道（127.0.0.1:localPort -> remoteHost:remotePort） */
+  const handleStartTunnel = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const lp = Number(tunnelLocalPort);
+    const rp = Number(tunnelRemotePort);
+    const rh = tunnelRemoteHost.trim();
+    if (!Number.isInteger(lp) || lp < 0 || lp > 65535) {
+      onNotify?.("本地端口必须为 0–65535（填 0 表示自动分配空闲端口）", "error");
+      return;
+    }
+    if (!Number.isInteger(rp) || rp < 1 || rp > 65535 || !rh) {
+      onNotify?.("请填写合法的远端目标主机与端口 (1–65535)", "error");
+      return;
+    }
+    setTunnelBusy(true);
+    try {
+      const created = await api.sshTunnelStart(sessionId, lp, rh, rp);
+      await refreshTunnels();
+      onNotify?.(
+        `隧道已建立：127.0.0.1:${created.localPort} → ${created.remoteHost}:${created.remotePort}`,
+        "success"
+      );
+    } catch (err) {
+      onNotify?.(String(err), "error");
+    } finally {
+      setTunnelBusy(false);
+    }
+  };
+
+  /** 停止指定的 SSH 本地端口转发隧道 */
+  const handleStopTunnel = async (tunnelId: string) => {
+    try {
+      await api.sshTunnelStop(tunnelId);
+      await refreshTunnels();
+      onNotify?.("已停止 SSH 端口转发隧道", "info");
+    } catch (err) {
+      onNotify?.(String(err), "error");
+    }
+  };
+
+  /** 开始或停止终端会话录制（停止时可导出标准 asciinema v2 `.cast` 或 `.log`） */
+  const handleToggleRecording = async () => {
+    if (!recording) {
+      recordFramesRef.current = [];
+      recordStartMsRef.current = Date.now();
+      recordingRef.current = true;
+      setRecording(true);
+      onNotify?.("已开始录制当前终端会话（再次点击「录制」即可停止并保存）", "info");
+      return;
+    }
+
+    recordingRef.current = false;
+    setRecording(false);
+    const frames = recordFramesRef.current;
+    if (frames.length === 0) {
+      onNotify?.("本次录制期间暂无终端输出内容", "info");
+      return;
+    }
+    try {
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+      const safeName = (isLocalOnly ? "local-terminal" : sessionName).replace(/[^\w.-]+/g, "_");
+      const target = await save({
+        defaultPath: `xiaorui_FTP-${safeName}-${stamp}.cast`,
+        filters: [
+          { name: "asciinema v2 终端录屏 (.cast)", extensions: ["cast"] },
+          { name: "纯文本日志 (.log)", extensions: ["log", "txt"] },
+        ],
+        title: "保存终端录制文件",
+      });
+      if (!target) return;
+      const sz = getActiveHandle()?.getSize() ?? { cols: 100, rows: 24 };
+      const content = target.toLowerCase().endsWith(".cast")
+        ? buildAsciinemaV2(sz.cols, sz.rows, isLocalOnly ? "Local Terminal" : sessionName, frames)
+        : frames.map((f) => f.text).join("");
+      await api.saveTextFile(target, content);
+      onNotify?.(`终端录制已保存至 ${target}`, "success");
+    } catch (err) {
+      onNotify?.(`保存录制文件失败：${String(err)}`, "error");
+    }
+  };
+
+  const handleReconnectActiveTab = () => {
+    setTabs((prev) =>
+      prev.map((t) =>
+        t.id === activeTab?.id
+          ? { ...t, status: "connecting", reconnectSeq: t.reconnectSeq + 1 }
+          : t
+      )
+    );
+  };
 
   /** 类 Xshell rz / Xftp 体验：从本地选择文件直接 SFTP 上传至当前远程目录 */
   const handleUploadLocalFiles = async () => {
@@ -1520,18 +1738,6 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
       }
       return next;
     });
-  };
-
-  const handleAddSnippet = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!newLabel.trim() || !newCmd.trim()) return;
-    setSnippets((prev) => [
-      ...prev,
-      { id: `u-${Date.now()}`, label: newLabel.trim(), cmd: newCmd.trim() },
-    ]);
-    setNewLabel("");
-    setNewCmd("");
-    setAddingSnippet(false);
   };
 
   /** 顶部拖拽调整停靠模式终端高度 */
@@ -1706,16 +1912,6 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
 
           <button
             type="button"
-            className={`btn-tool btn-tool-xs ${historyOpen ? "active" : ""}`}
-            onClick={() => setHistoryOpen((v) => !v)}
-            title="命令历史模糊检索 (Ctrl+Shift+H，已自动跳过密码)"
-          >
-            <History size={12} />
-            历史
-          </button>
-
-          <button
-            type="button"
             className="btn-tool btn-tool-xs"
             onClick={() => {
               void readClipboardText().then((txt) => {
@@ -1740,24 +1936,6 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
           >
             <Trash2 size={12} />
             清屏
-          </button>
-
-          <button
-            type="button"
-            className="btn-tool btn-tool-xs"
-            onClick={() =>
-              setTabs((prev) =>
-                prev.map((t) =>
-                  t.id === activeTab?.id
-                    ? { ...t, status: "connecting", reconnectSeq: t.reconnectSeq + 1 }
-                    : t
-                )
-              )
-            }
-            title="重新启动当前标签的 Shell 会话"
-          >
-            <RotateCw size={12} />
-            重连
           </button>
 
           {/* 终端外观与进阶功能统一收纳在设置浮层中，避免工具栏堆砌大量孤立小图标 */}
@@ -1922,37 +2100,6 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
                   </button>
                 )}
 
-                <button
-                  type="button"
-                  className="term-popover-toggle"
-                  onClick={() => {
-                    setHighlightPanelOpen((v) => !v);
-                    setSettingsMenuOpen(false);
-                  }}
-                >
-                  <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-                    <Highlighter size={13} />
-                    关键词高亮规则管理
-                  </span>
-                  <span className={`term-toggle-pill ${highlightEnabled ? "on" : ""}`}>
-                    {highlightEnabled ? "已开启" : "已关闭"}
-                  </span>
-                </button>
-
-                <button
-                  type="button"
-                  className="term-popover-toggle"
-                  onClick={() => setSnippetsOpen((v) => !v)}
-                >
-                  <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-                    <Zap size={13} />
-                    底部快捷命令栏
-                  </span>
-                  <span className={`term-toggle-pill ${snippetsOpen ? "on" : ""}`}>
-                    {snippetsOpen ? "显示" : "隐藏"}
-                  </span>
-                </button>
-
                 <div className="term-popover-sep" />
 
                 <button
@@ -1965,7 +2112,7 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
                 >
                   <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
                     <FileDown size={13} />
-                    导出终端会话日志 (.log)
+                    导出当前屏幕缓冲 (.log)
                   </span>
                 </button>
               </div>
@@ -2462,6 +2609,21 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
               setPendingDanger({ cmd, match, proceed, cancel })
             }
             onRecordCommand={handleRecordCommand}
+            onBroadcastInput={(data) => {
+              if (!broadcastModeRef.current) return;
+              for (const t of tabs) {
+                if (t.id !== tab.id && t.status === "connected") {
+                  void tabHandlesRef.current.get(t.id)?.writeInput(data);
+                }
+              }
+            }}
+            onOutputText={(text) => {
+              if (!recordingRef.current || tab.id !== activeTab?.id) return;
+              const elapsed = (Date.now() - recordStartMsRef.current) / 1000;
+              if (recordFramesRef.current.length < 50000) {
+                recordFramesRef.current.push({ time: elapsed, text });
+              }
+            }}
             onNotify={onNotify}
             onStatusChange={(status, sizeLabel) =>
               setTabs((prev) =>
@@ -2476,70 +2638,270 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
         ))}
       </div>
 
-      {/* Xshell 底部快捷命令栏 */}
-      {snippetsOpen && (
-        <div className="term-snippets-bar">
-          <span className="term-snippets-label">快捷命令</span>
-          {snippets.map((item) => (
-            <span key={item.id} className="term-snippet-chip">
-              <button
-                type="button"
-                className="term-snippet-run"
-                onClick={() => void runCommandWithGuard(item.cmd)}
-                title={`点击立即发送执行（受高危防呆保护）：${item.cmd}`}
-              >
-                {item.label}
-              </button>
-              <button
-                type="button"
-                className="term-snippet-del"
-                onClick={() => setSnippets((prev) => prev.filter((s) => s.id !== item.id))}
-                title="移除该快捷命令"
-              >
-                <X size={10} />
-              </button>
+      {/* 批执行抽屉（按 Linux / Windows PowerShell / Windows CMD 自动区分指令与执行方式） */}
+      {batchOpen && (
+        <div className="term-subpanel">
+          <div className="term-subpanel-header">
+            <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+              <Play size={13} color="var(--accent)" />
+              批执行（当前平台：{activeOsLabel}）
             </span>
-          ))}
-
-          {addingSnippet ? (
-            <form className="term-snippet-form" onSubmit={handleAddSnippet}>
-              <input
-                value={newLabel}
-                onChange={(e) => setNewLabel(e.target.value)}
-                placeholder="按钮名"
-                style={{ width: 72 }}
-                autoFocus
-              />
-              <input
-                value={newCmd}
-                onChange={(e) => setNewCmd(e.target.value)}
-                placeholder="命令（如 tail -f /var/log/syslog）"
-                style={{ width: 190 }}
-              />
-              <button type="submit" className="btn btn-sm btn-primary">
-                保存
-              </button>
+            <div style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+              <select
+                className="term-theme-select"
+                value={batchTarget}
+                onChange={(e) => setBatchTarget(e.target.value as "active" | "all")}
+              >
+                <option value="active">仅当前标签</option>
+                <option value="all">
+                  全部已连接标签 ({tabs.filter((t) => t.status === "connected").length})
+                </option>
+              </select>
               <button
                 type="button"
-                className="btn btn-sm btn-ghost"
-                onClick={() => setAddingSnippet(false)}
+                className="btn-tool btn-tool-xs"
+                onClick={() => setBatchOpen(false)}
               >
-                取消
+                <X size={12} />
+                关闭
               </button>
-            </form>
-          ) : (
+            </div>
+          </div>
+
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
+            {batchPresets.map((p) => (
+              <button
+                key={p.id}
+                type="button"
+                className="btn-tool btn-tool-xs"
+                onClick={() => setBatchScript((cur) => (cur.trim() ? `${cur.trimEnd()}\n${p.cmd}` : p.cmd))}
+                title={`点击追加 ${activeOsLabel} 命令：${p.cmd}`}
+              >
+                + {p.label}
+              </button>
+            ))}
+          </div>
+
+          <textarea
+            className="term-batch-textarea"
+            value={batchScript}
+            onChange={(e) => setBatchScript(e.target.value)}
+            placeholder={
+              activeOsKind === "linux"
+                ? "输入多行 Linux Shell 命令（每行一条，支持 # 注释，受高危防呆保护）..."
+                : activeOsKind === "windows_cmd"
+                  ? "输入多行 Windows CMD 命令（每行一条，支持 REM 注释）..."
+                  : "输入多行 Windows PowerShell 命令（每行一条，支持 # 注释）..."
+            }
+          />
+
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 6 }}>
             <button
               type="button"
-              className="btn btn-sm btn-ghost"
-              style={{ height: 22, padding: "0 7px", fontSize: 11 }}
-              onClick={() => setAddingSnippet(true)}
+              className="btn-tool btn-tool-xs"
+              onClick={() => setBatchScript("")}
             >
-              <Plus size={11} />
-              添加命令
+              清空
             </button>
+            <button
+              type="button"
+              className="btn btn-sm btn-primary"
+              style={{ height: 24, padding: "0 10px", fontSize: 11.5 }}
+              onClick={() => void handleExecuteBatch(batchScript)}
+            >
+              <Play size={11} />
+              立即批执行
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* SSH 本地端口转发隧道面板（仅远程 SSH 会话可用，严格绑定 127.0.0.1 回环安全边界） */}
+      {tunnelOpen && !isLocalOnly && (
+        <div className="term-subpanel">
+          <div className="term-subpanel-header">
+            <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+              <Network size={13} color="var(--accent)" />
+              SSH 本地端口转发隧道（仅监听 127.0.0.1）
+            </span>
+            <button
+              type="button"
+              className="btn-tool btn-tool-xs"
+              onClick={() => setTunnelOpen(false)}
+            >
+              <X size={12} />
+              关闭
+            </button>
+          </div>
+
+          <form
+            onSubmit={(e) => void handleStartTunnel(e)}
+            style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 6 }}
+          >
+            <span style={{ fontSize: 11.5, color: "var(--text-muted)" }}>127.0.0.1 :</span>
+            <input
+              className="term-theme-select"
+              style={{ width: 72, fontFamily: "var(--font-mono)" }}
+              value={tunnelLocalPort}
+              onChange={(e) => setTunnelLocalPort(e.target.value)}
+              placeholder="本地端口"
+              title="本地监听端口（填 0 自动分配）"
+            />
+            <span style={{ fontSize: 11.5, color: "var(--text-muted)" }}>→</span>
+            <input
+              className="term-theme-select"
+              style={{ width: 130, fontFamily: "var(--font-mono)" }}
+              value={tunnelRemoteHost}
+              onChange={(e) => setTunnelRemoteHost(e.target.value)}
+              placeholder="远端主机 (如 127.0.0.1)"
+            />
+            <span style={{ fontSize: 11.5, color: "var(--text-muted)" }}>:</span>
+            <input
+              className="term-theme-select"
+              style={{ width: 68, fontFamily: "var(--font-mono)" }}
+              value={tunnelRemotePort}
+              onChange={(e) => setTunnelRemotePort(e.target.value)}
+              placeholder="远端端口"
+            />
+            <button
+              type="submit"
+              className="btn btn-sm btn-primary"
+              style={{ height: 24, padding: "0 10px", fontSize: 11.5 }}
+              disabled={tunnelBusy}
+            >
+              {tunnelBusy ? "启动中..." : "新建隧道"}
+            </button>
+          </form>
+
+          {tunnels.length > 0 ? (
+            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+              {tunnels.map((t) => (
+                <div key={t.id} className="term-tunnel-row">
+                  <span style={{ fontFamily: "var(--font-mono)" }}>
+                    127.0.0.1:{t.localPort} → {t.remoteHost}:{t.remotePort}
+                  </span>
+                  <div style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+                    <span style={{ fontSize: 11, color: "var(--text-muted)" }}>
+                      活跃连接 {t.activeConnections}
+                    </span>
+                    <button
+                      type="button"
+                      className="btn-tool btn-tool-xs"
+                      style={{ color: "var(--danger)" }}
+                      onClick={() => void handleStopTunnel(t.id)}
+                    >
+                      停止
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div style={{ fontSize: 11.5, color: "var(--text-muted)" }}>
+              暂无活跃隧道，可安全映射远端 MySQL (3306)、Redis (6379) 或 Web 服务到本机回环端口。
+            </div>
           )}
         </div>
       )}
+
+      {/* 全新终端底部功能栏（广播输入 / 批执行 / 隧道[仅SSH] / 高亮 / 重连 / 历史命令 / 录制） */}
+      <div className="term-bottom-bar">
+        <button
+          type="button"
+          className={`term-bottom-btn ${broadcastMode ? "active" : ""}`}
+          onClick={() => {
+            const next = !broadcastMode;
+            setBroadcastMode(next);
+            onNotify?.(
+              next
+                ? `已开启广播输入：当前按键将同步发送到全部 ${tabs.filter((t) => t.status === "connected").length} 个已连接标签`
+                : "已关闭广播输入，恢复单标签输入",
+              "info"
+            );
+          }}
+          title="开启后当前终端的键盘输入将同步广播到本面板内全部已连接标签"
+        >
+          <Radio size={13} />
+          {broadcastMode ? `广播输入中 (${tabs.filter((t) => t.status === "connected").length})` : "广播输入"}
+        </button>
+
+        <button
+          type="button"
+          className={`term-bottom-btn ${batchOpen ? "active" : ""}`}
+          onClick={() => {
+            setBatchOpen((v) => !v);
+            setTunnelOpen(false);
+          }}
+          title={`按 ${activeOsLabel} 平台指令批量执行多条命令`}
+        >
+          <Play size={13} />
+          批执行
+        </button>
+
+        {!isLocalOnly && (
+          <button
+            type="button"
+            className={`term-bottom-btn ${tunnelOpen || tunnels.length > 0 ? "active" : ""}`}
+            onClick={() => {
+              setTunnelOpen((v) => !v);
+              setBatchOpen(false);
+            }}
+            title="管理 SSH 本地端口转发隧道（仅远程 SSH 会话可用）"
+          >
+            <Network size={13} />
+            隧道{tunnels.length > 0 ? ` (${tunnels.length})` : ""}
+          </button>
+        )}
+
+        <button
+          type="button"
+          className={`term-bottom-btn ${highlightPanelOpen || highlightEnabled ? "active" : ""}`}
+          onClick={() => setHighlightPanelOpen((v) => !v)}
+          title="管理终端关键词高亮规则（ERROR / WARN / OK / IPv4，自动跳过全屏 TUI）"
+        >
+          <Highlighter size={13} />
+          高亮
+        </button>
+
+        <button
+          type="button"
+          className="term-bottom-btn"
+          onClick={handleReconnectActiveTab}
+          title="重新启动当前标签的 Shell 会话"
+        >
+          <RotateCw size={13} />
+          重连
+        </button>
+
+        <button
+          type="button"
+          className={`term-bottom-btn ${historyOpen ? "active" : ""}`}
+          onClick={() => setHistoryOpen((v) => !v)}
+          title="模糊检索命令历史 (Ctrl+Shift+H，已自动跳过密码与敏感指令)"
+        >
+          <History size={13} />
+          历史命令
+        </button>
+
+        <button
+          type="button"
+          className={`term-bottom-btn ${recording ? "recording" : ""}`}
+          onClick={() => void handleToggleRecording()}
+          title={recording ? "点击停止录制并保存为 .cast / .log 文件" : "开始录制当前终端会话"}
+        >
+          {recording ? <Square size={11} /> : <Circle size={12} />}
+          {recording
+            ? `停止录制 ${String(Math.floor(recordElapsedSec / 60)).padStart(2, "0")}:${String(recordElapsedSec % 60).padStart(2, "0")}`
+            : "录制"}
+        </button>
+
+        <span
+          className="term-os-pill"
+          title="当前终端已自动识别操作系统，批执行与目录同步均按此系统方式执行"
+        >
+          {activeOsLabel}
+        </span>
+      </div>
     </div>
   );
 };

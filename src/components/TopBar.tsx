@@ -7,6 +7,7 @@
 
 import React, { useState } from "react";
 import {
+  Activity,
   ArrowLeftRight,
   Columns2,
   Download,
@@ -25,6 +26,8 @@ interface TopBarProps {
   onToggleSidebar: () => void;
   dualPane: boolean;
   onToggleDualPane: () => void;
+  monitorOpen: boolean;
+  onToggleMonitor: () => void;
   theme: "light" | "dark";
   onToggleTheme: () => void;
   transferOpen: boolean;
@@ -46,6 +49,8 @@ export const TopBar: React.FC<TopBarProps> = ({
   onToggleSidebar,
   dualPane,
   onToggleDualPane,
+  monitorOpen,
+  onToggleMonitor,
   theme,
   onToggleTheme,
   transferOpen,
@@ -162,6 +167,16 @@ export const TopBar: React.FC<TopBarProps> = ({
         </button>
 
         <span className="topbar-sep" />
+
+        <button
+          type="button"
+          className={`btn-tool ${monitorOpen ? "active" : ""}`}
+          onClick={onToggleMonitor}
+          title="显示或隐藏右侧实时系统监控与目录统计面板"
+        >
+          <Activity size={14} />
+          监控
+        </button>
 
         <button
           type="button"

@@ -292,15 +292,50 @@ export interface RemoteDisk {
   usePercent: number;
 }
 
-/** 远端服务器硬件规格与实时资源占用快照（SFTP/SSH 会话） */
+/** 远端或本机单个网络接口实时流量与地址信息 */
+export interface NetInterface {
+  name: string;
+  ip?: string | null;
+  rxBytesPerSec: number;
+  txBytesPerSec: number;
+}
+
+/** 活跃 SSH 本地端口转发隧道摘要 */
+export interface SshTunnelInfo {
+  id: string;
+  sessionId: string;
+  localPort: number;
+  remoteHost: string;
+  remotePort: number;
+  activeConnections: number;
+  createdAt: number;
+}
+
+/** 远端或本机服务器硬件规格与实时资源占用快照（支持 Linux / Windows / macOS） */
 export interface ServerMetrics {
+  osFamily: "linux" | "windows" | "macos" | string;
   osName: string;
+  hostname?: string | null;
+  uptimeSecs?: number | null;
   cpuCores: number;
   cpuUsagePct?: number | null;
+  cpuUserPct?: number | null;
+  cpuSysPct?: number | null;
   loadAvg?: string | null;
   memUsedBytes: number;
   memTotalBytes: number;
+  swapUsedBytes: number;
+  swapTotalBytes: number;
+  gpuName?: string | null;
+  gpuUsagePct?: number | null;
+  gpuMemUsedMb?: number | null;
+  gpuMemTotalMb?: number | null;
+  defaultGateway?: string | null;
+  netRxBps: number;
+  netTxBps: number;
+  netInterfaces: NetInterface[];
   disks: RemoteDisk[];
+  timestamp: number;
 }
 
 /** 各协议的展示名称、徽章样式与默认端口配置 */

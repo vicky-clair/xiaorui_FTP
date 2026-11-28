@@ -32,6 +32,7 @@ import { EditorModal } from "./components/EditorModal";
 import { FilePane } from "./components/FilePane";
 import { HostKeyModal } from "./components/HostKeyModal";
 import { KnownHostsModal } from "./components/KnownHostsModal";
+import { MonitorPanel, type CpuTrendPoint } from "./components/MonitorPanel";
 import { SiteModal } from "./components/SiteModal";
 import { SiteSidebar } from "./components/SiteSidebar";
 import { SshConfigImportModal } from "./components/SshConfigImportModal";
@@ -71,6 +72,7 @@ export default function App() {
   );
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [dualPane, setDualPane] = useState(true);
+  const [monitorOpen, setMonitorOpen] = useState(true);
   const [transferOpen, setTransferOpen] = useState(false);
   const [terminalOpen, setTerminalOpen] = useState(false);
   const [terminalMode, setTerminalMode] = useState<"ssh" | "local">("ssh");
@@ -131,6 +133,10 @@ export default function App() {
   const [sshConfigImportOpen, setSshConfigImportOpen] = useState(false);
   const [minimizeToTray, setMinimizeToTray] = useState(true);
   const [serverMetrics, setServerMetrics] = useState<ServerMetrics | null>(null);
+  const [localMetrics, setLocalMetrics] = useState<ServerMetrics | null>(null);
+  const [metricsLoading, setMetricsLoading] = useState(false);
+  const [remoteCpuHistory, setRemoteCpuHistory] = useState<CpuTrendPoint[]>([]);
+  const [localCpuHistory, setLocalCpuHistory] = useState<CpuTrendPoint[]>([]);
 
   // 可拖拽双栏宽度比例（左侧本地栏百分比）与命令栏聚焦引用
   const [splitRatio, setSplitRatio] = useState(46);
@@ -194,31 +200,84 @@ export default function App() {
 
   const activeSession = sessions.find((s) => s.sessionId === activeSessionId) ?? null;
 
-  // SFTP/SSH 会话激活时，自动采集远端服务器硬件规格、资源占用与多磁盘挂载点（每 15 秒轻量刷新）
+  // 远端 SFTP/SSH 实时硬件、网卡流量与 CPU 趋势采集（面板开启时每 5 秒刷新，关闭时 15 秒轻量刷新）
+  const fetchRemoteMetricsNow = useCallback(async (sid: string) => {
+    setMetricsLoading(true);
+    try {
+      const m = await api.remoteServerMetrics(sid);
+      setServerMetrics(m);
+      if (m.cpuUsagePct != null) {
+        setRemoteCpuHistory((prev) =>
+          [...prev, { ts: m.timestamp || Math.floor(Date.now() / 1000), cpu: m.cpuUsagePct! }].slice(
+            -180
+          )
+        );
+      }
+    } catch {
+      // 受限 SFTP-only 账号不支持 exec 通道时静默忽略，不影响文件浏览
+    } finally {
+      setMetricsLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
+    setRemoteCpuHistory([]);
     if (!activeSession?.supportsShell) {
       setServerMetrics(null);
       return;
     }
     let cancelled = false;
     const sid = activeSession.sessionId;
-    const fetchMetrics = async () => {
-      try {
-        const m = await api.remoteServerMetrics(sid);
-        if (!cancelled) setServerMetrics(m);
-      } catch {
-        // 受限 SFTP-only 账号不支持 exec 通道时静默忽略，不影响文件浏览
-      }
+    const run = async () => {
+      if (cancelled) return;
+      await fetchRemoteMetricsNow(sid);
     };
-    void fetchMetrics();
+    void run();
     const timer = window.setInterval(() => {
-      void fetchMetrics();
-    }, 15000);
+      void run();
+    }, monitorOpen ? 5000 : 15000);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [activeSession?.sessionId, activeSession?.supportsShell]);
+  }, [activeSession?.sessionId, activeSession?.supportsShell, monitorOpen, fetchRemoteMetricsNow]);
+
+  // 无远端 SSH 会话时，监控面板自动采集本机操作系统实时指标（Windows/Unix 差异化采集）
+  const fetchLocalMetricsNow = useCallback(async () => {
+    setMetricsLoading(true);
+    try {
+      const m = await api.localServerMetrics();
+      setLocalMetrics(m);
+      if (m.cpuUsagePct != null) {
+        setLocalCpuHistory((prev) =>
+          [...prev, { ts: m.timestamp || Math.floor(Date.now() / 1000), cpu: m.cpuUsagePct! }].slice(
+            -180
+          )
+        );
+      }
+    } catch {
+      // 忽略本机偶发采集失败
+    } finally {
+      setMetricsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!monitorOpen || activeSession?.supportsShell) return;
+    let cancelled = false;
+    const run = async () => {
+      if (cancelled) return;
+      await fetchLocalMetricsNow();
+    };
+    void run();
+    const timer = window.setInterval(() => {
+      void run();
+    }, 6000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [monitorOpen, activeSession?.supportsShell, fetchLocalMetricsNow]);
 
   /** 从远程文件面板一键在 SSH 终端进入指定目录（安全转义并拦截控制字符注入） */
   const handleOpenDirInTerminal = useCallback(
@@ -953,6 +1012,8 @@ export default function App() {
         onToggleSidebar={() => setSidebarOpen((v) => !v)}
         dualPane={dualPane}
         onToggleDualPane={() => setDualPane((v) => !v)}
+        monitorOpen={monitorOpen}
+        onToggleMonitor={() => setMonitorOpen((v) => !v)}
         theme={theme}
         onToggleTheme={() => setTheme((t) => (t === "light" ? "dark" : "light"))}
         transferOpen={transferOpen}
@@ -1267,6 +1328,7 @@ export default function App() {
             <TerminalDrawer
               key={activeSession.sessionId}
               mode="ssh"
+              remoteOsFamily={serverMetrics?.osFamily}
               sessionId={activeSession.sessionId}
               sessionName={activeSession.name}
               cwd={remotePath}
@@ -1292,6 +1354,47 @@ export default function App() {
             />
           )}
         </main>
+
+        {/* 右侧直观系统监控与当前目录概览面板（远程 SSH 监控 / 本机监控自动切换） */}
+        {monitorOpen && (
+          <MonitorPanel
+            mode={activeSession?.supportsShell ? "remote" : "local"}
+            title={
+              activeSession?.supportsShell
+                ? activeSession.name
+                : localMetrics?.hostname || "本机工作站"
+            }
+            hostLabel={activeSession?.supportsShell ? activeSession.host : "127.0.0.1"}
+            userLabel={
+              activeSession?.supportsShell
+                ? sites.find((s) => s.id === activeSession.siteId)?.username || undefined
+                : undefined
+            }
+            metrics={activeSession?.supportsShell ? serverMetrics : localMetrics}
+            loading={metricsLoading}
+            cpuHistory={activeSession?.supportsShell ? remoteCpuHistory : localCpuHistory}
+            currentPath={activeSession ? remotePath : localPath}
+            entries={activeSession ? remoteEntries : localEntries}
+            onRefresh={() => {
+              if (activeSession?.supportsShell) {
+                void fetchRemoteMetricsNow(activeSession.sessionId);
+              } else {
+                void fetchLocalMetricsNow();
+              }
+            }}
+            onNavigateDisk={(mountPath) => {
+              if (activeSession?.supportsShell) {
+                void loadRemoteDir(activeSession.sessionId, mountPath);
+              } else {
+                const winPath = /^\/[A-Za-z]:/.test(mountPath)
+                  ? `${mountPath.slice(1, 3)}\\`
+                  : mountPath;
+                void loadLocalDir(winPath);
+              }
+            }}
+            onClose={() => setMonitorOpen(false)}
+          />
+        )}
       </div>
 
       {/* 底部现代桌面状态栏（含远端硬件规格/占用、多磁盘快切与托盘模式开关） */}

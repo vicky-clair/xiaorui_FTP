@@ -25,7 +25,7 @@ use crate::models::parse_quick_connect_uri;
 use crate::models::{
     join_remote_path, normalize_remote_path, AgentStatus, AppSettings, AuthType, FileEntry,
     LocalRoot, Protocol, PtyDataEvent, PtyExitEvent, ServerMetrics, SessionInfo, SiteConfig,
-    SiteInput, SiteSecrets, TransferDirection, TransferTask,
+    SiteInput, SiteSecrets, SshTunnelInfo, TransferDirection, TransferTask,
 };
 use crate::protocols::{connect_protocol, sftp, PtyCommand, RemoteFs};
 use crate::security::{
@@ -54,6 +54,13 @@ pub struct ActivePty {
     pub cmd_tx: tokio::sync::mpsc::Sender<PtyCommand>,
 }
 
+/// 活跃 SSH 本地端口转发隧道运行时状态
+pub struct ActiveTunnel {
+    pub info: SshTunnelInfo,
+    pub active_connections: Arc<std::sync::atomic::AtomicU32>,
+    pub shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
 /// 活跃远程会话实例（包含元数据与协议适配器句柄）
 pub struct ActiveSession {
     pub info: SessionInfo,
@@ -78,6 +85,8 @@ pub struct AppState {
     pub ptys: Arc<RwLock<HashMap<String, ActivePty>>>,
     /// 独立终端窗口与远程会话的绑定表（window_label -> session_id）
     pub terminal_windows: RwLock<HashMap<String, String>>,
+    /// 当前活跃的 SSH 本地端口转发隧道映射表（tunnel_id -> ActiveTunnel）
+    pub tunnels: RwLock<HashMap<String, ActiveTunnel>>,
     /// 后台并发传输队列管理器
     pub transfers: TransferManager,
 }
@@ -99,6 +108,7 @@ impl AppState {
             sessions: RwLock::new(HashMap::new()),
             ptys: Arc::new(RwLock::new(HashMap::new())),
             terminal_windows: RwLock::new(HashMap::new()),
+            tunnels: RwLock::new(HashMap::new()),
             transfers: TransferManager::new(3),
         })
     }
@@ -839,7 +849,23 @@ pub async fn disconnect_session(
         let _ = tx.send(PtyCommand::Close).await;
     }
 
-    // 3. 关闭所有绑定到该会话的独立终端窗口（term-*）
+    // 3. 关闭该会话名下所有活跃 SSH 端口转发隧道
+    let tunnels_to_stop: Vec<tokio::sync::oneshot::Sender<()>> = {
+        let mut map = state.tunnels.write().await;
+        let ids: Vec<String> = map
+            .iter()
+            .filter(|(_, t)| t.info.session_id == session_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.into_iter()
+            .filter_map(|id| map.remove(&id).and_then(|mut t| t.shutdown_tx.take()))
+            .collect()
+    };
+    for tx in tunnels_to_stop {
+        let _ = tx.send(());
+    }
+
+    // 4. 关闭所有绑定到该会话的独立终端窗口（term-*）
     let bound_windows: Vec<String> = {
         let mut map = state.terminal_windows.write().await;
         let labels: Vec<String> = map
@@ -1360,6 +1386,177 @@ pub async fn remote_server_metrics(
     fs.server_metrics().await
 }
 
+/// 采集当前本机操作系统的实时硬件规格、网卡流量与多磁盘信息（Windows 静默无黑框执行）
+#[tauri::command]
+pub async fn local_server_metrics() -> AppResult<ServerMetrics> {
+    tokio::task::spawn_blocking(|| -> AppResult<ServerMetrics> {
+        #[cfg(windows)]
+        let output = {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            std::process::Command::new("powershell.exe")
+                .args([
+                    "-NoProfile",
+                    "-Command",
+                    sftp::build_windows_metrics_script(),
+                ])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+                .map_err(|e| AppError::Protocol(format!("采集本机 Windows 监控指标失败: {}", e)))?
+        };
+
+        #[cfg(not(windows))]
+        let output = {
+            let script = r#"
+OS=$(grep -m1 "^PRETTY_NAME=" /etc/os-release 2>/dev/null | cut -d= -f2- | tr -d "\"")
+[ -z "$OS" ] && OS=$(uname -s 2>/dev/null || echo "Unix")
+OS_FAM="linux"
+[ "$(uname -s 2>/dev/null)" = "Darwin" ] && OS_FAM="macos"
+HOST=$(hostname 2>/dev/null || true)
+UPTIME=$(awk '{print int($1)}' /proc/uptime 2>/dev/null || true)
+CORES=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 0)
+LOAD=$(awk '{print $1, $2, $3}' /proc/loadavg 2>/dev/null || true)
+MEM_T=0; MEM_U=0
+if [ -r /proc/meminfo ]; then
+  MEM_T=$(awk '/^MemTotal:/{print $2*1024}' /proc/meminfo)
+  MEM_A=$(awk '/^MemAvailable:/{print $2*1024}' /proc/meminfo)
+  MEM_U=$((MEM_T - MEM_A))
+fi
+echo "OS_FAMILY=$OS_FAM"
+echo "OS=$OS"
+echo "HOST=$HOST"
+echo "UPTIME=$UPTIME"
+echo "CORES=$CORES"
+echo "LOAD=$LOAD"
+echo "MEM=$MEM_U:$MEM_T"
+echo "DISKS_BEGIN"
+(df -kP -T 2>/dev/null || df -kP 2>/dev/null) | tail -n +2
+echo "DISKS_END"
+"#;
+            std::process::Command::new("sh")
+                .args(["-c", script])
+                .output()
+                .map_err(|e| AppError::Protocol(format!("采集本机系统监控指标失败: {}", e)))?
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        sftp::parse_server_metrics(&stdout)
+            .ok_or_else(|| AppError::Protocol("无法解析本机硬件与磁盘监控数据".into()))
+    })
+    .await
+    .map_err(|e| AppError::Protocol(format!("本机监控采集任务异常: {}", e)))?
+}
+
+/// 为指定 SSH 会话创建本地回环端口转发隧道（`127.0.0.1:local_port -> remote_host:remote_port`）
+#[tauri::command]
+pub async fn ssh_tunnel_start(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    session_id: String,
+    local_port: u16,
+    remote_host: String,
+    remote_port: u16,
+) -> AppResult<SshTunnelInfo> {
+    state
+        .ensure_window_session_access(&window, &session_id, "ssh_tunnel_start")
+        .await?;
+    let fs = state.get_fs(&session_id).await?;
+    let runtime = fs
+        .start_local_forward(local_port, remote_host.clone(), remote_port)
+        .await?;
+
+    let id = Uuid::new_v4().to_string();
+    let info = SshTunnelInfo {
+        id: id.clone(),
+        session_id: session_id.clone(),
+        local_port: runtime.local_port,
+        remote_host: remote_host.trim().to_string(),
+        remote_port,
+        active_connections: 0,
+        created_at: Utc::now().timestamp(),
+    };
+    state.tunnels.write().await.insert(
+        id,
+        ActiveTunnel {
+            info: info.clone(),
+            active_connections: runtime.active_connections,
+            shutdown_tx: Some(runtime.shutdown_tx),
+        },
+    );
+    state.audit.record(
+        AuditSeverity::Info,
+        AuditCategory::Session,
+        "ssh_tunnel_started",
+        &format!(
+            "127.0.0.1:{} -> {}:{}",
+            info.local_port, info.remote_host, info.remote_port
+        ),
+        &format!("已建立 SSH 本地端口转发隧道 (session={})", session_id),
+    );
+    Ok(info)
+}
+
+/// 查询指定 SSH 会话当前全部活跃的端口转发隧道
+#[tauri::command]
+pub async fn ssh_tunnel_list(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    session_id: String,
+) -> AppResult<Vec<SshTunnelInfo>> {
+    state
+        .ensure_window_session_access(&window, &session_id, "ssh_tunnel_list")
+        .await?;
+    let guard = state.tunnels.read().await;
+    let mut list: Vec<SshTunnelInfo> = guard
+        .values()
+        .filter(|t| t.info.session_id == session_id)
+        .map(|t| {
+            let mut item = t.info.clone();
+            item.active_connections = t.active_connections.load(Ordering::Relaxed);
+            item
+        })
+        .collect();
+    list.sort_by_key(|t| t.created_at);
+    Ok(list)
+}
+
+/// 停止并移除指定的 SSH 本地端口转发隧道
+#[tauri::command]
+pub async fn ssh_tunnel_stop(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    tunnel_id: String,
+) -> AppResult<()> {
+    let session_id = {
+        let guard = state.tunnels.read().await;
+        guard
+            .get(&tunnel_id)
+            .map(|t| t.info.session_id.clone())
+            .ok_or_else(|| AppError::SessionNotFound("端口转发隧道不存在或已停止".into()))?
+    };
+    state
+        .ensure_window_session_access(&window, &session_id, "ssh_tunnel_stop")
+        .await?;
+
+    let removed = state.tunnels.write().await.remove(&tunnel_id);
+    if let Some(mut tunnel) = removed {
+        if let Some(tx) = tunnel.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        state.audit.record(
+            AuditSeverity::Info,
+            AuditCategory::Session,
+            "ssh_tunnel_stopped",
+            &format!(
+                "127.0.0.1:{} -> {}:{}",
+                tunnel.info.local_port, tunnel.info.remote_host, tunnel.info.remote_port
+            ),
+            "已停止 SSH 本地端口转发隧道",
+        );
+    }
+    Ok(())
+}
+
 /// 枚举当前操作系统可用的白名单本地 Shell 预设
 #[tauri::command]
 pub fn list_local_shells() -> Vec<LocalShellOption> {
@@ -1771,7 +1968,7 @@ pub async fn clipboard_write_text(text: String) -> AppResult<()> {
     .map_err(|e| AppError::Protocol(format!("剪贴板写入任务异常: {}", e)))?
 }
 
-/// 将终端缓冲区日志内容导出保存到本地指定文件（严格限制 `.log`/`.txt` 扩展名、非符号链接与 10 MB 上限）
+/// 将终端缓冲区日志或 asciinema 录制内容导出保存到本地（严格限制 `.log`/`.txt`/`.cast` 扩展名、非符号链接与 10 MB 上限）
 #[tauri::command]
 pub async fn save_text_file(file_path: String, content: String) -> AppResult<()> {
     if content.len() > MAX_TEXT_EXPORT_BYTES {
@@ -1779,7 +1976,7 @@ pub async fn save_text_file(file_path: String, content: String) -> AppResult<()>
             "导出日志超过 10 MB 大小上限，已被安全策略拦截".into(),
         ));
     }
-    validate_scoped_file_path(Path::new(&file_path), &["log", "txt"])?;
+    validate_scoped_file_path(Path::new(&file_path), &["log", "txt", "cast"])?;
     tokio::fs::write(&file_path, content).await?;
     Ok(())
 }

@@ -26,9 +26,9 @@ use crate::error::{AppError, AppResult};
 use crate::known_hosts::{HostKeyCheckError, KnownHostsStore};
 use crate::models::{
     format_unix_mode, join_remote_path, normalize_remote_path, AgentStatus, AuthType, FileEntry,
-    RemoteDisk, ServerMetrics, ShellOutput,
+    NetInterface, RemoteDisk, ServerMetrics, ShellOutput,
 };
-use crate::protocols::{ProgressCallback, PtyCommand, PtyHandle, RemoteFs};
+use crate::protocols::{ProgressCallback, PtyCommand, PtyHandle, RemoteFs, TunnelRuntimeHandle};
 use crate::security::{
     commit_staging_file, ensure_not_symlink_target, staging_part_path,
     validate_remote_path_no_control,
@@ -998,34 +998,78 @@ impl RemoteFs for SftpClient {
     }
 
     async fn server_metrics(&self) -> AppResult<ServerMetrics> {
-        // 1. 优先尝试标准 POSIX/Linux/macOS 轻量采样脚本（单次 exec 完成，耗时约 250ms）
+        // 1. 优先尝试标准 POSIX/Linux/macOS 全维度轻量采样脚本（单次 exec 完成，耗时约 350ms）
         let posix_probe = r#"sh -c '
 OS=$(grep -m1 "^PRETTY_NAME=" /etc/os-release 2>/dev/null | cut -d= -f2- | tr -d "\"")
 [ -z "$OS" ] && OS=$(uname -s 2>/dev/null || echo "Unix")
+UNAME=$(uname -s 2>/dev/null || echo "Linux")
+OS_FAM="linux"
+[ "$UNAME" = "Darwin" ] && OS_FAM="macos"
+HOST=$(hostname 2>/dev/null || uname -n 2>/dev/null || true)
+UPTIME=$(awk "{print int(\$1)}" /proc/uptime 2>/dev/null || true)
 CORES=$(nproc 2>/dev/null || grep -c "^processor" /proc/cpuinfo 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 0)
-LOAD=$(awk "{print \$1}" /proc/loadavg 2>/dev/null || true)
-CPU=""
+LOAD=$(awk "{print \$1, \$2, \$3}" /proc/loadavg 2>/dev/null || true)
+NET1=$(awk "NR>2{gsub(/:/,\"\",\$1); print \$1,\$2,\$10}" /proc/net/dev 2>/dev/null)
+CPU=""; CPU_U=""; CPU_S=""
 if [ -r /proc/stat ]; then
   set -- $(head -n1 /proc/stat)
-  t1=$(($2+$3+$4+$5+$6+$7+$8)); i1=$(($5+$6))
-  sleep 0.2
+  u1=$(($2+$3)); s1=$(($4+$7+$8)); i1=$(($5+$6)); t1=$(($2+$3+$4+$5+$6+$7+$8))
+  sleep 0.35
   set -- $(head -n1 /proc/stat)
-  t2=$(($2+$3+$4+$5+$6+$7+$8)); i2=$(($5+$6))
-  dt=$((t2-t1)); di=$((i2-i1))
-  [ "$dt" -gt 0 ] && CPU=$(awk "BEGIN{printf \"%.1f\", (1 - $di/$dt) * 100}")
+  u2=$(($2+$3)); s2=$(($4+$7+$8)); i2=$(($5+$6)); t2=$(($2+$3+$4+$5+$6+$7+$8))
+  dt=$((t2-t1)); di=$((i2-i1)); du=$((u2-u1)); ds=$((s2-s1))
+  if [ "$dt" -gt 0 ]; then
+    CPU=$(awk "BEGIN{printf \"%.1f\", (1 - $di/$dt) * 100}")
+    CPU_U=$(awk "BEGIN{printf \"%.1f\", ($du/$dt) * 100}")
+    CPU_S=$(awk "BEGIN{printf \"%.1f\", ($ds/$dt) * 100}")
+  fi
 fi
-MEM_T=0; MEM_U=0
+NET2=$(awk "NR>2{gsub(/:/,\"\",\$1); print \$1,\$2,\$10}" /proc/net/dev 2>/dev/null)
+MEM_T=0; MEM_U=0; SWAP_T=0; SWAP_U=0
 if [ -r /proc/meminfo ]; then
   MEM_T=$(awk "/^MemTotal:/{print \$2*1024}" /proc/meminfo)
   MEM_A=$(awk "/^MemAvailable:/{print \$2*1024}" /proc/meminfo)
   [ -z "$MEM_A" ] && MEM_A=$(awk "/^MemFree:/{print \$2*1024}" /proc/meminfo)
   MEM_U=$((MEM_T - MEM_A))
+  SWAP_T=$(awk "/^SwapTotal:/{print \$2*1024}" /proc/meminfo)
+  SWAP_F=$(awk "/^SwapFree:/{print \$2*1024}" /proc/meminfo)
+  [ -n "$SWAP_T" ] && [ -n "$SWAP_F" ] && SWAP_U=$((SWAP_T - SWAP_F))
 fi
+GW=$(ip route show default 2>/dev/null | awk "/default/{print \$3; exit}")
+GPU=""
+if command -v nvidia-smi >/dev/null 2>&1; then
+  GPU=$(nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null | head -n1)
+fi
+echo "OS_FAMILY=$OS_FAM"
 echo "OS=$OS"
+echo "HOST=$HOST"
+echo "UPTIME=$UPTIME"
 echo "CORES=$CORES"
 echo "CPU=$CPU"
+echo "CPU_USER=$CPU_U"
+echo "CPU_SYS=$CPU_S"
 echo "LOAD=$LOAD"
 echo "MEM=$MEM_U:$MEM_T"
+echo "SWAP=$SWAP_U:$SWAP_T"
+echo "GW=$GW"
+[ -n "$GPU" ] && echo "GPU=$GPU"
+echo "NET_BEGIN"
+if [ -n "$NET2" ]; then
+  IPS=$(ip -4 -o addr show 2>/dev/null | awk "{split(\$4,a,\"/\"); print \$2, a[1]}")
+  printf "%s\n" "$NET2" | while read -r iface r2 t2; do
+    [ -z "$iface" ] && continue
+    [ "$iface" = "lo" ] && continue
+    r1=$(printf "%s\n" "$NET1" | awk -v k="$iface" "\$1==k{print \$2; exit}")
+    t1=$(printf "%s\n" "$NET1" | awk -v k="$iface" "\$1==k{print \$3; exit}")
+    ip4=$(printf "%s\n" "$IPS" | awk -v k="$iface" "\$1==k{print \$2; exit}")
+    [ -z "$r1" ] && r1=$r2
+    [ -z "$t1" ] && t1=$t2
+    rx=$(awk "BEGIN{d=$r2-$r1; if(d<0)d=0; printf \"%.0f\", d/0.35}")
+    tx=$(awk "BEGIN{d=$t2-$t1; if(d<0)d=0; printf \"%.0f\", d/0.35}")
+    echo "$iface|$ip4|$rx|$tx"
+  done
+fi
+echo "NET_END"
 echo "DISKS_BEGIN"
 (df -kP -T 2>/dev/null || df -kP 2>/dev/null) | tail -n +2
 echo "DISKS_END"
@@ -1037,10 +1081,9 @@ echo "DISKS_END"
             }
         }
 
-        // 2. 若远端为 Windows OpenSSH 服务器，自动回退 PowerShell CIM 采集
-        let win_probe = r#"powershell -NoProfile -Command "$os=Get-CimInstance Win32_OperatingSystem;$cs=Get-CimInstance Win32_ComputerSystem;$cpu=(Get-CimInstance Win32_Processor|Measure-Object -Property LoadPercentage -Average).Average;Write-Output ('OS='+$os.Caption);Write-Output ('CORES='+$cs.NumberOfLogicalProcessors);Write-Output ('CPU='+$cpu);Write-Output ('MEM='+(($os.TotalVisibleMemorySize-$os.FreePhysicalMemory)*1024)+':'+($os.TotalVisibleMemorySize*1024));Write-Output 'DISKS_BEGIN';Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3'|ForEach-Object{$u=$_.Size-$_.FreeSpace;Write-Output ('WIN|'+$_.DeviceID+'|'+$_.Size+'|'+$u+'|'+$_.FreeSpace)};Write-Output 'DISKS_END'""#;
-
-        let out = self.exec_shell(win_probe, None).await?;
+        // 2. 若远端为 Windows OpenSSH 服务器，自动回退 PowerShell CIM + 网卡速率采集
+        let win_probe = build_windows_metrics_command();
+        let out = self.exec_shell(&win_probe, None).await?;
         parse_server_metrics(&out.stdout)
             .ok_or_else(|| AppError::Protocol("无法解析远端服务器硬件与磁盘信息".into()))
     }
@@ -1181,6 +1224,103 @@ echo "DISKS_END"
 
         Ok(true)
     }
+
+    async fn start_local_forward(
+        &self,
+        local_port: u16,
+        remote_host: String,
+        remote_port: u16,
+    ) -> AppResult<TunnelRuntimeHandle> {
+        let target_host = remote_host.trim().to_string();
+        if target_host.is_empty()
+            || target_host.len() > 253
+            || target_host
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control())
+        {
+            return Err(AppError::InvalidInput(
+                "远端转发目标主机地址非法（不能为空或包含空白/控制字符）".into(),
+            ));
+        }
+        if remote_port == 0 {
+            return Err(AppError::InvalidInput("远端转发端口必须为 1–65535".into()));
+        }
+
+        // 严格限定仅绑定本地回环地址 127.0.0.1，防范将内网服务意外暴露到局域网
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", local_port))
+            .await
+            .map_err(|e| {
+                AppError::Connection(format!(
+                    "绑定本地回环端口 127.0.0.1:{} 失败: {}",
+                    local_port, e
+                ))
+            })?;
+        let bound_port = listener
+            .local_addr()
+            .map_err(|e| AppError::Connection(format!("获取本地监听地址失败: {}", e)))?
+            .port();
+
+        let ssh = self.ssh.clone();
+        let active_connections = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let active_ref = active_connections.clone();
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => {
+                        break;
+                    }
+                    accepted = listener.accept() => {
+                        let Ok((mut tcp_stream, peer_addr)) = accepted else {
+                            break;
+                        };
+                        let ssh_conn = ssh.clone();
+                        let rhost = target_host.clone();
+                        let counter = active_ref.clone();
+                        tokio::spawn(async move {
+                            let channel = {
+                                let guard = ssh_conn.lock().await;
+                                guard
+                                    .channel_open_direct_tcpip(
+                                        rhost,
+                                        remote_port as u32,
+                                        peer_addr.ip().to_string(),
+                                        peer_addr.port() as u32,
+                                    )
+                                    .await
+                            };
+                            let Ok(ch) = channel else {
+                                return;
+                            };
+                            counter.fetch_add(1, Ordering::Relaxed);
+                            let mut ssh_stream = ch.into_stream();
+                            let _ = tokio::io::copy_bidirectional(&mut tcp_stream, &mut ssh_stream).await;
+                            counter.fetch_sub(1, Ordering::Relaxed);
+                        });
+                    }
+                }
+            }
+        });
+
+        Ok(TunnelRuntimeHandle {
+            local_port: bound_port,
+            active_connections,
+            shutdown_tx,
+        })
+    }
+}
+
+/// 构造 Windows 平台硬件/多盘/网卡实时采集 PowerShell 命令（同时服务远端 Windows SSH 与本机 Windows 监控）
+pub fn build_windows_metrics_script() -> &'static str {
+    r#"$os=Get-CimInstance Win32_OperatingSystem;$cs=Get-CimInstance Win32_ComputerSystem;$cpu=(Get-CimInstance Win32_Processor|Measure-Object -Property LoadPercentage -Average).Average;$up=[int64]([DateTime]::Now-$os.LastBootUpTime).TotalSeconds;$gw=(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue|Sort-Object RouteMetric|Select-Object -First 1 -ExpandProperty NextHop);$gpu=Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue|Select-Object -First 1;$s1=@{};Get-NetAdapterStatistics -ErrorAction SilentlyContinue|ForEach-Object{$s1[$_.Name]=@($_.ReceivedBytes,$_.SentBytes)};Start-Sleep -Milliseconds 350;$s2=Get-NetAdapterStatistics -ErrorAction SilentlyContinue;$ips=@{};Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue|Where-Object{$_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*'}|ForEach-Object{if(-not $ips.ContainsKey($_.InterfaceAlias)){$ips[$_.InterfaceAlias]=$_.IPAddress}};Write-Output 'OS_FAMILY=windows';Write-Output ('OS='+$os.Caption);Write-Output ('HOST='+$cs.Name);Write-Output ('UPTIME='+$up);Write-Output ('CORES='+$cs.NumberOfLogicalProcessors);Write-Output ('CPU='+$cpu);Write-Output ('MEM='+(($os.TotalVisibleMemorySize-$os.FreePhysicalMemory)*1024)+':'+($os.TotalVisibleMemorySize*1024));$swT=($os.TotalVirtualMemorySize-$os.TotalVisibleMemorySize)*1024;if($swT -lt 0){$swT=0};$swF=($os.FreeVirtualMemory-$os.FreePhysicalMemory)*1024;if($swF -lt 0){$swF=0};$swU=$swT-$swF;if($swU -lt 0){$swU=0};Write-Output ('SWAP='+$swU+':'+$swT);if($gw){Write-Output ('GW='+$gw)};if($gpu){$vram=[int64]([math]::Round(($gpu.AdapterRAM)/1MB));Write-Output ('GPU='+$gpu.Name+',,0,'+$vram)};Write-Output 'NET_BEGIN';Get-NetAdapter -ErrorAction SilentlyContinue|Where-Object{$_.Status -eq 'Up' -or $ips.ContainsKey($_.Name)}|ForEach-Object{$n=$_.Name;$st=$s2|Where-Object{$_.Name -eq $n}|Select-Object -First 1;$rx=0;$tx=0;if($st -and $s1.ContainsKey($n)){$rx=[int64]([math]::Max(0,($st.ReceivedBytes-$s1[$n][0])/0.35));$tx=[int64]([math]::Max(0,($st.SentBytes-$s1[$n][1])/0.35))};$ip=$ips[$n];Write-Output ($n+'|'+$ip+'|'+$rx+'|'+$tx)};Write-Output 'NET_END';Write-Output 'DISKS_BEGIN';Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3'|ForEach-Object{$u=$_.Size-$_.FreeSpace;Write-Output ('WIN|'+$_.DeviceID+'|'+$_.Size+'|'+$u+'|'+$_.FreeSpace)};Write-Output 'DISKS_END'"#
+}
+
+fn build_windows_metrics_command() -> String {
+    format!(
+        "powershell -NoProfile -Command \"{}\"",
+        build_windows_metrics_script().replace('"', "\\\"")
+    )
 }
 
 /// 过滤 Linux/macOS 伪文件系统、内核引导分区与容器/系统临时挂载点，仅保留真实业务磁盘
@@ -1230,23 +1370,36 @@ fn is_ignored_fs(fs_type: Option<&str>, dev: &str, mount: &str) -> bool {
         || mount.starts_with("/etc/")
 }
 
-/// 解析 POSIX 或 Windows 远端硬件与多磁盘采集输出
+/// 解析 POSIX（Linux/macOS）或 Windows 远端/本机硬件、网卡流量与多磁盘采集输出
 pub fn parse_server_metrics(raw: &str) -> Option<ServerMetrics> {
     if !raw.contains("DISKS_BEGIN") {
         return None;
     }
 
+    let mut os_family = String::new();
     let mut os_name = String::new();
+    let mut hostname: Option<String> = None;
+    let mut uptime_secs: Option<u64> = None;
     let mut cpu_cores: u32 = 0;
     let mut cpu_usage_pct: Option<f32> = None;
+    let mut cpu_user_pct: Option<f32> = None;
+    let mut cpu_sys_pct: Option<f32> = None;
     let mut load_avg: Option<String> = None;
     let mut mem_used_bytes: u64 = 0;
     let mut mem_total_bytes: u64 = 0;
+    let mut swap_used_bytes: u64 = 0;
+    let mut swap_total_bytes: u64 = 0;
+    let mut gpu_name: Option<String> = None;
+    let mut gpu_usage_pct: Option<f32> = None;
+    let mut gpu_mem_used_mb: Option<u64> = None;
+    let mut gpu_mem_total_mb: Option<u64> = None;
+    let mut default_gateway: Option<String> = None;
+    let mut net_interfaces: Vec<NetInterface> = Vec::new();
     let mut disks: Vec<RemoteDisk> = Vec::new();
     let mut seen_mounts = std::collections::HashSet::new();
     // 同一物理块设备（如 /dev/sda1）在多处 bind 挂载时仅保留主挂载点，防止 1 块盘被重复计为多盘
     let mut seen_devs: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut in_disks = false;
+    let mut section = 0u8; // 0 = header, 1 = disks, 2 = net
 
     for raw_line in raw.lines() {
         let line = raw_line.trim();
@@ -1254,23 +1407,50 @@ pub fn parse_server_metrics(raw: &str) -> Option<ServerMetrics> {
             continue;
         }
         if line == "DISKS_BEGIN" {
-            in_disks = true;
+            section = 1;
             continue;
         }
-        if line == "DISKS_END" {
-            in_disks = false;
+        if line == "DISKS_END" || line == "NET_END" {
+            section = 0;
+            continue;
+        }
+        if line == "NET_BEGIN" {
+            section = 2;
             continue;
         }
 
-        if !in_disks {
-            if let Some(v) = line.strip_prefix("OS=") {
+        if section == 0 {
+            if let Some(v) = line.strip_prefix("OS_FAMILY=") {
+                os_family = v.trim().to_ascii_lowercase();
+            } else if let Some(v) = line.strip_prefix("OS=") {
                 os_name = v.trim().to_string();
+            } else if let Some(v) = line.strip_prefix("HOST=") {
+                let s = v.trim();
+                if !s.is_empty() {
+                    hostname = Some(s.to_string());
+                }
+            } else if let Some(v) = line.strip_prefix("UPTIME=") {
+                if let Ok(sec) = v.trim().parse::<u64>() {
+                    uptime_secs = Some(sec);
+                }
             } else if let Some(v) = line.strip_prefix("CORES=") {
                 cpu_cores = v.trim().parse().unwrap_or(0);
             } else if let Some(v) = line.strip_prefix("CPU=") {
                 if let Ok(pct) = v.trim().parse::<f32>() {
                     if pct.is_finite() {
                         cpu_usage_pct = Some(pct.clamp(0.0, 100.0));
+                    }
+                }
+            } else if let Some(v) = line.strip_prefix("CPU_USER=") {
+                if let Ok(pct) = v.trim().parse::<f32>() {
+                    if pct.is_finite() {
+                        cpu_user_pct = Some(pct.clamp(0.0, 100.0));
+                    }
+                }
+            } else if let Some(v) = line.strip_prefix("CPU_SYS=") {
+                if let Ok(pct) = v.trim().parse::<f32>() {
+                    if pct.is_finite() {
+                        cpu_sys_pct = Some(pct.clamp(0.0, 100.0));
                     }
                 }
             } else if let Some(v) = line.strip_prefix("LOAD=") {
@@ -1282,6 +1462,56 @@ pub fn parse_server_metrics(raw: &str) -> Option<ServerMetrics> {
                 if let Some((u, t)) = v.split_once(':') {
                     mem_used_bytes = u.trim().parse().unwrap_or(0);
                     mem_total_bytes = t.trim().parse().unwrap_or(0);
+                }
+            } else if let Some(v) = line.strip_prefix("SWAP=") {
+                if let Some((u, t)) = v.split_once(':') {
+                    swap_used_bytes = u.trim().parse().unwrap_or(0);
+                    swap_total_bytes = t.trim().parse().unwrap_or(0);
+                }
+            } else if let Some(v) = line.strip_prefix("GW=") {
+                let s = v.trim();
+                if !s.is_empty() {
+                    default_gateway = Some(s.to_string());
+                }
+            } else if let Some(v) = line.strip_prefix("GPU=") {
+                let parts: Vec<&str> = v.split(',').map(|s| s.trim()).collect();
+                if let Some(name) = parts.first().filter(|s| !s.is_empty()) {
+                    gpu_name = Some((*name).to_string());
+                }
+                if let Some(u) = parts.get(1).and_then(|s| s.parse::<f32>().ok()) {
+                    if u.is_finite() {
+                        gpu_usage_pct = Some(u.clamp(0.0, 100.0));
+                    }
+                }
+                if let Some(used) = parts.get(2).and_then(|s| s.parse::<u64>().ok()) {
+                    gpu_mem_used_mb = Some(used);
+                }
+                if let Some(total) = parts.get(3).and_then(|s| s.parse::<u64>().ok()) {
+                    if total > 0 {
+                        gpu_mem_total_mb = Some(total);
+                    }
+                }
+            }
+            continue;
+        }
+
+        if section == 2 {
+            // 网卡行格式：name|ip|rx_bps|tx_bps
+            let parts: Vec<&str> = line.split('|').collect();
+            if parts.len() >= 4 {
+                let name = parts[0].trim();
+                if !name.is_empty() {
+                    let ip = Some(parts[1].trim())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string());
+                    let rx_bytes_per_sec = parts[2].trim().parse::<u64>().unwrap_or(0);
+                    let tx_bytes_per_sec = parts[3].trim().parse::<u64>().unwrap_or(0);
+                    net_interfaces.push(NetInterface {
+                        name: name.to_string(),
+                        ip,
+                        rx_bytes_per_sec,
+                        tx_bytes_per_sec,
+                    });
                 }
             }
             continue;
@@ -1313,8 +1543,7 @@ pub fn parse_server_metrics(raw: &str) -> Option<ServerMetrics> {
             continue;
         }
 
-        // POSIX `df -kP -T` (7+ 列: fs type 1024-blocks used avail cap% mount...)
-        // 或 `df -kP` (6+ 列: fs 1024-blocks used avail cap% mount...)
+        // POSIX `df -kP -T` (7+ 列) 或 `df -kP` (6+ 列)
         let cols: Vec<&str> = line.split_whitespace().collect();
         let parsed_posix = if cols.len() >= 7
             && cols[2].parse::<u64>().is_ok()
@@ -1398,18 +1627,55 @@ pub fn parse_server_metrics(raw: &str) -> Option<ServerMetrics> {
         return None;
     }
 
+    // 自动补全 os_family（兼容旧版采样输出与 Windows/macOS 识别）
+    if os_family.is_empty() {
+        let lower = os_name.to_ascii_lowercase();
+        if lower.contains("windows") || disks.iter().any(|d| d.label.ends_with(":\\")) {
+            os_family = "windows".to_string();
+        } else if lower.contains("darwin") || lower.contains("macos") {
+            os_family = "macos".to_string();
+        } else {
+            os_family = "linux".to_string();
+        }
+    }
+
+    let net_rx_bps: u64 = net_interfaces
+        .iter()
+        .map(|n| n.rx_bytes_per_sec)
+        .fold(0u64, u64::saturating_add);
+    let net_tx_bps: u64 = net_interfaces
+        .iter()
+        .map(|n| n.tx_bytes_per_sec)
+        .fold(0u64, u64::saturating_add);
+
     Some(ServerMetrics {
+        os_family,
         os_name: if os_name.is_empty() {
             "Remote Server".to_string()
         } else {
             os_name
         },
+        hostname,
+        uptime_secs,
         cpu_cores,
         cpu_usage_pct,
+        cpu_user_pct,
+        cpu_sys_pct,
         load_avg,
         mem_used_bytes,
         mem_total_bytes,
+        swap_used_bytes,
+        swap_total_bytes,
+        gpu_name,
+        gpu_usage_pct,
+        gpu_mem_used_mb,
+        gpu_mem_total_mb,
+        default_gateway,
+        net_rx_bps,
+        net_tx_bps,
+        net_interfaces,
         disks,
+        timestamp: chrono::Utc::now().timestamp(),
     })
 }
 
@@ -1427,11 +1693,23 @@ mod tests {
     #[test]
     fn test_parse_server_metrics_linux_multi_disk() {
         let sample = r#"
+OS_FAMILY=linux
 OS=Ubuntu 22.04.4 LTS
+HOST=debian-srv
+UPTIME=1425600
 CORES=8
 CPU=23.5
-LOAD=0.64
+CPU_USER=10.2
+CPU_SYS=11.9
+LOAD=0.64 0.51 0.42
 MEM=4294967296:17179869184
+SWAP=536870912:2147483648
+GW=192.168.9.1
+GPU=NVIDIA RTX 4060, 18, 1024, 8192
+NET_BEGIN
+enp2s0|192.168.9.165|18432|7168
+wlp1s0||0|0
+NET_END
 DISKS_BEGIN
 tmpfs tmpfs 1638400 1200 1637200 1% /run
 /dev/sda1 ext4 52428800 20971520 31457280 40% /
@@ -1442,11 +1720,23 @@ tmpfs tmpfs 1638400 1200 1637200 1% /run
 DISKS_END
 "#;
         let m = parse_server_metrics(sample).expect("should parse linux metrics");
+        assert_eq!(m.os_family, "linux");
         assert_eq!(m.os_name, "Ubuntu 22.04.4 LTS");
+        assert_eq!(m.hostname.as_deref(), Some("debian-srv"));
+        assert_eq!(m.uptime_secs, Some(1_425_600));
         assert_eq!(m.cpu_cores, 8);
         assert_eq!(m.cpu_usage_pct, Some(23.5));
-        assert_eq!(m.load_avg.as_deref(), Some("0.64"));
+        assert_eq!(m.cpu_user_pct, Some(10.2));
+        assert_eq!(m.cpu_sys_pct, Some(11.9));
+        assert_eq!(m.load_avg.as_deref(), Some("0.64 0.51 0.42"));
         assert_eq!(m.mem_total_bytes, 17_179_869_184);
+        assert_eq!(m.swap_total_bytes, 2_147_483_648);
+        assert_eq!(m.default_gateway.as_deref(), Some("192.168.9.1"));
+        assert_eq!(m.gpu_name.as_deref(), Some("NVIDIA RTX 4060"));
+        assert_eq!(m.gpu_mem_total_mb, Some(8192));
+        assert_eq!(m.net_interfaces.len(), 2);
+        assert_eq!(m.net_rx_bps, 18432);
+        assert_eq!(m.net_tx_bps, 7168);
         assert_eq!(m.disks.len(), 2);
         assert_eq!(m.disks[0].mount_path, "/");
         assert_eq!(m.disks[1].mount_path, "/data");

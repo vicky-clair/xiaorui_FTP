@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildAsciinemaV2,
+  buildOsCdCommand,
   DEFAULT_HIGHLIGHT_RULES,
+  detectTerminalOs,
   encodeTerminalPaste,
+  formatBatchScriptForOs,
+  getBatchPresets,
   hasIncompleteAnsiTail,
   highlightTerminalText,
   isPasswordPromptLine,
@@ -94,5 +99,42 @@ describe("terminalEnhance utilities", () => {
     let bin = "";
     for (const b of bytes) bin += String.fromCharCode(b);
     expect(parseOsc52Write(`c;${btoa(bin)}`)).toBe("你好 tmux");
+  });
+
+  it("differentiates Linux, Windows PowerShell, and Windows CMD commands and builds asciinema v2", () => {
+    expect(detectTerminalOs("ssh", "linux")).toBe("linux");
+    expect(detectTerminalOs("ssh", "windows")).toBe("windows_ps");
+    expect(detectTerminalOs("local", undefined, "cmd")).toBe("windows_cmd");
+    expect(detectTerminalOs("local", undefined, "wsl")).toBe("linux");
+    expect(detectTerminalOs("local", undefined, "default")).toBe("windows_ps");
+
+    // 不同操作系统的批执行预设完全隔离
+    const linuxCmds = getBatchPresets("linux").map((p) => p.cmd).join(" ");
+    const winPsCmds = getBatchPresets("windows_ps").map((p) => p.cmd).join(" ");
+    const winCmds = getBatchPresets("windows_cmd").map((p) => p.cmd).join(" ");
+    expect(linuxCmds).toContain("df -hT");
+    expect(winPsCmds).toContain("Get-PSDrive");
+    expect(winCmds).toContain("netstat -ano");
+
+    // 按系统生成对应的目录切换命令
+    expect(buildOsCdCommand("/var/www/app", "linux")).toBe("cd '/var/www/app'\r");
+    expect(buildOsCdCommand("/D:/work/demo", "windows_ps")).toBe(
+      "Set-Location -LiteralPath 'D:\\work\\demo'\r"
+    );
+    expect(buildOsCdCommand("/D:/work/demo", "windows_cmd")).toBe('cd /d "D:\\work\\demo"\r');
+    expect(buildOsCdCommand("/tmp\nrm -rf /", "linux")).toBeNull();
+
+    // 批执行脚本规范化跳过注释行
+    expect(formatBatchScriptForOs("# comment\nuptime\nfree -h\n", "linux")).toBe(
+      "uptime\rfree -h\r"
+    );
+    expect(formatBatchScriptForOs("REM skip\ndir\n", "windows_cmd")).toBe("dir\r");
+
+    // 标准 asciinema v2 (.cast) 录制格式
+    const cast = buildAsciinemaV2(120, 32, "test", [{ time: 0.25, text: "hello\r\n" }]);
+    const lines = cast.trim().split("\n");
+    expect(lines.length).toBe(2);
+    expect(JSON.parse(lines[0]).version).toBe(2);
+    expect(JSON.parse(lines[1])).toEqual([0.25, "o", "hello\r\n"]);
   });
 });

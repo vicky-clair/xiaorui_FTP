@@ -156,8 +156,12 @@ pub fn run() {
             commands::list_transfers,
             commands::cancel_transfer,
             commands::clear_finished_transfers,
-            // 交互式 SSH PTY、本地 PTY、独立终端窗口与服务器硬件监测
+            // 交互式 SSH PTY、本地 PTY、端口转发隧道、独立终端窗口与多平台系统监控
             commands::remote_server_metrics,
+            commands::local_server_metrics,
+            commands::ssh_tunnel_start,
+            commands::ssh_tunnel_list,
+            commands::ssh_tunnel_stop,
             commands::list_local_shells,
             commands::get_local_terminal_defaults,
             commands::local_pty_open,

@@ -23,6 +23,7 @@ import type {
   SiteInput,
   SshConfigHost,
   SshKeyEntry,
+  SshTunnelInfo,
   TransferTask,
 } from "../types";
 
@@ -140,9 +141,26 @@ export const api = {
   onTransferUpdate: (cb: (task: TransferTask) => void): Promise<UnlistenFn> =>
     listen<TransferTask>("transfer://update", (ev) => cb(ev.payload)),
 
-  // ---------------- 交互式 SSH PTY、本地 PTY 与服务器硬件监测 ----------------
+  // ---------------- 交互式 SSH PTY、本地 PTY、端口转发隧道与多平台系统监控 ----------------
   remoteServerMetrics: (sessionId: string) =>
     invoke<ServerMetrics>("remote_server_metrics", { sessionId }),
+  localServerMetrics: () => invoke<ServerMetrics>("local_server_metrics"),
+  sshTunnelStart: (
+    sessionId: string,
+    localPort: number,
+    remoteHost: string,
+    remotePort: number
+  ) =>
+    invoke<SshTunnelInfo>("ssh_tunnel_start", {
+      sessionId,
+      localPort,
+      remoteHost,
+      remotePort,
+    }),
+  sshTunnelList: (sessionId: string) =>
+    invoke<SshTunnelInfo[]>("ssh_tunnel_list", { sessionId }),
+  sshTunnelStop: (tunnelId: string) =>
+    invoke<void>("ssh_tunnel_stop", { tunnelId }),
   listLocalShells: () => invoke<LocalShellOption[]>("list_local_shells"),
   getLocalTerminalDefaults: () =>
     invoke<LocalTerminalDefaults>("get_local_terminal_defaults"),

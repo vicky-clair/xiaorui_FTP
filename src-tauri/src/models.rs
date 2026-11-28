@@ -477,24 +477,90 @@ pub struct RemoteDisk {
     pub use_percent: u8,
 }
 
-/// 远端服务器硬件规格与实时资源占用快照（SFTP / SSH 会话自动采集）
+/// 远端或本机单个网络接口的实时流量与地址信息
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetInterface {
+    /// 网卡接口名（如 `enp2s0`、`wlp1s0`、`Ethernet`、`WLAN`）
+    pub name: String,
+    /// IPv4 地址（未分配时为 `None`）
+    pub ip: Option<String>,
+    /// 实时下行速率（字节/秒）
+    pub rx_bytes_per_sec: u64,
+    /// 实时上行速率（字节/秒）
+    pub tx_bytes_per_sec: u64,
+}
+
+/// 活跃 SSH 本地端口转发隧道摘要
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshTunnelInfo {
+    /// 隧道唯一 ID
+    pub id: String,
+    /// 所属 SSH 会话 ID
+    pub session_id: String,
+    /// 本地回环监听端口（强制绑定 `127.0.0.1`）
+    pub local_port: u16,
+    /// 远端目标主机（如 `127.0.0.1` 或内网数据库 IP）
+    pub remote_host: String,
+    /// 远端目标端口
+    pub remote_port: u16,
+    /// 当前活跃 TCP 转发连接数
+    pub active_connections: u32,
+    /// 创建时间戳（Unix 秒）
+    pub created_at: i64,
+}
+
+/// 远端或本机服务器硬件规格与实时资源占用快照（区分 Linux / Windows 采集）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerMetrics {
-    /// 操作系统名称（如 Ubuntu 22.04 LTS / Windows Server）
+    /// 操作系统家族（`linux` / `windows` / `macos`）
+    pub os_family: String,
+    /// 操作系统名称（如 Debian GNU/Linux 13 / Windows 11 Pro）
     pub os_name: String,
+    /// 主机名
+    pub hostname: Option<String>,
+    /// 系统运行时长（秒）
+    pub uptime_secs: Option<u64>,
     /// CPU 逻辑核心数
     pub cpu_cores: u32,
-    /// CPU 实时占用率百分比（0.0–100.0）
+    /// CPU 实时总占用率百分比（0.0–100.0）
     pub cpu_usage_pct: Option<f32>,
-    /// 系统 1 分钟负载均值（Linux/macOS）
+    /// CPU 用户态占比百分比（Linux `/proc/stat`）
+    pub cpu_user_pct: Option<f32>,
+    /// CPU 内核态占比百分比（Linux `/proc/stat`）
+    pub cpu_sys_pct: Option<f32>,
+    /// 系统负载均值（如 `0.42 0.38 0.31`）
     pub load_avg: Option<String>,
     /// 内存已用字节数
     pub mem_used_bytes: u64,
     /// 内存总字节数
     pub mem_total_bytes: u64,
+    /// Swap / 页面文件已用字节数
+    pub swap_used_bytes: u64,
+    /// Swap / 页面文件总字节数
+    pub swap_total_bytes: u64,
+    /// GPU 名称（若检测到显卡）
+    pub gpu_name: Option<String>,
+    /// GPU 利用率百分比
+    pub gpu_usage_pct: Option<f32>,
+    /// GPU 显存已用（MB）
+    pub gpu_mem_used_mb: Option<u64>,
+    /// GPU 显存总量（MB）
+    pub gpu_mem_total_mb: Option<u64>,
+    /// 默认网关 IPv4 地址
+    pub default_gateway: Option<String>,
+    /// 汇总实时下行速率（字节/秒）
+    pub net_rx_bps: u64,
+    /// 汇总实时上行速率（字节/秒）
+    pub net_tx_bps: u64,
+    /// 各网络接口明细列表
+    pub net_interfaces: Vec<NetInterface>,
     /// 全部已挂载物理磁盘 / 盘符列表
     pub disks: Vec<RemoteDisk>,
+    /// 采集时间戳（Unix 秒）
+    pub timestamp: i64,
 }
 
 /// 规范化 POSIX 风格远程路径：统一斜杠方向、消除 `.` / `..` 与重复斜杠，始终以 `/` 开头

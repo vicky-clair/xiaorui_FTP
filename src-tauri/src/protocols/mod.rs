@@ -39,6 +39,16 @@ pub struct PtyHandle {
     pub output_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
 }
 
+/// 已启动的 SSH 本地端口转发隧道运行时句柄
+pub struct TunnelRuntimeHandle {
+    /// 实际绑定的本地回环端口（`127.0.0.1:<local_port>`）
+    pub local_port: u16,
+    /// 当前活跃并发转发连接计数
+    pub active_connections: Arc<std::sync::atomic::AtomicU32>,
+    /// 发送关闭信号以立即停止监听与转发
+    pub shutdown_tx: tokio::sync::oneshot::Sender<()>,
+}
+
 /// 统一异步远程文件系统抽象接口
 #[async_trait]
 pub trait RemoteFs: Send + Sync {
@@ -111,6 +121,18 @@ pub trait RemoteFs: Send + Sync {
     async fn deploy_public_key(&self, _public_key_line: &str) -> AppResult<bool> {
         Err(AppError::Unsupported(
             "仅 SFTP/SSH 会话支持一键部署 SSH 公钥".into(),
+        ))
+    }
+
+    /// 在本机 `127.0.0.1:<local_port>` 启动 SSH 本地端口转发隧道（`-L local_port:remote_host:remote_port`）
+    async fn start_local_forward(
+        &self,
+        _local_port: u16,
+        _remote_host: String,
+        _remote_port: u16,
+    ) -> AppResult<TunnelRuntimeHandle> {
+        Err(AppError::Unsupported(
+            "仅 SFTP/SSH 会话支持端口转发隧道".into(),
         ))
     }
 }
