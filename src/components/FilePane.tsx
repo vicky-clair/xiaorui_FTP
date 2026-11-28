@@ -557,6 +557,17 @@ export const FilePane: React.FC<FilePaneProps> = ({
             <FolderPlus size={15} />
           </button>
 
+          {mode === "local" && onOpenInTerminal && (
+            <button
+              type="button"
+              className="icon-btn"
+              onClick={() => onOpenInTerminal(currentPath)}
+              title="在当前本地目录打开本地终端（使用 Windows 默认终端配置）"
+            >
+              <Terminal size={14} />
+            </button>
+          )}
+
           {mode === "remote" && onUploadFolderFromPicker && (
             <button
               type="button"
@@ -895,7 +906,7 @@ export const FilePane: React.FC<FilePaneProps> = ({
               修改权限 (CHMOD)
             </button>
           )}
-          {mode === "remote" && onOpenInTerminal && contextMenu.entry.isDir && (
+          {onOpenInTerminal && contextMenu.entry.isDir && (
             <button
               className="context-menu-item"
               onClick={() => {
@@ -904,7 +915,7 @@ export const FilePane: React.FC<FilePaneProps> = ({
               }}
             >
               <Terminal size={14} color="var(--accent)" />
-              在此目录打开 SSH 终端
+              {mode === "local" ? "在此目录打开本地终端" : "在此目录打开 SSH 终端"}
             </button>
           )}
           {mode === "remote" && onInsertPathToTerminal && (

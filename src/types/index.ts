@@ -164,6 +164,42 @@ export interface LocalShellOption {
   label: string;
 }
 
+/** 从 Windows Terminal / 系统默认读取的终端配色方案 */
+export interface TerminalColorScheme {
+  background: string;
+  foreground: string;
+  cursor?: string | null;
+  selectionBackground?: string | null;
+  black?: string | null;
+  red?: string | null;
+  green?: string | null;
+  yellow?: string | null;
+  blue?: string | null;
+  magenta?: string | null;
+  cyan?: string | null;
+  white?: string | null;
+  brightBlack?: string | null;
+  brightRed?: string | null;
+  brightGreen?: string | null;
+  brightYellow?: string | null;
+  brightBlue?: string | null;
+  brightMagenta?: string | null;
+  brightCyan?: string | null;
+  brightWhite?: string | null;
+}
+
+/** 当前操作系统的默认本地终端配置（Windows 下自动同步 Windows Terminal 默认配置） */
+export interface LocalTerminalDefaults {
+  profileId: string;
+  profileLabel: string;
+  source: string;
+  fontFamily?: string | null;
+  fontSize?: number | null;
+  cursorStyle?: "bar" | "block" | "underline" | string | null;
+  schemeName?: string | null;
+  theme?: TerminalColorScheme | null;
+}
+
 /** 当前已连接的远程会话摘要 */
 export interface SessionInfo {
   sessionId: string;

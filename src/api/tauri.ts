@@ -14,6 +14,7 @@ import type {
   KnownHostEntry,
   LocalRoot,
   LocalShellOption,
+  LocalTerminalDefaults,
   PtyDataEvent,
   PtyExitEvent,
   ServerMetrics,
@@ -143,6 +144,8 @@ export const api = {
   remoteServerMetrics: (sessionId: string) =>
     invoke<ServerMetrics>("remote_server_metrics", { sessionId }),
   listLocalShells: () => invoke<LocalShellOption[]>("list_local_shells"),
+  getLocalTerminalDefaults: () =>
+    invoke<LocalTerminalDefaults>("get_local_terminal_defaults"),
   localPtyOpen: (profile: string, cols: number, rows: number, cwd?: string) =>
     invoke<string>("local_pty_open", { profile, cols, rows, cwd: cwd ?? null }),
   sshPtyOpen: (sessionId: string, cols: number, rows: number) =>
@@ -155,6 +158,8 @@ export const api = {
     invoke<void>("ssh_pty_close", { terminalId }),
   openTerminalWindow: (sessionId: string, cwd?: string) =>
     invoke<string>("open_terminal_window", { sessionId, cwd: cwd ?? null }),
+  openLocalTerminalWindow: (cwd?: string) =>
+    invoke<string>("open_local_terminal_window", { cwd: cwd ?? null }),
   focusMainWindow: () => invoke<void>("focus_main_window"),
   clipboardReadText: () => invoke<string>("clipboard_read_text"),
   clipboardWriteText: (text: string) => invoke<void>("clipboard_write_text", { text }),

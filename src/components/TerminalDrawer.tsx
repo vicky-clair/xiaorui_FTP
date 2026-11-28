@@ -43,7 +43,7 @@ import {
   Zap,
 } from "lucide-react";
 import { api } from "../api/tauri";
-import type { LocalShellOption } from "../types";
+import type { LocalShellOption, LocalTerminalDefaults, TerminalColorScheme } from "../types";
 import { readClipboardText, writeClipboardText } from "../utils/clipboard";
 import { buildSafeCdCommand, isDangerousMultilinePaste } from "../utils/security";
 import {
@@ -66,6 +66,7 @@ export interface TerminalCommandRequest {
 }
 
 interface TerminalDrawerProps {
+  mode?: "ssh" | "local";
   sessionId: string;
   sessionName: string;
   cwd: string;
@@ -108,9 +109,9 @@ interface PtyTabHandle {
   dumpBuffer: () => string;
 }
 
-type ThemeKey = "github_dark" | "one_dark" | "monokai" | "solarized_light" | "matrix";
+type ThemeKey = "win_default" | "github_dark" | "one_dark" | "monokai" | "solarized_light" | "matrix";
 
-const TERMINAL_THEMES: Record<ThemeKey, { label: string; bg: string; theme: ITheme }> = {
+const TERMINAL_THEMES: Record<Exclude<ThemeKey, "win_default">, { label: string; bg: string; theme: ITheme }> = {
   github_dark: {
     label: "GitHub Dark",
     bg: "#0d1117",
@@ -245,9 +246,16 @@ const DEFAULT_SNIPPETS: QuickSnippet[] = [
   { id: "s6", label: "Docker", cmd: "docker ps" },
 ];
 
-type FontKey = "auto_nf" | "jetbrains_nf" | "caskaydia_nf" | "meslo_nf" | "fira_nf" | "consolas";
+type FontKey =
+  | "win_default"
+  | "auto_nf"
+  | "jetbrains_nf"
+  | "caskaydia_nf"
+  | "meslo_nf"
+  | "fira_nf"
+  | "consolas";
 
-const TERMINAL_FONTS: Record<FontKey, { label: string; family: string }> = {
+const TERMINAL_FONTS: Record<Exclude<FontKey, "win_default">, { label: string; family: string }> = {
   auto_nf: {
     label: "Nerd Font 自动",
     family:
@@ -330,6 +338,41 @@ function base64ToBytes(b64: string): Uint8Array {
   return out;
 }
 
+/** 将后端解析的 Windows Terminal 配色方案转换为 xterm.js `ITheme` */
+function toXtermTheme(scheme: TerminalColorScheme): ITheme {
+  return {
+    background: scheme.background,
+    foreground: scheme.foreground,
+    cursor: scheme.cursor ?? undefined,
+    selectionBackground: scheme.selectionBackground ?? "rgba(255, 255, 255, 0.25)",
+    black: scheme.black ?? undefined,
+    red: scheme.red ?? undefined,
+    green: scheme.green ?? undefined,
+    yellow: scheme.yellow ?? undefined,
+    blue: scheme.blue ?? undefined,
+    magenta: scheme.magenta ?? undefined,
+    cyan: scheme.cyan ?? undefined,
+    white: scheme.white ?? undefined,
+    brightBlack: scheme.brightBlack ?? undefined,
+    brightRed: scheme.brightRed ?? undefined,
+    brightGreen: scheme.brightGreen ?? undefined,
+    brightYellow: scheme.brightYellow ?? undefined,
+    brightBlue: scheme.brightBlue ?? undefined,
+    brightMagenta: scheme.brightMagenta ?? undefined,
+    brightCyan: scheme.brightCyan ?? undefined,
+    brightWhite: scheme.brightWhite ?? undefined,
+  };
+}
+
+/** 构造带回退等宽栈的字体族，确保 Windows 默认字体与中文字符同时完美渲染 */
+function buildFontStack(primaryFace?: string | null): string {
+  const clean = primaryFace?.replace(/["']/g, "").trim();
+  if (!clean) {
+    return TERMINAL_FONTS.auto_nf.family;
+  }
+  return `"${clean}", "Cascadia Mono", Consolas, "PingFang SC", "Microsoft YaHei Mono", monospace`;
+}
+
 /** 单个独立 PTY 标签页实例（支持远端 SSH PTY 与原生本地 PTY，隐藏时保持会话活跃不中断） */
 const PtyTabPane = React.forwardRef<
   PtyTabHandle,
@@ -341,8 +384,10 @@ const PtyTabPane = React.forwardRef<
     active: boolean;
     reconnectSeq: number;
     fontSize: number;
-    fontKey: FontKey;
-    themeKey: ThemeKey;
+    fontFamily: string;
+    themeBg: string;
+    themeObj: ITheme;
+    cursorStyle: "bar" | "block" | "underline";
     copyOnSelect: boolean;
     vimMode: boolean;
     followSftp: boolean;
@@ -374,8 +419,10 @@ const PtyTabPane = React.forwardRef<
       active,
       reconnectSeq,
       fontSize,
-      fontKey,
-      themeKey,
+      fontFamily,
+      themeBg,
+      themeObj,
+      cursorStyle,
       copyOnSelect,
       vimMode,
       followSftp,
@@ -526,17 +573,18 @@ const PtyTabPane = React.forwardRef<
       [fitAndNotify]
     );
 
-    // 动态更新字号、字体与配色主题（无需重连 PTY）
+    // 动态更新字号、字体、光标样式与配色主题（无需重连 PTY）
     useEffect(() => {
       const term = termRef.current;
       if (!term) return;
       term.options.fontSize = fontSize;
-      term.options.fontFamily = TERMINAL_FONTS[fontKey].family;
-      term.options.theme = TERMINAL_THEMES[themeKey].theme;
+      term.options.fontFamily = fontFamily;
+      term.options.theme = themeObj;
+      term.options.cursorStyle = cursorStyle;
       if (active) {
         requestAnimationFrame(() => fitAndNotify());
       }
-    }, [fontSize, fontKey, themeKey, active, fitAndNotify]);
+    }, [fontSize, fontFamily, themeObj, cursorStyle, active, fitAndNotify]);
 
     // 切换为激活标签时自动重新适配窗口大小并聚焦
     useEffect(() => {
@@ -561,14 +609,14 @@ const PtyTabPane = React.forwardRef<
 
       const term = new Terminal({
         cursorBlink: true,
-        cursorStyle: "bar",
-        fontFamily: TERMINAL_FONTS[fontKey].family,
+        cursorStyle,
+        fontFamily,
         fontSize,
         lineHeight: 1.28,
         scrollback: 8000,
         // Unicode11Addon 需要开启 proposed API 以精准计算 Nerd Font/Powerline/Emoji/中文宽字符列宽
         allowProposedApi: true,
-        theme: TERMINAL_THEMES[themeKey].theme,
+        theme: themeObj,
       });
 
       const fitAddon = new FitAddon();
@@ -1018,7 +1066,7 @@ const PtyTabPane = React.forwardRef<
         className="xterm-host"
         style={{
           display: active ? "block" : "none",
-          background: TERMINAL_THEMES[themeKey].bg,
+          background: themeBg,
         }}
         onClick={() => termRef.current?.focus()}
         onContextMenu={(e) => {
@@ -1050,6 +1098,7 @@ const PtyTabPane = React.forwardRef<
 PtyTabPane.displayName = "PtyTabPane";
 
 export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
+  mode = "ssh",
   sessionId,
   sessionName,
   cwd,
@@ -1063,43 +1112,83 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
   onNotify,
   onClose,
 }) => {
-  const [tabs, setTabs] = useState<TabMeta[]>([
-    {
-      id: "tab-1",
-      kind: "ssh",
-      title: "Shell 1",
-      status: "connecting",
-      sizeLabel: "",
-      reconnectSeq: 0,
-    },
-  ]);
-  const [activeTabId, setActiveTabId] = useState("tab-1");
+  const isLocalOnly = mode === "local";
+  const [tabs, setTabs] = useState<TabMeta[]>(() =>
+    isLocalOnly
+      ? [
+          {
+            id: "local-1",
+            kind: "local",
+            localProfile: "default",
+            title: "默认终端",
+            status: "connecting",
+            sizeLabel: "",
+            reconnectSeq: 0,
+          },
+        ]
+      : [
+          {
+            id: "tab-1",
+            kind: "ssh",
+            title: "Shell 1",
+            status: "connecting",
+            sizeLabel: "",
+            reconnectSeq: 0,
+          },
+        ]
+  );
+  const [activeTabId, setActiveTabId] = useState(isLocalOnly ? "local-1" : "tab-1");
   const tabSeqRef = useRef(2);
-  const localSeqRef = useRef(1);
+  const localSeqRef = useRef(isLocalOnly ? 2 : 1);
   const tabHandlesRef = useRef<Map<string, PtyTabHandle>>(new Map());
   const [localShells, setLocalShells] = useState<LocalShellOption[]>([]);
+  const [localDefaults, setLocalDefaults] = useState<LocalTerminalDefaults | null>(null);
+  const userCustomizedLocalFontSizeRef = useRef(false);
 
   useEffect(() => {
     void api
       .listLocalShells()
       .then((list) => setLocalShells(list))
       .catch(() => {});
-  }, []);
+    void api
+      .getLocalTerminalDefaults()
+      .then((defs) => {
+        setLocalDefaults(defs);
+        if (isLocalOnly) {
+          setTabs((prev) =>
+            prev.map((t) =>
+              t.id === "local-1" && t.title === "默认终端"
+                ? { ...t, title: defs.profileLabel }
+                : t
+            )
+          );
+          if (defs.fontSize && !userCustomizedLocalFontSizeRef.current) {
+            setFontSize(defs.fontSize);
+          }
+        }
+      })
+      .catch(() => {});
+  }, [isLocalOnly]);
 
   const [drawerHeight, setDrawerHeight] = useState(310);
   const [resizing, setResizing] = useState(false);
 
-  // Xshell 偏好设置（字号、Nerd Font 字体、主题、选中即复制、Vim/tmux 键位、跟随 SFTP、高危防护、高亮规则）
+  // Xshell / Windows 默认配置偏好：本地终端模式默认全用 Windows Terminal 默认配置
   const [fontSize, setFontSize] = useState<number>(() => {
+    if (isLocalOnly) return 13;
     const saved = Number(localStorage.getItem(STORAGE_FONT));
     return Number.isFinite(saved) && saved >= 10 && saved <= 24 ? saved : 13;
   });
   const [fontKey, setFontKey] = useState<FontKey>(() => {
+    if (isLocalOnly) return "win_default";
     const saved = localStorage.getItem(STORAGE_FONT_FAMILY) as FontKey | null;
+    if (saved === "win_default") return "win_default";
     return saved && saved in TERMINAL_FONTS ? saved : "auto_nf";
   });
   const [themeKey, setThemeKey] = useState<ThemeKey>(() => {
+    if (isLocalOnly) return "win_default";
     const saved = localStorage.getItem(STORAGE_THEME) as ThemeKey | null;
+    if (saved === "win_default") return "win_default";
     return saved && saved in TERMINAL_THEMES ? saved : "github_dark";
   });
   const [copyOnSelect, setCopyOnSelect] = useState<boolean>(() => {
@@ -1155,14 +1244,14 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
   const [pendingPaste, setPendingPaste] = useState<string | null>(null);
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_FONT, String(fontSize));
-  }, [fontSize]);
+    if (!isLocalOnly) localStorage.setItem(STORAGE_FONT, String(fontSize));
+  }, [fontSize, isLocalOnly]);
   useEffect(() => {
-    localStorage.setItem(STORAGE_FONT_FAMILY, fontKey);
-  }, [fontKey]);
+    if (!isLocalOnly) localStorage.setItem(STORAGE_FONT_FAMILY, fontKey);
+  }, [fontKey, isLocalOnly]);
   useEffect(() => {
-    localStorage.setItem(STORAGE_THEME, themeKey);
-  }, [themeKey]);
+    if (!isLocalOnly) localStorage.setItem(STORAGE_THEME, themeKey);
+  }, [themeKey, isLocalOnly]);
   useEffect(() => {
     localStorage.setItem(STORAGE_COPY_SEL, String(copyOnSelect));
   }, [copyOnSelect]);
@@ -1249,12 +1338,38 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
     void trySend();
   }, [pendingCommand, getActiveHandle]);
 
-  const handleZoom = useCallback((delta: number | "reset") => {
-    setFontSize((cur) => {
-      if (delta === "reset") return 13;
-      return Math.min(24, Math.max(10, cur + delta));
-    });
-  }, []);
+  const handleZoom = useCallback(
+    (delta: number | "reset") => {
+      userCustomizedLocalFontSizeRef.current = true;
+      setFontSize((cur) => {
+        if (delta === "reset") return isLocalOnly ? (localDefaults?.fontSize ?? 13) : 13;
+        return Math.min(24, Math.max(10, cur + delta));
+      });
+    },
+    [isLocalOnly, localDefaults?.fontSize]
+  );
+
+  // 根据当前所选主题与字体（含 Windows Terminal 默认配置）解析最终渲染参数
+  const resolvedFontFamily =
+    fontKey === "win_default"
+      ? buildFontStack(localDefaults?.fontFamily)
+      : TERMINAL_FONTS[fontKey].family;
+
+  const resolvedThemeEntry =
+    themeKey === "win_default" && localDefaults?.theme
+      ? {
+          bg: localDefaults.theme.background,
+          theme: toXtermTheme(localDefaults.theme),
+        }
+      : TERMINAL_THEMES[themeKey === "win_default" ? "github_dark" : themeKey];
+
+  const resolvedCursorStyle: "bar" | "block" | "underline" =
+    isLocalOnly &&
+    (localDefaults?.cursorStyle === "block" ||
+      localDefaults?.cursorStyle === "underline" ||
+      localDefaults?.cursorStyle === "bar")
+      ? localDefaults.cursorStyle
+      : "bar";
 
   const handleOpenSearch = useCallback(() => {
     setSearchOpen(true);
@@ -1342,20 +1457,24 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
     setActiveTabId(id);
   };
 
-  /** 新增一个原生本地终端标签页（PowerShell / Git Bash / CMD / Unix Shell） */
-  const handleAddLocalTab = (profileId?: string) => {
+  /** 新增一个原生本地终端标签页（默认直接应用 Windows Terminal 默认配置，也支持指定 Shell） */
+  const handleAddLocalTab = (profileId = "default") => {
     const opt =
       localShells.find((s) => s.id === profileId) ??
-      localShells[0] ?? { id: "default", label: "本地" };
+      localShells[0] ?? { id: "default", label: localDefaults?.profileLabel || "本地默认" };
     const n = localSeqRef.current++;
     const id = `local-${n}`;
+    const shortTitle =
+      opt.id === "default"
+        ? localDefaults?.profileLabel || "默认终端"
+        : opt.label.replace(/\s*\(默认\)$/, "");
     setTabs((prev) => [
       ...prev,
       {
         id,
         kind: "local",
         localProfile: opt.id,
-        title: `本地 ${opt.label.split(" ")[0]}`,
+        title: isLocalOnly ? `${shortTitle} ${n}` : `本地 ${shortTitle.split(" ")[0]}`,
         status: "connecting",
         sizeLabel: "",
         reconnectSeq: 0,
@@ -1433,9 +1552,20 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
       {/* 顶部主工具栏：多标签切换 + Xshell 工具组 + 缩放/放大/独立窗口 */}
       <div className="drawer-header terminal-toolbar">
         <div className="term-tabs">
-          <TermIcon size={14} color="var(--accent)" style={{ flexShrink: 0 }} />
-          <span className="term-session-name" title={`${sessionName} (${cwd})`}>
-            {sessionName}
+          {isLocalOnly ? (
+            <Laptop size={14} color="var(--accent)" style={{ flexShrink: 0 }} />
+          ) : (
+            <TermIcon size={14} color="var(--accent)" style={{ flexShrink: 0 }} />
+          )}
+          <span
+            className="term-session-name"
+            title={
+              isLocalOnly
+                ? `${localDefaults?.source ?? "本地默认终端"} · ${localDefaults?.profileLabel ?? "默认 Shell"}${localDefaults?.fontFamily ? ` · ${localDefaults.fontFamily}` : ""}${localCwd ? ` · ${localCwd}` : ""}`
+                : `${sessionName} (${cwd})`
+            }
+          >
+            {isLocalOnly ? "本地终端" : sessionName}
           </span>
 
           {tabs.map((tab) => {
@@ -1468,26 +1598,62 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
             );
           })}
 
-          <button
-            type="button"
-            className="icon-btn"
-            style={{ width: 24, height: 24 }}
-            onClick={handleAddTab}
-            title="新建同会话 SSH 远程终端标签"
-          >
-            <Plus size={13} />
-          </button>
+          {isLocalOnly ? (
+            <>
+              <button
+                type="button"
+                className="icon-btn"
+                style={{ width: 24, height: 24 }}
+                onClick={() => handleAddLocalTab("default")}
+                title={`新建本地默认终端标签 (${localDefaults?.profileLabel ?? "Windows 默认"})`}
+              >
+                <Plus size={13} />
+              </button>
+              {localShells.length > 1 && (
+                <select
+                  className="term-theme-select"
+                  value=""
+                  onChange={(e) => {
+                    if (e.target.value) handleAddLocalTab(e.target.value);
+                  }}
+                  title="选择其他本机 Shell 新建标签页"
+                  style={{ maxWidth: 112 }}
+                >
+                  <option value="" disabled>
+                    + 切换 Shell...
+                  </option>
+                  {localShells.map((sh) => (
+                    <option key={sh.id} value={sh.id}>
+                      {sh.label}
+                    </option>
+                  ))}
+                </select>
+              )}
+            </>
+          ) : (
+            <>
+              <button
+                type="button"
+                className="icon-btn"
+                style={{ width: 24, height: 24 }}
+                onClick={handleAddTab}
+                title="新建同会话 SSH 远程终端标签"
+              >
+                <Plus size={13} />
+              </button>
 
-          <button
-            type="button"
-            className="btn btn-sm btn-ghost"
-            style={{ height: 22, padding: "0 6px", fontSize: 11 }}
-            onClick={() => handleAddLocalTab()}
-            title={`新建原生本地终端标签 (${localShells[0]?.label ?? "本地 Shell"})`}
-          >
-            <Laptop size={11} />
-            +本地
-          </button>
+              <button
+                type="button"
+                className="btn btn-sm btn-ghost"
+                style={{ height: 22, padding: "0 6px", fontSize: 11 }}
+                onClick={() => handleAddLocalTab("default")}
+                title={`新建原生本地终端标签 (${localDefaults?.profileLabel ?? "Windows 默认"})`}
+              >
+                <Laptop size={11} />
+                +本地
+              </button>
+            </>
+          )}
         </div>
 
         <div className="term-actions">
@@ -1532,15 +1698,17 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
             </button>
           )}
 
-          <button
-            type="button"
-            className="btn btn-sm btn-ghost"
-            onClick={() => void handleUploadLocalFiles()}
-            title={`选择本地文件通过 SFTP 快速上传到 ${cwd}`}
-          >
-            <Upload size={12} />
-            上传
-          </button>
+          {!isLocalOnly && (
+            <button
+              type="button"
+              className="btn btn-sm btn-ghost"
+              onClick={() => void handleUploadLocalFiles()}
+              title={`选择本地文件通过 SFTP 快速上传到 ${cwd}`}
+            >
+              <Upload size={12} />
+              上传
+            </button>
+          )}
 
           <button
             type="button"
@@ -1664,9 +1832,14 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
             className="term-theme-select"
             value={fontKey}
             onChange={(e) => setFontKey(e.target.value as FontKey)}
-            title="切换终端字体（支持 Nerd Font / Powerlevel10k / tmux / nvim 图标）"
+            title="切换终端字体（支持 Windows 默认终端字体 / Nerd Font / Powerlevel10k）"
           >
-            {(Object.keys(TERMINAL_FONTS) as FontKey[]).map((k) => (
+            <option value="win_default">
+              {localDefaults?.fontFamily
+                ? `Windows 默认 (${localDefaults.fontFamily})`
+                : "Windows 默认字体"}
+            </option>
+            {(Object.keys(TERMINAL_FONTS) as Exclude<FontKey, "win_default">[]).map((k) => (
               <option key={k} value={k}>
                 {TERMINAL_FONTS[k].label}
               </option>
@@ -1677,9 +1850,14 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
             className="term-theme-select"
             value={themeKey}
             onChange={(e) => setThemeKey(e.target.value as ThemeKey)}
-            title="切换终端配色主题"
+            title="切换终端配色主题（支持同步 Windows Terminal 默认配色）"
           >
-            {(Object.keys(TERMINAL_THEMES) as ThemeKey[]).map((k) => (
+            <option value="win_default">
+              {localDefaults?.schemeName
+                ? `Windows 默认 (${localDefaults.schemeName})`
+                : "Windows 默认配色"}
+            </option>
+            {(Object.keys(TERMINAL_THEMES) as Exclude<ThemeKey, "win_default">[]).map((k) => (
               <option key={k} value={k}>
                 {TERMINAL_THEMES[k].label}
               </option>
@@ -2205,8 +2383,10 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
             active={tab.id === activeTab?.id}
             reconnectSeq={tab.reconnectSeq}
             fontSize={fontSize}
-            fontKey={fontKey}
-            themeKey={themeKey}
+            fontFamily={resolvedFontFamily}
+            themeBg={resolvedThemeEntry.bg}
+            themeObj={resolvedThemeEntry.theme}
+            cursorStyle={resolvedCursorStyle}
             copyOnSelect={copyOnSelect}
             vimMode={vimMode}
             followSftp={followSftp}

@@ -19,9 +19,13 @@ interface Toast {
 
 export function StandaloneTerminalApp() {
   const params = new URLSearchParams(window.location.search);
-  const sessionId = params.get("sessionId") ?? "";
-  const sessionName = params.get("name") || params.get("host") || "SSH 终端";
-  const cwd = params.get("cwd") || "/";
+  const terminalKind = params.get("kind") === "local" ? "local" : "ssh";
+  const sessionId = params.get("sessionId") ?? (terminalKind === "local" ? "__local__" : "");
+  const sessionName =
+    terminalKind === "local"
+      ? "本地终端"
+      : params.get("name") || params.get("host") || "SSH 终端";
+  const cwd = params.get("cwd") || (terminalKind === "local" ? "" : "/");
 
   const [dragOver, setDragOver] = useState(false);
   const [toasts, setToasts] = useState<Toast[]>([]);
@@ -40,9 +44,9 @@ export function StandaloneTerminalApp() {
     document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
   }, []);
 
-  // 独立终端窗口同样支持直接拖入本地文件/文件夹，自动走 SFTP 队列递归上传到远端目录
+  // 独立 SSH 终端窗口支持直接拖入本地文件/文件夹，自动走 SFTP 队列递归上传到远端目录
   useEffect(() => {
-    if (!sessionId) return;
+    if (terminalKind !== "ssh" || !sessionId) return;
     let unlisten: (() => void) | undefined;
     (async () => {
       try {
@@ -77,7 +81,7 @@ export function StandaloneTerminalApp() {
     };
   }, [sessionId, cwd, pushToast]);
 
-  if (!sessionId) {
+  if (terminalKind === "ssh" && !sessionId) {
     return (
       <div className="empty-state" style={{ height: "100vh" }}>
         <div className="empty-title">缺少 SSH 会话参数</div>
@@ -89,9 +93,11 @@ export function StandaloneTerminalApp() {
   return (
     <div style={{ width: "100%", height: "100%", position: "relative" }}>
       <TerminalDrawer
+        mode={terminalKind}
         sessionId={sessionId}
         sessionName={sessionName}
         cwd={cwd}
+        localCwd={terminalKind === "local" ? cwd : undefined}
         standalone={true}
         onNotify={pushToast}
       />

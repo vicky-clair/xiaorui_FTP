@@ -20,7 +20,7 @@ use crate::audit::{AuditCategory, AuditEntry, AuditLogger, AuditSeverity};
 use crate::error::{AppError, AppResult};
 use crate::known_hosts::{KnownHostEntry, KnownHostsStore};
 use crate::local_fs;
-use crate::local_pty::{self, LocalShellOption};
+use crate::local_pty::{self, LocalShellOption, LocalTerminalDefaults};
 use crate::models::parse_quick_connect_uri;
 use crate::models::{
     join_remote_path, normalize_remote_path, AgentStatus, AppSettings, AuthType, FileEntry,
@@ -1366,6 +1366,12 @@ pub fn list_local_shells() -> Vec<LocalShellOption> {
     local_pty::list_local_shells()
 }
 
+/// 读取当前操作系统的默认本地终端配置（Windows 下自动同步 Windows Terminal 默认配置）
+#[tauri::command]
+pub fn get_local_terminal_defaults() -> LocalTerminalDefaults {
+    local_pty::get_local_terminal_defaults()
+}
+
 /// 打开本地原生交互终端（PowerShell / Git Bash / CMD / Unix Shell），严格走白名单与窗口归属隔离
 #[tauri::command]
 pub async fn local_pty_open(
@@ -1647,6 +1653,47 @@ pub async fn open_terminal_window(
     {
         state.terminal_windows.write().await.remove(&label);
         return Err(AppError::Protocol(format!("创建独立终端窗口失败: {}", e)));
+    }
+
+    Ok(label)
+}
+
+/// 打开独立的原生操作系统本地终端窗口（无需连接远程会话，自动应用 Windows 默认终端配置）
+#[tauri::command]
+pub async fn open_local_terminal_window(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    cwd: Option<String>,
+) -> AppResult<String> {
+    state.ensure_main_window(&window, "open_local_terminal_window")?;
+    let label = format!("term-local-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let cur_cwd = cwd
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(local_fs::home_dir);
+    let enc_cwd = utf8_percent_encode(&cur_cwd, NON_ALPHANUMERIC).to_string();
+    let url = format!("index.html?mode=terminal&kind=local&cwd={}", enc_cwd);
+
+    state
+        .terminal_windows
+        .write()
+        .await
+        .insert(label.clone(), "__local__".to_string());
+
+    let title = "本地终端 — xiaorui_FTP";
+    if let Err(e) = WebviewWindowBuilder::new(&app, &label, WebviewUrl::App(url.into()))
+        .title(title)
+        .inner_size(980.0, 620.0)
+        .min_inner_size(560.0, 340.0)
+        .center()
+        .resizable(true)
+        .build()
+    {
+        state.terminal_windows.write().await.remove(&label);
+        return Err(AppError::Protocol(format!(
+            "创建独立本地终端窗口失败: {}",
+            e
+        )));
     }
 
     Ok(label)

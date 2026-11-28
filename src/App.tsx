@@ -73,6 +73,9 @@ export default function App() {
   const [dualPane, setDualPane] = useState(true);
   const [transferOpen, setTransferOpen] = useState(false);
   const [terminalOpen, setTerminalOpen] = useState(false);
+  const [terminalMode, setTerminalMode] = useState<"ssh" | "local">("ssh");
+  const [localTerminalCwd, setLocalTerminalCwd] = useState("");
+  const [localTerminalKey, setLocalTerminalKey] = useState(1);
   const [terminalMaximized, setTerminalMaximized] = useState(false);
   const [terminalCommand, setTerminalCommand] = useState<TerminalCommandRequest | null>(null);
 
@@ -226,11 +229,21 @@ export default function App() {
         return;
       }
       setTransferOpen(false);
+      setTerminalMode("ssh");
       setTerminalOpen(true);
       setTerminalCommand({ id: Date.now() + Math.random(), text: cmd });
     },
     [pushToast]
   );
+
+  /** 在指定本地目录一键打开本地终端（使用 Windows 默认终端配置，无需连接远程服务器） */
+  const handleOpenLocalDirInTerminal = useCallback((dirPath: string) => {
+    setTransferOpen(false);
+    setLocalTerminalCwd(dirPath);
+    setLocalTerminalKey((k) => k + 1);
+    setTerminalMode("local");
+    setTerminalOpen(true);
+  }, []);
 
   /** 从远程文件面板将文件/目录完整路径插入 SSH 终端当前光标位置（拦截换行与控制字符注入） */
   const handleInsertPathToTerminal = useCallback(
@@ -241,14 +254,26 @@ export default function App() {
         return;
       }
       setTransferOpen(false);
+      setTerminalMode("ssh");
       setTerminalOpen(true);
       setTerminalCommand({ id: Date.now() + Math.random(), text: formatted });
     },
     [pushToast]
   );
 
-  /** 将当前 SSH 会话终端弹出为独立原生操作系统窗口 */
+  /** 将当前终端（SSH 或本地终端）弹出为独立原生操作系统窗口 */
   const handlePopOutTerminal = async () => {
+    if (terminalMode === "local") {
+      try {
+        await api.openLocalTerminalWindow(localTerminalCwd || localPath || undefined);
+        setTerminalOpen(false);
+        setTerminalMaximized(false);
+        pushToast("已打开独立本地终端窗口（Windows 默认配置）", "info");
+      } catch (err) {
+        pushToast(String(err), "error");
+      }
+      return;
+    }
     if (!activeSession?.supportsShell) return;
     try {
       await api.openTerminalWindow(activeSession.sessionId, remotePath);
@@ -936,11 +961,29 @@ export default function App() {
           setTransferOpen((v) => !v);
           if (!transferOpen) setTerminalOpen(false);
         }}
+        localTerminalOpen={terminalOpen && terminalMode === "local"}
+        onToggleLocalTerminal={() => {
+          if (terminalOpen && terminalMode === "local") {
+            setTerminalOpen(false);
+            setTerminalMaximized(false);
+          } else {
+            setLocalTerminalCwd(localPath);
+            setTerminalMode("local");
+            setTransferOpen(false);
+            setTerminalOpen(true);
+          }
+        }}
         canOpenTerminal={Boolean(activeSession?.supportsShell)}
-        terminalOpen={terminalOpen}
+        terminalOpen={terminalOpen && terminalMode === "ssh"}
         onToggleTerminal={() => {
-          setTerminalOpen((v) => !v);
-          if (!terminalOpen) setTransferOpen(false);
+          if (terminalOpen && terminalMode === "ssh") {
+            setTerminalOpen(false);
+            setTerminalMaximized(false);
+          } else {
+            setTerminalMode("ssh");
+            setTransferOpen(false);
+            setTerminalOpen(true);
+          }
         }}
         connecting={connecting}
         quickConnectInputRef={quickConnectInputRef}
@@ -986,7 +1029,7 @@ export default function App() {
                     className={`session-tab ${isActive ? "active" : ""}`}
                     onClick={() => {
                       setActiveSessionId(s.sessionId);
-                      if (!s.supportsShell) setTerminalOpen(false);
+                      if (!s.supportsShell && terminalMode === "ssh") setTerminalOpen(false);
                       void loadRemoteDir(s.sessionId, s.currentPath);
                     }}
                   >
@@ -1040,6 +1083,7 @@ export default function App() {
                 onTransfer={(e) => void handleUploadEntry(e)}
                 onCopyPath={(p) => pushToast(`已复制路径：${p}`, "info")}
                 onDropEntryFromOtherPane={(e) => void handleDownloadEntry(e, false)}
+                onOpenInTerminal={handleOpenLocalDirInTerminal}
               />
             )}
 
@@ -1200,9 +1244,29 @@ export default function App() {
             />
           )}
 
-          {terminalOpen && activeSession?.supportsShell && (
+          {terminalOpen && terminalMode === "local" && (
+            <TerminalDrawer
+              key={`local-${localTerminalKey}`}
+              mode="local"
+              sessionId="__local__"
+              sessionName="本地终端"
+              cwd={localTerminalCwd || localPath}
+              localCwd={localTerminalCwd || localPath}
+              maximized={terminalMaximized}
+              onToggleMaximize={() => setTerminalMaximized((v) => !v)}
+              onPopOut={() => void handlePopOutTerminal()}
+              onNotify={pushToast}
+              onClose={() => {
+                setTerminalOpen(false);
+                setTerminalMaximized(false);
+              }}
+            />
+          )}
+
+          {terminalOpen && terminalMode === "ssh" && activeSession?.supportsShell && (
             <TerminalDrawer
               key={activeSession.sessionId}
+              mode="ssh"
               sessionId={activeSession.sessionId}
               sessionName={activeSession.name}
               cwd={remotePath}

@@ -10,6 +10,7 @@ import {
   ArrowLeftRight,
   Columns2,
   Download,
+  Laptop,
   Moon,
   PanelLeft,
   Plus,
@@ -29,6 +30,8 @@ interface TopBarProps {
   transferOpen: boolean;
   activeTransferCount: number;
   onToggleTransfers: () => void;
+  localTerminalOpen: boolean;
+  onToggleLocalTerminal: () => void;
   canOpenTerminal: boolean;
   terminalOpen: boolean;
   onToggleTerminal: () => void;
@@ -48,6 +51,8 @@ export const TopBar: React.FC<TopBarProps> = ({
   transferOpen,
   activeTransferCount,
   onToggleTransfers,
+  localTerminalOpen,
+  onToggleLocalTerminal,
   canOpenTerminal,
   terminalOpen,
   onToggleTerminal,
@@ -119,6 +124,15 @@ export const TopBar: React.FC<TopBarProps> = ({
           title={dualPane ? "切换为单栏（仅远程）" : "切换为双栏（本地 + 远程）"}
         >
           {dualPane ? <Columns2 size={16} /> : <Square size={15} />}
+        </button>
+
+        <button
+          className={`btn btn-sm ${localTerminalOpen ? "btn-primary" : "btn-ghost"}`}
+          onClick={onToggleLocalTerminal}
+          title="打开本地终端（自动使用 Windows 默认终端配置）"
+        >
+          <Laptop size={14} />
+          本地终端
         </button>
 
         {canOpenTerminal && (
