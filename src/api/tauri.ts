@@ -13,12 +13,15 @@ import type {
   FileEntry,
   KnownHostEntry,
   LocalRoot,
+  LocalShellOption,
   PtyDataEvent,
   PtyExitEvent,
   ServerMetrics,
   SessionInfo,
   SiteConfig,
   SiteInput,
+  SshConfigHost,
+  SshKeyEntry,
   TransferTask,
 } from "../types";
 
@@ -41,6 +44,18 @@ export const api = {
     invoke<AuditEntry[]>("list_audit_logs", { limit: limit ?? 200 }),
   exportAuditLogs: (filePath: string) =>
     invoke<void>("export_audit_logs", { filePath }),
+  listSshKeys: () => invoke<SshKeyEntry[]>("list_ssh_keys"),
+  generateSshKey: (name: string, comment: string, passphrase?: string) =>
+    invoke<SshKeyEntry>("generate_ssh_key", {
+      name,
+      comment,
+      passphrase: passphrase || null,
+    }),
+  deploySshPublicKey: (sessionId: string, publicKeyLine: string) =>
+    invoke<boolean>("deploy_ssh_public_key", { sessionId, publicKeyLine }),
+  discoverSshConfigHosts: () => invoke<SshConfigHost[]>("discover_ssh_config_hosts"),
+  importSshConfigHosts: (hosts: SshConfigHost[]) =>
+    invoke<number>("import_ssh_config_hosts", { hosts }),
   getAppSettings: () => invoke<AppSettings>("get_app_settings"),
   setMinimizeToTray: (enabled: boolean) =>
     invoke<AppSettings>("set_minimize_to_tray", { enabled }),
@@ -124,9 +139,12 @@ export const api = {
   onTransferUpdate: (cb: (task: TransferTask) => void): Promise<UnlistenFn> =>
     listen<TransferTask>("transfer://update", (ev) => cb(ev.payload)),
 
-  // ---------------- 交互式 SSH PTY 终端与服务器硬件监测 ----------------
+  // ---------------- 交互式 SSH PTY、本地 PTY 与服务器硬件监测 ----------------
   remoteServerMetrics: (sessionId: string) =>
     invoke<ServerMetrics>("remote_server_metrics", { sessionId }),
+  listLocalShells: () => invoke<LocalShellOption[]>("list_local_shells"),
+  localPtyOpen: (profile: string, cols: number, rows: number, cwd?: string) =>
+    invoke<string>("local_pty_open", { profile, cols, rows, cwd: cwd ?? null }),
   sshPtyOpen: (sessionId: string, cols: number, rows: number) =>
     invoke<string>("ssh_pty_open", { sessionId, cols, rows }),
   sshPtyWrite: (terminalId: string, data: string) =>

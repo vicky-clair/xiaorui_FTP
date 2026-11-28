@@ -6,7 +6,17 @@
  */
 
 import React, { useMemo, useState } from "react";
-import { Download, FileClock, Pencil, Search, ShieldCheck, Trash2, Upload } from "lucide-react";
+import {
+  Download,
+  FileClock,
+  FileCode2,
+  KeyRound,
+  Pencil,
+  Search,
+  ShieldCheck,
+  Trash2,
+  Upload,
+} from "lucide-react";
 import { PROTOCOL_META, type SiteConfig } from "../types";
 
 interface SiteSidebarProps {
@@ -18,6 +28,8 @@ interface SiteSidebarProps {
   onDelete: (site: SiteConfig) => void;
   onExport: () => void;
   onImport: () => void;
+  onImportSshConfig: () => void;
+  onOpenSshKeys: () => void;
   onOpenKnownHosts: () => void;
   onOpenAuditLogs: () => void;
 }
@@ -31,6 +43,8 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
   onDelete,
   onExport,
   onImport,
+  onImportSshConfig,
+  onOpenSshKeys,
   onOpenKnownHosts,
   onOpenAuditLogs,
 }) => {
@@ -154,21 +168,45 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
         )}
       </div>
 
-      <div className="sidebar-footer">
+      <div
+        className="sidebar-footer"
+        style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(3, 1fr)",
+          gap: 4,
+          padding: "8px 8px",
+        }}
+      >
         <button className="btn btn-sm btn-ghost" onClick={onImport} title="从 JSON 文件导入站点配置">
-          <Upload size={13} />
+          <Upload size={12} />
           导入
         </button>
         <button className="btn btn-sm btn-ghost" onClick={onExport} title="导出站点备份为 JSON（不含敏感密钥）">
-          <Download size={13} />
+          <Download size={12} />
           备份
         </button>
+        <button
+          className="btn btn-sm btn-ghost"
+          onClick={onImportSshConfig}
+          title="一键解析并导入本机 ~/.ssh/config 主机配置"
+        >
+          <FileCode2 size={12} />
+          SSH配置
+        </button>
+        <button
+          className="btn btn-sm btn-ghost"
+          onClick={onOpenSshKeys}
+          title="管理本地 ~/.ssh 密钥、生成 Ed25519 并一键部署公钥到远端"
+        >
+          <KeyRound size={12} />
+          密钥
+        </button>
         <button className="btn btn-sm btn-ghost" onClick={onOpenKnownHosts} title="管理 SSH 已知主机公钥指纹">
-          <ShieldCheck size={13} />
+          <ShieldCheck size={12} />
           主机
         </button>
         <button className="btn btn-sm btn-ghost" onClick={onOpenAuditLogs} title="查看本地脱敏安全审计日志">
-          <FileClock size={13} />
+          <FileClock size={12} />
           日志
         </button>
       </div>

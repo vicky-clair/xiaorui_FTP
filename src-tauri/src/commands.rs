@@ -20,17 +20,20 @@ use crate::audit::{AuditCategory, AuditEntry, AuditLogger, AuditSeverity};
 use crate::error::{AppError, AppResult};
 use crate::known_hosts::{KnownHostEntry, KnownHostsStore};
 use crate::local_fs;
+use crate::local_pty::{self, LocalShellOption};
 use crate::models::parse_quick_connect_uri;
 use crate::models::{
-    join_remote_path, normalize_remote_path, AgentStatus, AppSettings, FileEntry, LocalRoot,
-    Protocol, PtyDataEvent, PtyExitEvent, ServerMetrics, SessionInfo, SiteConfig, SiteInput,
-    SiteSecrets, TransferDirection, TransferTask,
+    join_remote_path, normalize_remote_path, AgentStatus, AppSettings, AuthType, FileEntry,
+    LocalRoot, Protocol, PtyDataEvent, PtyExitEvent, ServerMetrics, SessionInfo, SiteConfig,
+    SiteInput, SiteSecrets, TransferDirection, TransferTask,
 };
 use crate::protocols::{connect_protocol, sftp, PtyCommand, RemoteFs};
 use crate::security::{
     ensure_not_symlink_target, resolve_safe_download_path, validate_scoped_file_path,
     write_private_file,
 };
+use crate::ssh_config::{self, SshConfigHost};
+use crate::ssh_keys::{self, SshKeyEntry};
 use crate::storage::{load_secrets_strict, SiteStore};
 use crate::transfer::{TransferManager, TRANSFER_EVENT};
 
@@ -385,6 +388,177 @@ pub async fn export_audit_logs(
     let json = state.audit.export_json(1000)?;
     tokio::fs::write(&file_path, json).await?;
     Ok(())
+}
+
+// ============================================================================
+// SSH 密钥管理、纯 SFTP 一键部署公钥与 ~/.ssh/config 导入
+// ============================================================================
+
+/// 列出本地 `~/.ssh` 目录下的 SSH 密钥元信息（仅主窗口可调用，严禁暴露私钥内容）
+#[tauri::command]
+pub async fn list_ssh_keys(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+) -> AppResult<Vec<SshKeyEntry>> {
+    state.ensure_main_window(&window, "list_ssh_keys")?;
+    tokio::task::spawn_blocking(ssh_keys::list_local_ssh_keys)
+        .await
+        .map_err(|e| AppError::Storage(format!("扫描本地 SSH 密钥异常: {}", e)))?
+}
+
+/// 在本地 `~/.ssh` 目录生成现代 Ed25519 密钥对（支持可选 Passphrase 加密，仅主窗口可调用）
+#[tauri::command]
+pub async fn generate_ssh_key(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    name: String,
+    comment: String,
+    passphrase: Option<String>,
+) -> AppResult<SshKeyEntry> {
+    use zeroize::Zeroize;
+    state.ensure_main_window(&window, "generate_ssh_key")?;
+    let has_pass = passphrase.as_deref().is_some_and(|p| !p.is_empty());
+    let mut pass_owned = passphrase;
+    let entry = tokio::task::spawn_blocking(move || {
+        let res = ssh_keys::generate_local_ed25519_key(&name, &comment, pass_owned.as_deref());
+        if let Some(p) = pass_owned.as_mut() {
+            p.zeroize();
+        }
+        res
+    })
+    .await
+    .map_err(|e| AppError::Protocol(format!("生成 SSH 密钥任务异常: {}", e)))??;
+
+    state.audit.record(
+        AuditSeverity::Info,
+        AuditCategory::Credential,
+        "ssh_key_generated",
+        &entry.name,
+        &format!(
+            "已生成 Ed25519 密钥对 ({} / {}, 口令保护={})",
+            entry.algorithm, entry.fingerprint, has_pass
+        ),
+    );
+    Ok(entry)
+}
+
+/// 通过纯 SFTP 通道将指定 SSH 公钥一键部署至当前已连接的远端主机 `~/.ssh/authorized_keys`
+#[tauri::command]
+pub async fn deploy_ssh_public_key(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    session_id: String,
+    public_key_line: String,
+) -> AppResult<bool> {
+    state.ensure_main_window(&window, "deploy_ssh_public_key")?;
+    let (_, alg, fp) = ssh_keys::validate_openssh_public_key(&public_key_line)?;
+    let fs = state.get_fs(&session_id).await?;
+    let target = {
+        let guard = state.sessions.read().await;
+        guard
+            .get(&session_id)
+            .map(|s| format!("{}:{}", s.info.host, s.info.port))
+            .unwrap_or_else(|| session_id.clone())
+    };
+    let added = fs.deploy_public_key(&public_key_line).await?;
+    state.audit.record(
+        AuditSeverity::Warn,
+        AuditCategory::Credential,
+        "ssh_key_deployed",
+        &target,
+        &format!(
+            "{} SSH 公钥至远端 authorized_keys ({} / {})",
+            if added {
+                "已部署"
+            } else {
+                "已存在跳过"
+            },
+            alg,
+            fp
+        ),
+    );
+    Ok(added)
+}
+
+/// 扫描并解析本机 `~/.ssh/config` 中的 SSH 主机配置列表（仅主窗口可调用）
+#[tauri::command]
+pub async fn discover_ssh_config_hosts(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+) -> AppResult<Vec<SshConfigHost>> {
+    state.ensure_main_window(&window, "discover_ssh_config_hosts")?;
+    tokio::task::spawn_blocking(ssh_config::discover_local_ssh_config)
+        .await
+        .map_err(|e| AppError::Storage(format!("解析 ~/.ssh/config 异常: {}", e)))?
+}
+
+/// 将用户勾选的 `~/.ssh/config` 主机批量导入站点列表（自动去重，绝不覆盖或破坏既有站点）
+#[tauri::command]
+pub async fn import_ssh_config_hosts(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    hosts: Vec<SshConfigHost>,
+) -> AppResult<usize> {
+    state.ensure_main_window(&window, "import_ssh_config_hosts")?;
+    let existing = state.store.list()?;
+    let mut imported = 0usize;
+
+    for h in hosts {
+        let already = existing.iter().any(|s| {
+            s.protocol == Protocol::Sftp
+                && s.host.eq_ignore_ascii_case(&h.host)
+                && s.port == h.port
+                && s.username == h.username
+        });
+        if already {
+            continue;
+        }
+        let auth_type = if h.private_key_path.as_deref().is_some_and(|p| !p.is_empty()) {
+            AuthType::PrivateKey
+        } else {
+            AuthType::Agent
+        };
+        let input = SiteInput {
+            id: None,
+            name: h.alias.clone(),
+            group: "SSH Config".to_string(),
+            protocol: Protocol::Sftp,
+            host: h.host,
+            port: Some(h.port),
+            username: h.username,
+            auth_type,
+            secret: None,
+            passphrase: None,
+            session_token: None,
+            private_key_path: h.private_key_path,
+            remote_path: "/".to_string(),
+            endpoint: None,
+            bucket: None,
+            region: None,
+            path_style: false,
+            tls_skip_verify: false,
+            jump_host: h.jump_host.clone(),
+            jump_port: h.jump_port,
+            jump_username: h.jump_username,
+            jump_auth_type: h.jump_host.as_ref().map(|_| AuthType::Agent),
+            jump_private_key_path: None,
+            jump_secret: None,
+            jump_passphrase: None,
+            notes: "导入自 ~/.ssh/config".to_string(),
+            save_secret: false,
+        };
+        state.store.save(input)?;
+        imported += 1;
+    }
+
+    state.audit.record(
+        AuditSeverity::Info,
+        AuditCategory::Credential,
+        "ssh_config_imported",
+        "~/.ssh/config",
+        &format!("从 OpenSSH 配置导入 {} 个新 SFTP 站点", imported),
+    );
+    Ok(imported)
 }
 
 // ============================================================================
@@ -1170,6 +1344,94 @@ pub async fn remote_server_metrics(
 ) -> AppResult<ServerMetrics> {
     let fs = state.get_fs(&session_id).await?;
     fs.server_metrics().await
+}
+
+/// 枚举当前操作系统可用的白名单本地 Shell 预设
+#[tauri::command]
+pub fn list_local_shells() -> Vec<LocalShellOption> {
+    local_pty::list_local_shells()
+}
+
+/// 打开本地原生交互终端（PowerShell / Git Bash / CMD / Unix Shell），严格走白名单与窗口归属隔离
+#[tauri::command]
+pub async fn local_pty_open(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    profile: String,
+    cwd: Option<String>,
+    cols: u32,
+    rows: u32,
+) -> AppResult<String> {
+    let owner_window = window.label().to_string();
+    if owner_window != "main" && !owner_window.starts_with("term-") {
+        return Err(AppError::PermissionDenied(
+            "安全策略拒绝：未知窗口禁止打开本地终端".into(),
+        ));
+    }
+
+    let profile_for_spawn = profile.clone();
+    let cwd_for_spawn = cwd.clone();
+    let mut handle = tokio::task::spawn_blocking(move || {
+        local_pty::open_local_pty(&profile_for_spawn, cwd_for_spawn.as_deref(), cols, rows)
+    })
+    .await
+    .map_err(|e| AppError::Protocol(format!("启动本地终端任务异常: {}", e)))??;
+
+    let terminal_id = Uuid::new_v4().to_string();
+    state.ptys.write().await.insert(
+        terminal_id.clone(),
+        ActivePty {
+            session_id: "__local__".to_string(),
+            owner_window: owner_window.clone(),
+            cmd_tx: handle.cmd_tx,
+        },
+    );
+
+    state.audit.record(
+        AuditSeverity::Info,
+        AuditCategory::Session,
+        "local_pty_opened",
+        &profile,
+        &format!("在窗口 {} 中打开本地终端 ({})", owner_window, profile),
+    );
+
+    let ptys_ref = state.ptys.clone();
+    let tid = terminal_id.clone();
+    tokio::spawn(async move {
+        let mut window_start = std::time::Instant::now();
+        let mut bytes_in_window: usize = 0;
+
+        while let Some(chunk) = handle.output_rx.recv().await {
+            for slice in chunk.chunks(PTY_MAX_CHUNK_BYTES) {
+                if window_start.elapsed().as_secs() >= 1 {
+                    window_start = std::time::Instant::now();
+                    bytes_in_window = 0;
+                }
+                bytes_in_window = bytes_in_window.saturating_add(slice.len());
+                if bytes_in_window > PTY_MAX_BYTES_PER_SEC {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                let data_b64 = base64::engine::general_purpose::STANDARD.encode(slice);
+                let _ = app.emit_to(
+                    &owner_window,
+                    PTY_DATA_EVENT,
+                    PtyDataEvent {
+                        terminal_id: tid.clone(),
+                        data_b64,
+                    },
+                );
+            }
+        }
+        ptys_ref.write().await.remove(&tid);
+        let _ = app.emit_to(
+            &owner_window,
+            PTY_EXIT_EVENT,
+            PtyExitEvent { terminal_id: tid },
+        );
+    });
+
+    Ok(terminal_id)
 }
 
 /// 打开交互式 SSH PTY 伪终端（校验窗口与会话归属，并启用输出速率/分片限流防刷屏 DoS）

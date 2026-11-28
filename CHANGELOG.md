@@ -2,7 +2,19 @@
 
 所有重要变更均记录于此文件。
 
-## [1.0.0] - 2026-11-27
+## [1.0.0] - 2026-11-28
+
+### SSH 终端进阶能力与体验升级（第一/二/三梯队落地）
+- **Windows 原生剪贴板修复**：接入 `arboard` 操作系统原生剪贴板 IPC，彻底解决 Windows WebView2 下无法复制/粘贴的问题；支持 `Ctrl+C/V`、`Ctrl+Shift+C/V`、`Ctrl/Shift+Insert`、左键松手复制（`mouseup`）与右键复制/粘贴。
+- **`zsh + tmux + nvim` 专项优化**：透传 `COLORTERM=truecolor`，接入 `@xterm/addon-unicode11`（宽字符对齐）与 `@xterm/addon-webgl`（GPU 加速渲染），新增 Nerd Font 字体选择器、`Ctrl+Shift+F` 搜索及一键 **Vim/tmux 键位模式**。
+- **第二梯队进阶运维能力**：
+  - **终端 ↔ SFTP 双向目录跟随**：解析远端 Shell `OSC 7` 目录上报并自动同步 SFTP 面板；
+  - **SSH 密钥管理器 & 纯 SFTP 一键部署公钥**：扫描 `~/.ssh`、原生生成 Ed25519 密钥对（可选 Passphrase，Unix `0o600`），通过纯 SFTP 幂等写入远端 `authorized_keys`（零 Shell 注入）；
+  - **命令历史模糊检索（`Ctrl+Shift+H`）与终端关键词高亮**：历史自动脱敏跳过密码/Token；高亮引擎在 `nvim`/`tmux` 备用屏幕下自动暂停防失真；
+  - **一键导入 `~/.ssh/config`**：支持 `Host *` 默认项、`IdentityFile` 展开与 `ProxyJump` 跳板机勾选导入。
+- **第三梯队安全防呆与本地终端**：
+  - **高危命令防呆拦截（Command Guard）**：提交前拦截 `rm -rf /`、`mkfs`、`dd of=/dev/`、`shutdown`/`reboot`、`DROP DATABASE` 等高危指令并弹窗确认；
+  - **原生本地终端标签（`+本地`）**：基于 `portable-pty`（Windows ConPTY / Unix PTY）按白名单启动本地 PowerShell / Git Bash / CMD / Unix Shell。
 
 ### 安全加固（P0 / P1 / P2 全量完成）
 - **SSH Host Key 零信任与 Fail Secure**：

@@ -134,6 +134,36 @@ export interface AuditEntry {
   detail: string;
 }
 
+/** 本地 SSH 密钥元数据（不含私钥明文） */
+export interface SshKeyEntry {
+  name: string;
+  privateKeyPath?: string | null;
+  publicKeyPath: string;
+  algorithm: string;
+  fingerprint: string;
+  comment: string;
+  publicKeyLine: string;
+  hasPrivateKey: boolean;
+}
+
+/** 从 `~/.ssh/config` 解析出的主机条目 */
+export interface SshConfigHost {
+  alias: string;
+  host: string;
+  port: number;
+  username: string;
+  privateKeyPath?: string | null;
+  jumpHost?: string | null;
+  jumpPort?: number | null;
+  jumpUsername?: string | null;
+}
+
+/** 本机可用的本地终端 Shell 预设 */
+export interface LocalShellOption {
+  id: string;
+  label: string;
+}
+
 /** 当前已连接的远程会话摘要 */
 export interface SessionInfo {
   sessionId: string;

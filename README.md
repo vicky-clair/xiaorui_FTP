@@ -24,14 +24,19 @@
 - **S3 兼容对象存储**：内置 AWS Signature V4，提供 **AWS S3 / 阿里云 OSS / 腾讯云 COS / MinIO / Cloudflare R2** 一键预设，支持 64 KB 流式上传、千级以上对象自动分页列举与递归删除、STS 临时凭证与 Path-Style。
 - **WebDAV / HTTPS**：兼容 **Nextcloud / Alist / 群晖 NAS / 坚果云**，支持 Basic 认证、Bearer Token（OAuth2）、匿名访问、中文路径编解码与流式传输。
 
-### 3. Xshell 风格交互式 SSH 终端（直接调用远端默认 Shell）
-- **原生默认登录 Shell**：基于真实 `xterm-256color` PTY + `xterm.js`，直接启动远端服务器默认 Shell（如 `zsh` / Oh-My-Zsh / `bash` / `fish` / PowerShell），完整支持彩色提示符、`Tab` 补全、`Ctrl+C`、`Ctrl+R` 以及 `vim` / `htop` / `tmux` / `tail -f` 等交互程序。
-- **三种显示形态**：底部停靠（可拖拽调高）、工作区全屏放大（不断开运行中的 Shell）、**弹出独立操作系统窗口**（可拖至副屏、自由缩放最大化）。
-- **Xshell 实用效率套件**：同会话多标签 Shell 并行、`Ctrl+F` 终端日志搜索（大小写/正则）、字号缩放（`A-`/`A+` 或 `Ctrl+=`/`-`/`0`）、5 套配色主题、选中即复制 & 右键粘贴、会话日志导出为 `.log`、底部可自定义快捷命令栏。
+### 3. Xshell 风格交互式 SSH 终端与本地终端（直接调用远端默认 Shell）
+- **原生默认登录 Shell + GPU 流畅渲染**：基于真实 `xterm-256color` PTY（透传 `COLORTERM=truecolor`）+ `xterm.js` + `@xterm/addon-unicode11` + `@xterm/addon-webgl`，直接启动远端默认 Shell（如 `zsh` / Oh-My-Zsh / `tmux` / `bash` / `fish` / PowerShell），丝滑支持 `nvim` / `htop` / `lazygit` 与 Nerd Font / Powerlevel10k 图标。
+- **三种显示形态 + 本地原生终端标签**：底部停靠（可拖拽调高）、工作区全屏放大、**弹出独立操作系统窗口**；标签栏支持同会话多 SSH 标签并行，并可一键点击 **「+本地」** 启动本机 PowerShell / Git Bash / CMD / Unix Shell 原生 PTY 对照操作。
+- **进阶运维与防呆套件**：
+  - **高危命令防呆拦截（Command Guard）**：自动拦截 `rm -rf /`、`mkfs`、`dd of=/dev/`、`shutdown`/`reboot`、`DROP DATABASE` 等破坏性指令并触发确认（进入 `nvim`/`tmux` 备用屏幕时自动暂停防误报）；
+  - **命令历史模糊检索（`Ctrl+Shift+H`）**：自动去重并脱敏跳过含密码/Token 的命令，支持仅填入或安全执行；
+  - **终端关键词高亮规则**：内置 `ERROR` / `WARN` / `OK` / `IPv4` 彩色高亮并支持自定义正则，备用屏幕自动跳过保证 `nvim` 零失真；
+  - **Xshell 效率套件**：`Ctrl+Shift+F` 搜索、Nerd Font 字体选择器、**Vim/tmux 键位模式**一键切换、字号缩放、5 套主题、Windows 原生剪贴板复制/粘贴、`.log` 日志导出、快捷命令栏。
 - **本地 ↔ SSH 双向灵活联动**：
+  - **终端跟随 SFTP（OSC 7）**：开启工具栏 **「跟随」** 后，远端 Shell 切换目录并发送 OSC 7 时，SFTP 文件面板自动同步跳转；
   - 远程文件面板右键菜单支持 **「在此目录打开 SSH 终端」** 与 **「将路径插入终端光标」**；
-  - 终端内置 **「同步目录」**（一键 `cd` 到当前 SFTP 浏览目录）与 **「上传文件」**（免装 `lrzsz`，直走高速 SFTP 队列）；
-  - **独立终端窗口**同样支持直接拖入本地文件/文件夹递归上传。
+  - 终端内置 **「同步目录」** 与 **「上传」**（免装 `lrzsz`，直走高速 SFTP 队列）；独立终端窗口同样支持拖放上传。
+- **SSH 密钥管理与 `~/.ssh/config` 导入**：侧边栏内置 **「密钥」**（生成 Ed25519 密钥对含可选口令、纯 SFTP 零注入一键部署公钥至远端 `authorized_keys`）与 **「SSH配置」**（一键解析导入本机 `~/.ssh/config` 含 `Host *` 与 `ProxyJump`）。
 
 ### 4. 远端硬件监控与多磁盘一键切换
 - **底部状态栏实时监测**（SFTP/SSH 会话）：每 15 秒轻量采样远端服务器的 **CPU 核数与占用率、内存已用/总量、磁盘占用率**（高负载自动琥珀/红色预警），兼容 Linux / macOS 与 Windows OpenSSH 服务端。

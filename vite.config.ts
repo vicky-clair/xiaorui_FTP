@@ -16,7 +16,14 @@ export default defineConfig(async () => ({
     rollupOptions: {
       output: {
         manualChunks: {
-          xterm: ["@xterm/xterm", "@xterm/addon-fit", "@xterm/addon-search"],
+          "react-vendor": ["react", "react-dom"],
+          xterm: [
+            "@xterm/xterm",
+            "@xterm/addon-fit",
+            "@xterm/addon-search",
+            "@xterm/addon-unicode11",
+            "@xterm/addon-webgl",
+          ],
           icons: ["lucide-react"],
         },
       },

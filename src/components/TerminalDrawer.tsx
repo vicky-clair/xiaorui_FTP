@@ -26,11 +26,16 @@ import {
   FileDown,
   FolderOpen,
   FolderSync,
+  Highlighter,
+  History,
+  Laptop,
+  Link2,
   Maximize2,
   Minimize2,
   Plus,
   RotateCw,
   Search,
+  ShieldAlert,
   Terminal as TermIcon,
   Trash2,
   Upload,
@@ -38,8 +43,18 @@ import {
   Zap,
 } from "lucide-react";
 import { api } from "../api/tauri";
+import type { LocalShellOption } from "../types";
 import { readClipboardText, writeClipboardText } from "../utils/clipboard";
 import { buildSafeCdCommand, isDangerousMultilinePaste } from "../utils/security";
+import {
+  DEFAULT_HIGHLIGHT_RULES,
+  highlightTerminalText,
+  isSensitiveCommand,
+  matchDangerousCommand,
+  parseOsc7Path,
+  type DangerousCommandMatch,
+  type HighlightRule,
+} from "../utils/terminalEnhance";
 
 export interface TerminalCommandRequest {
   id: number;
@@ -50,9 +65,11 @@ interface TerminalDrawerProps {
   sessionId: string;
   sessionName: string;
   cwd: string;
+  localCwd?: string;
   standalone?: boolean;
   maximized?: boolean;
   pendingCommand?: TerminalCommandRequest | null;
+  onRemoteCwdDetected?: (path: string) => void;
   onToggleMaximize?: () => void;
   onPopOut?: () => void;
   onNotify?: (text: string, kind?: "info" | "success" | "error") => void;
@@ -67,6 +84,8 @@ interface QuickSnippet {
 
 interface TabMeta {
   id: string;
+  kind: "ssh" | "local";
+  localProfile?: string;
   title: string;
   status: "connecting" | "connected" | "exited" | "error";
   sizeLabel: string;
@@ -257,6 +276,33 @@ const STORAGE_FONT_FAMILY = "xiaorui_term_font_family";
 const STORAGE_THEME = "xiaorui_term_theme";
 const STORAGE_COPY_SEL = "xiaorui_term_copy_on_select";
 const STORAGE_VIM_MODE = "xiaorui_term_vim_mode";
+const STORAGE_FOLLOW_SFTP = "xiaorui_term_follow_sftp";
+const STORAGE_CMD_GUARD = "xiaorui_term_cmd_guard";
+const STORAGE_HIGHLIGHT_ON = "xiaorui_term_highlight_on";
+const STORAGE_HIGHLIGHT_RULES = "xiaorui_term_highlight_rules_v1";
+const STORAGE_HISTORY = "xiaorui_term_cmd_history_v1";
+
+function loadHistory(): string[] {
+  try {
+    const raw = localStorage.getItem(STORAGE_HISTORY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as string[];
+    return Array.isArray(parsed) ? parsed.filter((s) => typeof s === "string").slice(0, 200) : [];
+  } catch {
+    return [];
+  }
+}
+
+function loadHighlightRules(): HighlightRule[] {
+  try {
+    const raw = localStorage.getItem(STORAGE_HIGHLIGHT_RULES);
+    if (!raw) return DEFAULT_HIGHLIGHT_RULES;
+    const parsed = JSON.parse(raw) as HighlightRule[];
+    return Array.isArray(parsed) && parsed.length > 0 ? parsed : DEFAULT_HIGHLIGHT_RULES;
+  } catch {
+    return DEFAULT_HIGHLIGHT_RULES;
+  }
+}
 
 function loadSnippets(): QuickSnippet[] {
   try {
@@ -279,10 +325,13 @@ function base64ToBytes(b64: string): Uint8Array {
   return out;
 }
 
-/** 单个独立 PTY 标签页实例（隐藏时保持会话活跃不中断） */
+/** 单个独立 PTY 标签页实例（支持远端 SSH PTY 与原生本地 PTY，隐藏时保持会话活跃不中断） */
 const PtyTabPane = React.forwardRef<
   PtyTabHandle,
   {
+    kind: "ssh" | "local";
+    localProfile?: string;
+    localCwd?: string;
     sessionId: string;
     active: boolean;
     reconnectSeq: number;
@@ -291,15 +340,31 @@ const PtyTabPane = React.forwardRef<
     themeKey: ThemeKey;
     copyOnSelect: boolean;
     vimMode: boolean;
+    followSftp: boolean;
+    commandGuard: boolean;
+    highlightEnabled: boolean;
+    highlightRules: HighlightRule[];
     onStatusChange: (status: TabMeta["status"], sizeLabel?: string) => void;
     onOpenSearch: () => void;
+    onOpenHistory: () => void;
     onZoomDelta: (delta: number | "reset") => void;
     onRequestPaste: (text: string) => void;
+    onRemoteCwdDetected?: (path: string) => void;
+    onDangerousCommand: (
+      cmd: string,
+      match: DangerousCommandMatch,
+      sendProceed: () => Promise<void>,
+      sendCancel: () => Promise<void>
+    ) => void;
+    onRecordCommand: (cmd: string) => void;
     onNotify?: (text: string, kind?: "info" | "success" | "error") => void;
   }
 >(
   (
     {
+      kind,
+      localProfile,
+      localCwd,
       sessionId,
       active,
       reconnectSeq,
@@ -308,10 +373,18 @@ const PtyTabPane = React.forwardRef<
       themeKey,
       copyOnSelect,
       vimMode,
+      followSftp,
+      commandGuard,
+      highlightEnabled,
+      highlightRules,
       onStatusChange,
       onOpenSearch,
+      onOpenHistory,
       onZoomDelta,
       onRequestPaste,
+      onRemoteCwdDetected,
+      onDangerousCommand,
+      onRecordCommand,
       onNotify,
     },
     ref
@@ -323,10 +396,18 @@ const PtyTabPane = React.forwardRef<
     const terminalIdRef = useRef<string | null>(null);
     const copyOnSelectRef = useRef(copyOnSelect);
     const vimModeRef = useRef(vimMode);
+    const followSftpRef = useRef(followSftp);
+    const commandGuardRef = useRef(commandGuard);
+    const highlightEnabledRef = useRef(highlightEnabled);
+    const highlightRulesRef = useRef(highlightRules);
     const onOpenSearchRef = useRef(onOpenSearch);
+    const onOpenHistoryRef = useRef(onOpenHistory);
     const onZoomDeltaRef = useRef(onZoomDelta);
     const onStatusChangeRef = useRef(onStatusChange);
     const onRequestPasteRef = useRef(onRequestPaste);
+    const onRemoteCwdDetectedRef = useRef(onRemoteCwdDetected);
+    const onDangerousCommandRef = useRef(onDangerousCommand);
+    const onRecordCommandRef = useRef(onRecordCommand);
     const onNotifyRef = useRef(onNotify);
 
     useEffect(() => {
@@ -336,8 +417,23 @@ const PtyTabPane = React.forwardRef<
       vimModeRef.current = vimMode;
     }, [vimMode]);
     useEffect(() => {
+      followSftpRef.current = followSftp;
+    }, [followSftp]);
+    useEffect(() => {
+      commandGuardRef.current = commandGuard;
+    }, [commandGuard]);
+    useEffect(() => {
+      highlightEnabledRef.current = highlightEnabled;
+    }, [highlightEnabled]);
+    useEffect(() => {
+      highlightRulesRef.current = highlightRules;
+    }, [highlightRules]);
+    useEffect(() => {
       onOpenSearchRef.current = onOpenSearch;
     }, [onOpenSearch]);
+    useEffect(() => {
+      onOpenHistoryRef.current = onOpenHistory;
+    }, [onOpenHistory]);
     useEffect(() => {
       onZoomDeltaRef.current = onZoomDelta;
     }, [onZoomDelta]);
@@ -347,6 +443,15 @@ const PtyTabPane = React.forwardRef<
     useEffect(() => {
       onRequestPasteRef.current = onRequestPaste;
     }, [onRequestPaste]);
+    useEffect(() => {
+      onRemoteCwdDetectedRef.current = onRemoteCwdDetected;
+    }, [onRemoteCwdDetected]);
+    useEffect(() => {
+      onDangerousCommandRef.current = onDangerousCommand;
+    }, [onDangerousCommand]);
+    useEffect(() => {
+      onRecordCommandRef.current = onRecordCommand;
+    }, [onRecordCommand]);
     useEffect(() => {
       onNotifyRef.current = onNotify;
     }, [onNotify]);
@@ -476,6 +581,14 @@ const PtyTabPane = React.forwardRef<
       // 终端输出纵深防御：显式拦截恶意远端 OSC 52（剪贴板读写）与 OSC 8（隐藏超链接）控制序列
       const osc52Disp = term.parser.registerOscHandler(52, () => true);
       const osc8Disp = term.parser.registerOscHandler(8, () => true);
+      // 终端 -> SFTP 目录自动跟随：解析现代 Shell (zsh/bash/fish) 上报的 OSC 7 当前工作目录
+      const osc7Disp = term.parser.registerOscHandler(7, (payload) => {
+        if (kind === "ssh" && followSftpRef.current) {
+          const parsed = parseOsc7Path(payload);
+          if (parsed) onRemoteCwdDetectedRef.current?.(parsed);
+        }
+        return true;
+      });
       termRef.current = term;
       fitRef.current = fitAddon;
       searchRef.current = searchAddon;
@@ -543,6 +656,12 @@ const PtyTabPane = React.forwardRef<
           ev.preventDefault();
           ev.stopPropagation();
           onOpenSearchRef.current();
+          return false;
+        }
+        if (mod && ev.shiftKey && key === "h") {
+          ev.preventDefault();
+          ev.stopPropagation();
+          onOpenHistoryRef.current();
           return false;
         }
         if (mod && !ev.shiftKey) {
@@ -613,9 +732,79 @@ const PtyTabPane = React.forwardRef<
       });
       ro.observe(container);
 
+      // 追踪备用屏幕状态（进入 nvim/htop/tmux 全屏时暂停关键词高亮与高危命令拦截，确保 TUI 零失真）
+      let inAltScreen = false;
+      let lineBuf = "";
+      const utf8Decoder = new TextDecoder("utf-8");
+
+      const writeChunkToTerminal = (bytes: Uint8Array) => {
+        const preview = utf8Decoder.decode(bytes, { stream: true });
+        if (preview.includes("\x1b[?1049h") || preview.includes("\x1b[?47h")) {
+          inAltScreen = true;
+          lineBuf = "";
+        }
+        if (preview.includes("\x1b[?1049l") || preview.includes("\x1b[?47l")) {
+          inAltScreen = false;
+        }
+        if (highlightEnabledRef.current && !inAltScreen) {
+          term.write(highlightTerminalText(preview, highlightRulesRef.current));
+        } else {
+          term.write(bytes);
+        }
+      };
+
       const dataDisp = term.onData((data) => {
         const tid = terminalIdRef.current;
-        if (tid) void api.sshPtyWrite(tid, data);
+        if (!tid) return;
+
+        // 备用屏幕模式（nvim / tmux 全屏等）下直接透传全部原始字节
+        if (inAltScreen) {
+          void api.sshPtyWrite(tid, data);
+          return;
+        }
+
+        // 高危命令防呆拦截 + 安全命令历史采集（仅在按回车提交行时触发）
+        if (data === "\r" || data === "\n") {
+          const submitted = lineBuf.trim();
+          lineBuf = "";
+          if (submitted && commandGuardRef.current) {
+            const danger = matchDangerousCommand(submitted);
+            if (danger) {
+              onDangerousCommandRef.current(
+                submitted,
+                danger,
+                async () => {
+                  onRecordCommandRef.current(submitted);
+                  await api.sshPtyWrite(tid, "\r");
+                  term.focus();
+                },
+                async () => {
+                  // 发送 Ctrl+U 清空远端命令行残留，确保不会意外执行
+                  await api.sshPtyWrite(tid, "\x15");
+                  term.focus();
+                }
+              );
+              return;
+            }
+          }
+          if (submitted) {
+            onRecordCommandRef.current(submitted);
+          }
+          void api.sshPtyWrite(tid, data);
+          return;
+        }
+
+        // 维护当前行缓冲（忽略方向键转义序列，退格删尾字符，Ctrl+C/U 清空缓冲）
+        if (data === "\x03" || data === "\x15") {
+          lineBuf = "";
+        } else if (data === "\x7f" || data === "\b") {
+          lineBuf = lineBuf.slice(0, -1);
+        } else if (!data.startsWith("\x1b")) {
+          lineBuf += data;
+          if (lineBuf.length > 1024) lineBuf = lineBuf.slice(-1024);
+        }
+
+        void api.sshPtyWrite(tid, data);
       });
 
       onStatusChangeRef.current("connecting");
@@ -632,7 +821,7 @@ const PtyTabPane = React.forwardRef<
               return;
             }
             if (ev.terminalId === terminalIdRef.current) {
-              term.write(bytes);
+              writeChunkToTerminal(bytes);
             }
           });
 
@@ -642,7 +831,9 @@ const PtyTabPane = React.forwardRef<
               terminalIdRef.current = null;
               onStatusChangeRef.current("exited");
               term.writeln(
-                "\r\n\x1b[33m[远程 Shell 会话已结束，点击工具栏「重连」可重新启动]\x1b[0m"
+                kind === "local"
+                  ? "\r\n\x1b[33m[本地 Shell 会话已结束，点击工具栏「重连」可重新启动]\x1b[0m"
+                  : "\r\n\x1b[33m[远程 Shell 会话已结束，点击工具栏「重连」可重新启动]\x1b[0m"
               );
             }
           });
@@ -657,7 +848,10 @@ const PtyTabPane = React.forwardRef<
           const cols = Math.max(40, term.cols || 100);
           const rows = Math.max(8, term.rows || 20);
 
-          const tid = await api.sshPtyOpen(sessionId, cols, rows);
+          const tid =
+            kind === "local"
+              ? await api.localPtyOpen(localProfile || "default", cols, rows, localCwd)
+              : await api.sshPtyOpen(sessionId, cols, rows);
           if (disposed) {
             void api.sshPtyClose(tid);
             return;
@@ -667,14 +861,16 @@ const PtyTabPane = React.forwardRef<
           onStatusChangeRef.current("connected", `${cols}×${rows}`);
 
           for (const item of pendingChunks) {
-            if (item.tid === tid) term.write(item.bytes);
+            if (item.tid === tid) writeChunkToTerminal(item.bytes);
           }
           fitAndNotify();
           term.focus();
         } catch (err) {
           if (!disposed) {
             onStatusChangeRef.current("error");
-            term.writeln(`\x1b[31m打开远程交互式终端失败：${String(err)}\x1b[0m`);
+            term.writeln(
+              `\x1b[31m打开${kind === "local" ? "本地" : "远程交互式"}终端失败：${String(err)}\x1b[0m`
+            );
           }
         }
       })();
@@ -687,6 +883,7 @@ const PtyTabPane = React.forwardRef<
         container.removeEventListener("paste", onNativePaste, true);
         osc52Disp.dispose();
         osc8Disp.dispose();
+        osc7Disp.dispose();
         dataDisp.dispose();
         if (unlistenData) unlistenData();
         if (unlistenExit) unlistenExit();
@@ -701,7 +898,7 @@ const PtyTabPane = React.forwardRef<
         searchRef.current = null;
       };
       // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [sessionId, reconnectSeq]);
+    }, [sessionId, kind, localProfile, reconnectSeq]);
 
     return (
       <div
@@ -744,25 +941,43 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
   sessionId,
   sessionName,
   cwd,
+  localCwd,
   standalone = false,
   maximized = false,
   pendingCommand,
+  onRemoteCwdDetected,
   onToggleMaximize,
   onPopOut,
   onNotify,
   onClose,
 }) => {
   const [tabs, setTabs] = useState<TabMeta[]>([
-    { id: "tab-1", title: "Shell 1", status: "connecting", sizeLabel: "", reconnectSeq: 0 },
+    {
+      id: "tab-1",
+      kind: "ssh",
+      title: "Shell 1",
+      status: "connecting",
+      sizeLabel: "",
+      reconnectSeq: 0,
+    },
   ]);
   const [activeTabId, setActiveTabId] = useState("tab-1");
   const tabSeqRef = useRef(2);
+  const localSeqRef = useRef(1);
   const tabHandlesRef = useRef<Map<string, PtyTabHandle>>(new Map());
+  const [localShells, setLocalShells] = useState<LocalShellOption[]>([]);
+
+  useEffect(() => {
+    void api
+      .listLocalShells()
+      .then((list) => setLocalShells(list))
+      .catch(() => {});
+  }, []);
 
   const [drawerHeight, setDrawerHeight] = useState(310);
   const [resizing, setResizing] = useState(false);
 
-  // Xshell 偏好设置（字号、Nerd Font 字体、主题、选中即复制、Vim/tmux 键位模式、快捷命令栏）
+  // Xshell 偏好设置（字号、Nerd Font 字体、主题、选中即复制、Vim/tmux 键位、跟随 SFTP、高危防护、高亮规则）
   const [fontSize, setFontSize] = useState<number>(() => {
     const saved = Number(localStorage.getItem(STORAGE_FONT));
     return Number.isFinite(saved) && saved >= 10 && saved <= 24 ? saved : 13;
@@ -782,6 +997,35 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
   const [vimMode, setVimMode] = useState<boolean>(() => {
     return localStorage.getItem(STORAGE_VIM_MODE) === "true";
   });
+  const [followSftp, setFollowSftp] = useState<boolean>(() => {
+    const saved = localStorage.getItem(STORAGE_FOLLOW_SFTP);
+    return saved === null ? true : saved === "true";
+  });
+  const [commandGuard, setCommandGuard] = useState<boolean>(() => {
+    const saved = localStorage.getItem(STORAGE_CMD_GUARD);
+    return saved === null ? true : saved === "true";
+  });
+  const [highlightEnabled, setHighlightEnabled] = useState<boolean>(() => {
+    const saved = localStorage.getItem(STORAGE_HIGHLIGHT_ON);
+    return saved === null ? true : saved === "true";
+  });
+  const [highlightRules, setHighlightRules] = useState<HighlightRule[]>(loadHighlightRules);
+  const [highlightPanelOpen, setHighlightPanelOpen] = useState(false);
+  const [newRuleLabel, setNewRuleLabel] = useState("");
+  const [newRulePattern, setNewRulePattern] = useState("");
+
+  // 命令历史检索（自动脱敏跳过密码/Token）
+  const [cmdHistory, setCmdHistory] = useState<string[]>(loadHistory);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [historyQuery, setHistoryQuery] = useState("");
+
+  // 高危命令防呆拦截确认状态
+  const [pendingDanger, setPendingDanger] = useState<{
+    cmd: string;
+    match: DangerousCommandMatch;
+    proceed: () => Promise<void>;
+    cancel: () => Promise<void>;
+  } | null>(null);
 
   // 搜索条状态
   const [searchOpen, setSearchOpen] = useState(false);
@@ -814,14 +1058,64 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
     localStorage.setItem(STORAGE_VIM_MODE, String(vimMode));
   }, [vimMode]);
   useEffect(() => {
+    localStorage.setItem(STORAGE_FOLLOW_SFTP, String(followSftp));
+  }, [followSftp]);
+  useEffect(() => {
+    localStorage.setItem(STORAGE_CMD_GUARD, String(commandGuard));
+  }, [commandGuard]);
+  useEffect(() => {
+    localStorage.setItem(STORAGE_HIGHLIGHT_ON, String(highlightEnabled));
+  }, [highlightEnabled]);
+  useEffect(() => {
+    localStorage.setItem(STORAGE_HIGHLIGHT_RULES, JSON.stringify(highlightRules));
+  }, [highlightRules]);
+  useEffect(() => {
+    localStorage.setItem(STORAGE_HISTORY, JSON.stringify(cmdHistory));
+  }, [cmdHistory]);
+  useEffect(() => {
     localStorage.setItem(STORAGE_SNIPPETS, JSON.stringify(snippets));
   }, [snippets]);
+
+  /** 记录已执行的安全命令到本地历史（自动去重并跳过含密码/Token 的敏感命令） */
+  const handleRecordCommand = useCallback((cmd: string) => {
+    const clean = cmd.trim();
+    if (!clean || isSensitiveCommand(clean)) return;
+    setCmdHistory((prev) => [clean, ...prev.filter((c) => c !== clean)].slice(0, 200));
+  }, []);
 
   const activeTab = tabs.find((t) => t.id === activeTabId) ?? tabs[0];
 
   const getActiveHandle = useCallback(
     () => (activeTab ? tabHandlesRef.current.get(activeTab.id) : undefined),
     [activeTab]
+  );
+
+  /** 安全执行快捷/历史命令（开启防护时先经 Command Guard 检测） */
+  const runCommandWithGuard = useCallback(
+    async (cmd: string) => {
+      const trimmed = cmd.trim();
+      if (!trimmed) return;
+      if (commandGuard) {
+        const danger = matchDangerousCommand(trimmed);
+        if (danger) {
+          setPendingDanger({
+            cmd: trimmed,
+            match: danger,
+            proceed: async () => {
+              handleRecordCommand(trimmed);
+              await getActiveHandle()?.writeInput(`${trimmed}\r`);
+            },
+            cancel: async () => {
+              getActiveHandle()?.focus();
+            },
+          });
+          return;
+        }
+      }
+      handleRecordCommand(trimmed);
+      await getActiveHandle()?.writeInput(`${trimmed}\r`);
+    },
+    [commandGuard, getActiveHandle, handleRecordCommand]
   );
 
   // 处理来自主界面 FilePane 的外部指令（例如「在终端进入目录」「将路径插入终端」）
@@ -918,13 +1212,42 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
     }
   };
 
-  /** 新增一个独立 Shell 标签页 */
+  /** 新增一个独立远程 SSH Shell 标签页 */
   const handleAddTab = () => {
     const n = tabSeqRef.current++;
     const id = `tab-${n}`;
     setTabs((prev) => [
       ...prev,
-      { id, title: `Shell ${n}`, status: "connecting", sizeLabel: "", reconnectSeq: 0 },
+      {
+        id,
+        kind: "ssh",
+        title: `Shell ${n}`,
+        status: "connecting",
+        sizeLabel: "",
+        reconnectSeq: 0,
+      },
+    ]);
+    setActiveTabId(id);
+  };
+
+  /** 新增一个原生本地终端标签页（PowerShell / Git Bash / CMD / Unix Shell） */
+  const handleAddLocalTab = (profileId?: string) => {
+    const opt =
+      localShells.find((s) => s.id === profileId) ??
+      localShells[0] ?? { id: "default", label: "本地" };
+    const n = localSeqRef.current++;
+    const id = `local-${n}`;
+    setTabs((prev) => [
+      ...prev,
+      {
+        id,
+        kind: "local",
+        localProfile: opt.id,
+        title: `本地 ${opt.label.split(" ")[0]}`,
+        status: "connecting",
+        sizeLabel: "",
+        reconnectSeq: 0,
+      },
     ]);
     setActiveTabId(id);
   };
@@ -1038,9 +1361,20 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
             className="icon-btn"
             style={{ width: 24, height: 24 }}
             onClick={handleAddTab}
-            title="新建同会话 SSH 终端标签"
+            title="新建同会话 SSH 远程终端标签"
           >
             <Plus size={13} />
+          </button>
+
+          <button
+            type="button"
+            className="btn btn-sm btn-ghost"
+            style={{ height: 22, padding: "0 6px", fontSize: 11 }}
+            onClick={() => handleAddLocalTab()}
+            title={`新建原生本地终端标签 (${localShells[0]?.label ?? "本地 Shell"})`}
+          >
+            <Laptop size={11} />
+            +本地
           </button>
         </div>
 
@@ -1051,16 +1385,40 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
             </span>
           )}
 
-          <button
-            type="button"
-            className="btn btn-sm btn-ghost"
-            onClick={() => void handleSyncCwd()}
-            disabled={activeTab?.status !== "connected"}
-            title={`在终端执行 cd 同步到远程目录：${cwd}`}
-          >
-            <FolderSync size={12} />
-            同步目录
-          </button>
+          {activeTab?.kind === "ssh" && (
+            <button
+              type="button"
+              className="btn btn-sm btn-ghost"
+              onClick={() => void handleSyncCwd()}
+              disabled={activeTab?.status !== "connected"}
+              title={`在终端执行 cd 同步到远程目录：${cwd}`}
+            >
+              <FolderSync size={12} />
+              同步目录
+            </button>
+          )}
+
+          {onRemoteCwdDetected && activeTab?.kind === "ssh" && (
+            <button
+              type="button"
+              className={`btn btn-sm ${followSftp ? "btn-primary" : "btn-ghost"}`}
+              style={{ height: 24, padding: "0 7px", fontSize: 11 }}
+              onClick={() => {
+                const next = !followSftp;
+                setFollowSftp(next);
+                onNotify?.(
+                  next
+                    ? "已开启终端跟随：远端 Shell 上报 OSC 7 目录变化时自动同步 SFTP 面板"
+                    : "已关闭终端跟随 SFTP 目录",
+                  "info"
+                );
+              }}
+              title="开启后当远端 Shell 切换目录并发送 OSC 7 时，SFTP 文件面板自动同步跳转"
+            >
+              <Link2 size={11} />
+              跟随
+            </button>
+          )}
 
           <button
             type="button"
@@ -1069,7 +1427,7 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
             title={`选择本地文件通过 SFTP 快速上传到 ${cwd}`}
           >
             <Upload size={12} />
-            上传文件
+            上传
           </button>
 
           <button
@@ -1080,6 +1438,49 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
             title="搜索终端日志 (Ctrl+Shift+F，已释放 Ctrl+F 给 nvim/zsh)"
           >
             <Search size={13} />
+          </button>
+
+          <button
+            type="button"
+            className={`icon-btn ${historyOpen ? "active" : ""}`}
+            style={{ width: 25, height: 25 }}
+            onClick={() => setHistoryOpen((v) => !v)}
+            title="命令历史模糊检索 (Ctrl+Shift+H，已自动脱敏过滤密码)"
+          >
+            <History size={13} />
+          </button>
+
+          <button
+            type="button"
+            className={`icon-btn ${highlightEnabled ? "active" : ""}`}
+            style={{ width: 25, height: 25 }}
+            onClick={() => setHighlightPanelOpen((v) => !v)}
+            title="终端关键词高亮规则（ERROR / WARN / OK / IPv4，自动跳过 nvim/tmux 全屏）"
+          >
+            <Highlighter size={13} />
+          </button>
+
+          <button
+            type="button"
+            className={`icon-btn ${commandGuard ? "active" : ""}`}
+            style={{ width: 25, height: 25 }}
+            onClick={() => {
+              const next = !commandGuard;
+              setCommandGuard(next);
+              onNotify?.(
+                next
+                  ? "高危命令防呆拦截已开启（拦截 rm -rf /、mkfs、reboot 等指令）"
+                  : "已临时关闭高危命令防呆拦截",
+                "info"
+              );
+            }}
+            title={
+              commandGuard
+                ? "高危命令防呆拦截：已开启（自动拦截 rm -rf /、mkfs、dd、reboot 等指令）"
+                : "高危命令防呆拦截：已关闭（点击开启）"
+            }
+          >
+            <ShieldAlert size={13} />
           </button>
 
           <button
@@ -1373,6 +1774,245 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
         </div>
       )}
 
+      {/* 高危命令防呆拦截警示条（Command Guard） */}
+      {pendingDanger && (
+        <div
+          className="term-search-bar"
+          style={{
+            background: "rgba(239, 68, 68, 0.14)",
+            borderBottom: "1px solid rgba(239, 68, 68, 0.5)",
+            justifyContent: "space-between",
+            flexWrap: "wrap",
+            gap: 8,
+          }}
+        >
+          <div style={{ fontSize: 12, flex: 1, minWidth: 220 }}>
+            <strong style={{ color: "var(--danger)" }}>高危命令拦截：</strong>
+            {pendingDanger.match.reason} — 待执行：
+            <code
+              style={{
+                marginLeft: 6,
+                fontFamily: "var(--font-mono)",
+                fontSize: 11.5,
+                color: "var(--danger)",
+              }}
+            >
+              {pendingDanger.cmd}
+            </code>
+          </div>
+          <div style={{ display: "inline-flex", gap: 6 }}>
+            <button
+              type="button"
+              className="btn btn-sm btn-primary"
+              onClick={async () => {
+                const fn = pendingDanger.cancel;
+                setPendingDanger(null);
+                await fn();
+                onNotify?.("已安全拦截高危命令并清空命令行", "info");
+              }}
+            >
+              安全拦截（清空行）
+            </button>
+            <button
+              type="button"
+              className="btn btn-sm btn-danger"
+              onClick={async () => {
+                const fn = pendingDanger.proceed;
+                setPendingDanger(null);
+                await fn();
+              }}
+            >
+              确认仍要执行
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* 命令历史模糊检索条（Ctrl+Shift+H） */}
+      {historyOpen && (
+        <div
+          className="term-search-bar"
+          style={{ flexDirection: "column", alignItems: "stretch", gap: 6, padding: "6px 10px" }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <History size={13} color="var(--accent)" />
+            <input
+              value={historyQuery}
+              onChange={(e) => setHistoryQuery(e.target.value)}
+              placeholder="模糊检索已执行命令历史（已自动脱敏过滤密码与密钥）..."
+              autoFocus
+            />
+            {cmdHistory.length > 0 && (
+              <button
+                type="button"
+                className="btn btn-sm btn-ghost"
+                onClick={() => setCmdHistory([])}
+                title="清空本地命令历史"
+              >
+                清空
+              </button>
+            )}
+            <button
+              type="button"
+              className="icon-btn"
+              style={{ width: 22, height: 22 }}
+              onClick={() => setHistoryOpen(false)}
+            >
+              <X size={13} />
+            </button>
+          </div>
+          <div
+            style={{
+              display: "flex",
+              flexWrap: "wrap",
+              gap: 5,
+              maxHeight: 92,
+              overflowY: "auto",
+            }}
+          >
+            {cmdHistory
+              .filter(
+                (c) =>
+                  !historyQuery.trim() ||
+                  c.toLowerCase().includes(historyQuery.trim().toLowerCase())
+              )
+              .slice(0, 24)
+              .map((cmd) => (
+                <span key={cmd} className="term-snippet-chip">
+                  <button
+                    type="button"
+                    className="term-snippet-run"
+                    onClick={() => {
+                      void getActiveHandle()?.writeInput(cmd);
+                      setHistoryOpen(false);
+                    }}
+                    title="点击仅填入终端命令行（不自动回车）"
+                  >
+                    {cmd.length > 42 ? `${cmd.slice(0, 42)}…` : cmd}
+                  </button>
+                  <button
+                    type="button"
+                    className="term-snippet-del"
+                    onClick={() => {
+                      setHistoryOpen(false);
+                      void runCommandWithGuard(cmd);
+                    }}
+                    title="立即执行该历史命令"
+                  >
+                    ↵
+                  </button>
+                </span>
+              ))}
+            {cmdHistory.length === 0 && (
+              <span style={{ fontSize: 11.5, color: "var(--text-muted)" }}>
+                暂无历史记录，在终端中执行命令后将自动采集（自动跳过含密码/Token 的命令）。
+              </span>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* 终端关键词高亮规则管理条 */}
+      {highlightPanelOpen && (
+        <div
+          className="term-search-bar"
+          style={{ flexWrap: "wrap", gap: 6, padding: "6px 10px" }}
+        >
+          <label
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 5,
+              fontSize: 11.5,
+              fontWeight: 600,
+              cursor: "pointer",
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={highlightEnabled}
+              onChange={(e) => setHighlightEnabled(e.target.checked)}
+            />
+            启用关键词高亮
+          </label>
+          {highlightRules.map((r) => (
+            <span key={r.id} className="term-snippet-chip">
+              <button
+                type="button"
+                className="term-snippet-run"
+                style={{ opacity: r.enabled ? 1 : 0.45 }}
+                onClick={() =>
+                  setHighlightRules((prev) =>
+                    prev.map((x) => (x.id === r.id ? { ...x, enabled: !x.enabled } : x))
+                  )
+                }
+                title={`正则: ${r.pattern}（点击切换启停）`}
+              >
+                {r.label}
+              </button>
+              {!r.id.startsWith("hl-") && (
+                <button
+                  type="button"
+                  className="term-snippet-del"
+                  onClick={() => setHighlightRules((prev) => prev.filter((x) => x.id !== r.id))}
+                >
+                  <X size={10} />
+                </button>
+              )}
+            </span>
+          ))}
+          <form
+            className="term-snippet-form"
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (!newRuleLabel.trim() || !newRulePattern.trim()) return;
+              try {
+                new RegExp(newRulePattern.trim());
+              } catch {
+                onNotify?.("正则表达式语法无效，请检查后重试", "error");
+                return;
+              }
+              setHighlightRules((prev) => [
+                ...prev,
+                {
+                  id: `u-hl-${Date.now()}`,
+                  label: newRuleLabel.trim(),
+                  pattern: newRulePattern.trim(),
+                  ansiCode: "\x1b[1;35m",
+                  enabled: true,
+                },
+              ]);
+              setNewRuleLabel("");
+              setNewRulePattern("");
+            }}
+          >
+            <input
+              value={newRuleLabel}
+              onChange={(e) => setNewRuleLabel(e.target.value)}
+              placeholder="规则名"
+              style={{ width: 68 }}
+            />
+            <input
+              value={newRulePattern}
+              onChange={(e) => setNewRulePattern(e.target.value)}
+              placeholder="关键词或正则（如 timeout|502）"
+              style={{ width: 170 }}
+            />
+            <button type="submit" className="btn btn-sm btn-primary">
+              添加
+            </button>
+          </form>
+          <button
+            type="button"
+            className="icon-btn"
+            style={{ width: 22, height: 22, marginLeft: "auto" }}
+            onClick={() => setHighlightPanelOpen(false)}
+          >
+            <X size={13} />
+          </button>
+        </div>
+      )}
+
       {/* 多行危险粘贴二次确认警示条（防范恶意网页隐藏换行命令立即执行） */}
       {pendingPaste !== null && (
         <div
@@ -1446,6 +2086,9 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
               if (el) tabHandlesRef.current.set(tab.id, el);
               else tabHandlesRef.current.delete(tab.id);
             }}
+            kind={tab.kind}
+            localProfile={tab.localProfile}
+            localCwd={localCwd}
             sessionId={sessionId}
             active={tab.id === activeTab?.id}
             reconnectSeq={tab.reconnectSeq}
@@ -1454,9 +2097,19 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
             themeKey={themeKey}
             copyOnSelect={copyOnSelect}
             vimMode={vimMode}
+            followSftp={followSftp}
+            commandGuard={commandGuard}
+            highlightEnabled={highlightEnabled}
+            highlightRules={highlightRules}
             onOpenSearch={handleOpenSearch}
+            onOpenHistory={() => setHistoryOpen((v) => !v)}
             onZoomDelta={handleZoom}
             onRequestPaste={handleRequestPaste}
+            onRemoteCwdDetected={onRemoteCwdDetected}
+            onDangerousCommand={(cmd, match, proceed, cancel) =>
+              setPendingDanger({ cmd, match, proceed, cancel })
+            }
+            onRecordCommand={handleRecordCommand}
             onNotify={onNotify}
             onStatusChange={(status, sizeLabel) =>
               setTabs((prev) =>
@@ -1480,8 +2133,8 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
               <button
                 type="button"
                 className="term-snippet-run"
-                onClick={() => void getActiveHandle()?.writeInput(`${item.cmd}\r`)}
-                title={`点击立即发送执行：${item.cmd}`}
+                onClick={() => void runCommandWithGuard(item.cmd)}
+                title={`点击立即发送执行（受高危防呆保护）：${item.cmd}`}
               >
                 {item.label}
               </button>

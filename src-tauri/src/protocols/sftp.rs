@@ -1114,6 +1114,73 @@ echo "DISKS_END"
 
         Ok(PtyHandle { cmd_tx, output_rx })
     }
+
+    async fn deploy_public_key(&self, public_key_line: &str) -> AppResult<bool> {
+        // 1. 严格校验公钥为单行合法 OpenSSH 公钥（杜绝任意内容或换行注入 authorized_keys）
+        let (canonical_pub, _, _) = crate::ssh_keys::validate_openssh_public_key(public_key_line)?;
+        let mut new_parts = canonical_pub.split_whitespace();
+        let new_type = new_parts.next().unwrap_or("");
+        let new_blob = new_parts.next().unwrap_or("");
+
+        // 2. 通过 SFTP canonicalize(".") 获取当前登录用户的远端主目录
+        let home_dir = self
+            .sftp
+            .canonicalize(".")
+            .await
+            .map_err(|e| AppError::Protocol(format!("解析远端用户主目录失败: {}", e)))?;
+        let ssh_dir = join_remote_path(&home_dir, ".ssh");
+        let auth_keys_path = join_remote_path(&ssh_dir, "authorized_keys");
+
+        // 3. 确保 ~/.ssh 目录存在并设置 0700 权限
+        let _ = self.sftp.create_dir(&ssh_dir).await;
+        let _ = self
+            .sftp
+            .set_metadata(
+                &ssh_dir,
+                FileAttributes {
+                    permissions: Some(0o700),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        // 4. 读取现有 authorized_keys 并按公钥主体幂等去重
+        let existing = match self.read_bytes(&auth_keys_path, 512 * 1024).await {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+            Err(_) => String::new(),
+        };
+        for line in existing.lines() {
+            let mut parts = line.split_whitespace();
+            if let (Some(t), Some(b)) = (parts.next(), parts.next()) {
+                if t == new_type && b == new_blob {
+                    return Ok(false);
+                }
+            }
+        }
+
+        // 5. 追加规范化公钥并设置 authorized_keys 权限为 0600
+        let mut updated = existing;
+        if !updated.is_empty() && !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        updated.push_str(&canonical_pub);
+        updated.push('\n');
+
+        self.write_bytes(&auth_keys_path, updated.as_bytes())
+            .await?;
+        let _ = self
+            .sftp
+            .set_metadata(
+                &auth_keys_path,
+                FileAttributes {
+                    permissions: Some(0o600),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        Ok(true)
+    }
 }
 
 /// 过滤 Linux/macOS 伪文件系统、内核引导分区与容器/系统临时挂载点，仅保留真实业务磁盘

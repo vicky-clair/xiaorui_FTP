@@ -34,6 +34,8 @@ import { HostKeyModal } from "./components/HostKeyModal";
 import { KnownHostsModal } from "./components/KnownHostsModal";
 import { SiteModal } from "./components/SiteModal";
 import { SiteSidebar } from "./components/SiteSidebar";
+import { SshConfigImportModal } from "./components/SshConfigImportModal";
+import { SshKeyManagerModal } from "./components/SshKeyManagerModal";
 import { TerminalDrawer, type TerminalCommandRequest } from "./components/TerminalDrawer";
 import { TopBar } from "./components/TopBar";
 import { TransferDrawer } from "./components/TransferDrawer";
@@ -122,6 +124,8 @@ export default function App() {
   } | null>(null);
   const [knownHostsOpen, setKnownHostsOpen] = useState(false);
   const [auditLogsOpen, setAuditLogsOpen] = useState(false);
+  const [sshKeysOpen, setSshKeysOpen] = useState(false);
+  const [sshConfigImportOpen, setSshConfigImportOpen] = useState(false);
   const [minimizeToTray, setMinimizeToTray] = useState(true);
   const [serverMetrics, setServerMetrics] = useState<ServerMetrics | null>(null);
 
@@ -863,6 +867,8 @@ export default function App() {
       Boolean(dialog) ||
       knownHostsOpen ||
       auditLogsOpen ||
+      sshKeysOpen ||
+      sshConfigImportOpen ||
       Boolean(hostKeyPrompt);
     const onKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k" && !anyModalOpen) {
@@ -883,7 +889,18 @@ export default function App() {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [auditLogsOpen, dialog, editor, hostKeyPrompt, knownHostsOpen, loadLocalDir, loadRemoteDir, siteModal.open]);
+  }, [
+    auditLogsOpen,
+    dialog,
+    editor,
+    hostKeyPrompt,
+    knownHostsOpen,
+    loadLocalDir,
+    loadRemoteDir,
+    siteModal.open,
+    sshConfigImportOpen,
+    sshKeysOpen,
+  ]);
 
   // 拖拽双栏分割条实时调整左右宽度
   const handleStartResize = (e: React.MouseEvent) => {
@@ -950,6 +967,8 @@ export default function App() {
             onDelete={handleDeleteSite}
             onExport={handleExportSites}
             onImport={handleImportSites}
+            onImportSshConfig={() => setSshConfigImportOpen(true)}
+            onOpenSshKeys={() => setSshKeysOpen(true)}
             onOpenKnownHosts={() => setKnownHostsOpen(true)}
             onOpenAuditLogs={() => setAuditLogsOpen(true)}
           />
@@ -1187,8 +1206,18 @@ export default function App() {
               sessionId={activeSession.sessionId}
               sessionName={activeSession.name}
               cwd={remotePath}
+              localCwd={localPath}
               maximized={terminalMaximized}
               pendingCommand={terminalCommand}
+              onRemoteCwdDetected={(detectedPath) => {
+                if (
+                  activeSessionIdRef.current === activeSession.sessionId &&
+                  detectedPath &&
+                  detectedPath !== remotePathRef.current
+                ) {
+                  void loadRemoteDir(activeSession.sessionId, detectedPath);
+                }
+              }}
               onToggleMaximize={() => setTerminalMaximized((v) => !v)}
               onPopOut={() => void handlePopOutTerminal()}
               onNotify={pushToast}
@@ -1402,6 +1431,30 @@ export default function App() {
       {auditLogsOpen && (
         <AuditLogModal
           onClose={() => setAuditLogsOpen(false)}
+          onNotify={pushToast}
+        />
+      )}
+
+      {sshKeysOpen && (
+        <SshKeyManagerModal
+          activeSftpSession={activeSession?.supportsShell ? activeSession : null}
+          onClose={() => setSshKeysOpen(false)}
+          onNotify={pushToast}
+        />
+      )}
+
+      {sshConfigImportOpen && (
+        <SshConfigImportModal
+          onImported={async (count) => {
+            setSites(await api.listSites());
+            pushToast(
+              count > 0
+                ? `已从 ~/.ssh/config 导入 ${count} 个新站点至「SSH Config」分组`
+                : "所选主机均已存在于站点列表中，无需重复导入",
+              "success"
+            );
+          }}
+          onClose={() => setSshConfigImportOpen(false)}
           onNotify={pushToast}
         />
       )}

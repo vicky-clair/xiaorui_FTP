@@ -8,9 +8,12 @@ mod commands;
 mod error;
 mod known_hosts;
 mod local_fs;
+mod local_pty;
 mod models;
 mod protocols;
 mod security;
+mod ssh_config;
+mod ssh_keys;
 mod storage;
 mod transfer;
 
@@ -118,6 +121,11 @@ pub fn run() {
             commands::trust_known_host,
             commands::list_audit_logs,
             commands::export_audit_logs,
+            commands::list_ssh_keys,
+            commands::generate_ssh_key,
+            commands::deploy_ssh_public_key,
+            commands::discover_ssh_config_hosts,
+            commands::import_ssh_config_hosts,
             commands::get_app_settings,
             commands::set_minimize_to_tray,
             // 会话连接与生命周期管理
@@ -148,8 +156,10 @@ pub fn run() {
             commands::list_transfers,
             commands::cancel_transfer,
             commands::clear_finished_transfers,
-            // 交互式 SSH PTY、独立终端窗口与服务器硬件监测
+            // 交互式 SSH PTY、本地 PTY、独立终端窗口与服务器硬件监测
             commands::remote_server_metrics,
+            commands::list_local_shells,
+            commands::local_pty_open,
             commands::ssh_pty_open,
             commands::ssh_pty_write,
             commands::ssh_pty_resize,

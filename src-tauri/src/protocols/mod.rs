@@ -105,6 +105,14 @@ pub trait RemoteFs: Send + Sync {
             "仅 SFTP/SSH 会话支持交互式伪终端 (PTY)".into(),
         ))
     }
+
+    /// 通过纯 SFTP 通道将合法 OpenSSH 公钥部署到远端 `~/.ssh/authorized_keys`（幂等去重，零 Shell 注入风险）。
+    /// 返回 `Ok(true)` 表示已新增写入，`Ok(false)` 表示该公钥已存在无需重复部署。
+    async fn deploy_public_key(&self, _public_key_line: &str) -> AppResult<bool> {
+        Err(AppError::Unsupported(
+            "仅 SFTP/SSH 会话支持一键部署 SSH 公钥".into(),
+        ))
+    }
 }
 
 /// 根据站点配置与密钥分发并建立对应的远程协议连接
