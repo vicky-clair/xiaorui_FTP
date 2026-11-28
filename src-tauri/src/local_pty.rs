@@ -76,7 +76,7 @@ pub struct LocalTerminalDefaults {
     pub theme: Option<TerminalColorScheme>,
 }
 
-/// 去除 Windows Terminal `settings.json` 中合法的 JSONC 注释（`//`、`/* */`）与尾逗号
+/// 去除 Windows Terminal `settings.json` 中合法的 JSONC 注释（`//`、`/* */`）与尾逗号（完整保留 UTF-8 中文字符串）
 fn strip_jsonc(input: &str) -> String {
     let bytes = input.as_bytes();
     let len = bytes.len();
@@ -88,15 +88,24 @@ fn strip_jsonc(input: &str) -> String {
     while i < len {
         let ch = bytes[i];
         if in_string {
-            out.push(ch as char);
-            if escaped {
+            if ch < 0x80 {
+                out.push(ch as char);
+                if escaped {
+                    escaped = false;
+                } else if ch == b'\\' {
+                    escaped = true;
+                } else if ch == b'"' {
+                    in_string = false;
+                }
+                i += 1;
+            } else if let Some(c) = input[i..].chars().next() {
+                // 非 ASCII UTF-8 多字节字符必须按 char 写入，避免把中文路径/名称拆成乱码
+                out.push(c);
                 escaped = false;
-            } else if ch == b'\\' {
-                escaped = true;
-            } else if ch == b'"' {
-                in_string = false;
+                i += c.len_utf8();
+            } else {
+                break;
             }
-            i += 1;
             continue;
         }
 
@@ -115,15 +124,11 @@ fn strip_jsonc(input: &str) -> String {
                 i += 1;
             }
             i = (i + 2).min(len);
+        } else if let Some(c) = input[i..].chars().next() {
+            out.push(c);
+            i += c.len_utf8();
         } else {
-            // 非 ASCII UTF-8 多字节字符需按 char 切片原样保留，防止破坏中文配置名
-            let rest = &input[i..];
-            if let Some(c) = rest.chars().next() {
-                out.push(c);
-                i += c.len_utf8();
-            } else {
-                break;
-            }
+            break;
         }
     }
 
@@ -388,10 +393,12 @@ pub fn parse_windows_terminal_settings_json(raw: &str) -> Option<LocalTerminalDe
             .and_then(|o| o.get("font"))
             .and_then(|f| f.get("size"))
             .or_else(|| obj.and_then(|o| o.get("fontSize")))?;
-        let n = raw_num
-            .as_u64()
-            .or_else(|| raw_num.as_f64().map(|f| f.round() as u64))?;
-        Some((n as u32).clamp(10, 24))
+        // Windows Terminal 字号单位为 pt，xterm.js 使用 CSS px（1pt ≈ 4/3 px），按比例换算以保持视觉一致
+        let pt = raw_num
+            .as_f64()
+            .or_else(|| raw_num.as_u64().map(|n| n as f64))?;
+        let px = (pt * 4.0 / 3.0).round() as u32;
+        Some(px.clamp(11, 24))
     };
 
     let font_family =
@@ -491,13 +498,13 @@ fn read_windows_terminal_defaults() -> Option<LocalTerminalDefaults> {
             if let Some(mut parsed) = parse_windows_terminal_settings_json(&raw) {
                 // 若配置的默认 Shell 在本机暂不可用，则安全回退到已安装的默认 PowerShell
                 let available = match parsed.profile_id.as_str() {
-                    "pwsh" => which_in_path("pwsh.exe"),
+                    "pwsh" => find_pwsh_exe().is_some(),
                     "gitbash" => find_git_bash().is_some(),
-                    "wsl" => which_in_path("wsl.exe"),
+                    "wsl" => find_in_path("wsl.exe").is_some(),
                     _ => true,
                 };
                 if !available {
-                    if which_in_path("pwsh.exe") {
+                    if find_pwsh_exe().is_some() {
                         parsed.profile_id = "pwsh".into();
                         parsed.profile_label = "PowerShell 7".into();
                     } else {
@@ -519,7 +526,7 @@ pub fn get_local_terminal_defaults() -> LocalTerminalDefaults {
         if let Some(wt) = read_windows_terminal_defaults() {
             return wt;
         }
-        let (profile_id, profile_label) = if which_in_path("pwsh.exe") {
+        let (profile_id, profile_label) = if find_pwsh_exe().is_some() {
             ("pwsh", "PowerShell 7")
         } else {
             ("powershell", "Windows PowerShell")
@@ -529,7 +536,7 @@ pub fn get_local_terminal_defaults() -> LocalTerminalDefaults {
             profile_label: profile_label.into(),
             source: "Windows 系统默认配置".into(),
             font_family: Some("Cascadia Mono".into()),
-            font_size: Some(13),
+            font_size: Some(14),
             cursor_style: Some("bar".into()),
             scheme_name: Some("Campbell".into()),
             theme: builtin_wt_scheme("Campbell"),
@@ -560,7 +567,7 @@ pub fn list_local_shells() -> Vec<LocalShellOption> {
             id: "default".into(),
             label: format!("{} (默认)", defaults.profile_label),
         }];
-        if which_in_path("pwsh.exe") {
+        if find_pwsh_exe().is_some() {
             shells.push(LocalShellOption {
                 id: "pwsh".into(),
                 label: "PowerShell 7".into(),
@@ -576,7 +583,7 @@ pub fn list_local_shells() -> Vec<LocalShellOption> {
                 label: "Git Bash".into(),
             });
         }
-        if which_in_path("wsl.exe") {
+        if find_in_path("wsl.exe").is_some() {
             shells.push(LocalShellOption {
                 id: "wsl".into(),
                 label: "WSL".into(),
@@ -611,26 +618,64 @@ pub fn list_local_shells() -> Vec<LocalShellOption> {
     }
 }
 
+/// 在 PATH 中查找可执行文件（优先真实文件，同时兼容 WindowsApps MSIX App Execution Alias 重解析点）
 #[cfg(windows)]
-fn which_in_path(exe: &str) -> bool {
-    let Some(paths) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&paths).any(|dir| dir.join(exe).is_file())
-}
-
-#[cfg(windows)]
-fn find_git_bash() -> Option<String> {
-    let candidates = [
-        r"C:\Program Files\Git\bin\bash.exe",
-        r"C:\Program Files (x86)\Git\bin\bash.exe",
-    ];
-    for p in candidates {
-        if Path::new(p).is_file() {
-            return Some(p.to_string());
+fn find_in_path(exe: &str) -> Option<std::path::PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    let mut alias_fallback: Option<std::path::PathBuf> = None;
+    for dir in std::env::split_paths(&paths) {
+        let candidate = dir.join(exe);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if alias_fallback.is_none() && std::fs::symlink_metadata(&candidate).is_ok() {
+            alias_fallback = Some(candidate);
         }
     }
-    None
+    alias_fallback
+}
+
+/// 探测本机 PowerShell 7 (`pwsh.exe`)，覆盖 PATH、MSI、Scoop 与 Microsoft Store (WindowsApps)
+#[cfg(windows)]
+fn find_pwsh_exe() -> Option<std::path::PathBuf> {
+    if let Some(p) = find_in_path("pwsh.exe") {
+        return Some(p);
+    }
+    let mut candidates = vec![
+        std::path::PathBuf::from(r"C:\Program Files\PowerShell\7\pwsh.exe"),
+        std::path::PathBuf::from(r"C:\Program Files\PowerShell\7-preview\pwsh.exe"),
+    ];
+    if let Some(home) = dirs::home_dir() {
+        candidates.push(home.join(r"scoop\apps\pwsh\current\pwsh.exe"));
+        candidates.push(home.join(r"scoop\shims\pwsh.exe"));
+    }
+    if let Some(local_app) = std::env::var_os("LOCALAPPDATA") {
+        candidates.push(Path::new(&local_app).join(r"Microsoft\WindowsApps\pwsh.exe"));
+    }
+    candidates
+        .into_iter()
+        .find(|p| p.is_file() || std::fs::symlink_metadata(p).is_ok())
+}
+
+/// 探测本机 Git Bash (`bash.exe`)，覆盖标准安装路径、Scoop 及 PATH 中的 git 相对目录
+#[cfg(windows)]
+fn find_git_bash() -> Option<std::path::PathBuf> {
+    let mut candidates = vec![
+        std::path::PathBuf::from(r"C:\Program Files\Git\bin\bash.exe"),
+        std::path::PathBuf::from(r"C:\Program Files (x86)\Git\bin\bash.exe"),
+    ];
+    if let Some(home) = dirs::home_dir() {
+        candidates.push(home.join(r"scoop\apps\git\current\bin\bash.exe"));
+    }
+    if let Some(local_app) = std::env::var_os("LOCALAPPDATA") {
+        candidates.push(Path::new(&local_app).join(r"Programs\Git\bin\bash.exe"));
+    }
+    if let Some(git_exe) = find_in_path("git.exe") {
+        if let Some(git_root) = git_exe.parent().and_then(|p| p.parent()) {
+            candidates.push(git_root.join(r"bin\bash.exe"));
+        }
+    }
+    candidates.into_iter().find(|p| p.is_file())
 }
 
 /// 按严格白名单将前端传入的 `profile` 映射为安全的本地 Shell 启动命令
@@ -645,18 +690,20 @@ fn build_shell_command(profile: &str, cwd: Option<&str>) -> AppResult<CommandBui
     #[cfg(windows)]
     let mut cmd = match effective_profile.as_str() {
         "pwsh" => {
-            if !which_in_path("pwsh.exe") {
-                return Err(AppError::InvalidInput(
-                    "本机未检测到 PowerShell 7 (pwsh.exe)".into(),
-                ));
-            }
-            let mut c = CommandBuilder::new("pwsh.exe");
+            let pwsh = find_pwsh_exe().ok_or_else(|| {
+                AppError::InvalidInput("本机未检测到 PowerShell 7 (pwsh.exe)".into())
+            })?;
+            let mut c = CommandBuilder::new(pwsh);
             c.arg("-NoLogo");
             c
         }
         "powershell" | "default" | "" => {
             let mut c = CommandBuilder::new("powershell.exe");
             c.arg("-NoLogo");
+            c.arg("-NoExit");
+            // 统一 Windows PowerShell 5.1 交互控制台输入/输出为 UTF-8，防止中文在 xterm.js 中乱码
+            c.arg("-Command");
+            c.arg("[Console]::InputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $null = chcp 65001");
             c
         }
         "gitbash" => {
@@ -668,12 +715,17 @@ fn build_shell_command(profile: &str, cwd: Option<&str>) -> AppResult<CommandBui
             c
         }
         "wsl" => {
-            if !which_in_path("wsl.exe") {
-                return Err(AppError::InvalidInput("本机未检测到 WSL (wsl.exe)".into()));
-            }
-            CommandBuilder::new("wsl.exe")
+            let wsl = find_in_path("wsl.exe")
+                .ok_or_else(|| AppError::InvalidInput("本机未检测到 WSL (wsl.exe)".into()))?;
+            CommandBuilder::new(wsl)
         }
-        "cmd" => CommandBuilder::new("cmd.exe"),
+        "cmd" => {
+            let mut c = CommandBuilder::new("cmd.exe");
+            // 自动切至 UTF-8 代码页（65001），消除 Windows 中文 CMD 目录与输出在 xterm.js 中的 GBK 乱码
+            c.arg("/K");
+            c.arg("chcp 65001>nul");
+            c
+        }
         other => {
             return Err(AppError::SecurityPolicy(format!(
                 "不允许启动非白名单本地 Shell 预设 '{}'",
@@ -720,6 +772,8 @@ fn build_shell_command(profile: &str, cwd: Option<&str>) -> AppResult<CommandBui
 
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
+    cmd.env("PYTHONUTF8", "1");
+    cmd.env("LANG", "zh_CN.UTF-8");
 
     if let Some(dir) = cwd.filter(|d| !d.trim().is_empty()) {
         if Path::new(dir).is_dir() {
@@ -834,11 +888,12 @@ mod tests {
     #[test]
     fn test_parse_windows_terminal_jsonc_defaults() {
         let sample = r##"{
-            // Windows Terminal 默认配置示例（含 JSONC 注释与尾逗号）
+            // Windows Terminal 默认配置示例（含 JSONC 注释、中文路径与尾逗号）
             "defaultProfile": "{574e775e-4f2a-5b96-ac1e-a2962a402336}",
             "profiles": {
                 "defaults": {
-                    "font": { "face": "CaskaydiaCove Nerd Font", "size": 14 },
+                    "backgroundImage": "%USERPROFILE%\\Pictures\\壁纸文件\\demo.jpg",
+                    "font": { "face": "JetBrainsMono NFM, Cascadia Code", "size": 11 },
                     "cursorShape": "filledBox",
                     "colorScheme": "Custom Dark",
                 },
@@ -871,9 +926,10 @@ mod tests {
         assert_eq!(parsed.profile_label, "PowerShell 7");
         assert_eq!(
             parsed.font_family.as_deref(),
-            Some("CaskaydiaCove Nerd Font")
+            Some("JetBrainsMono NFM, Cascadia Code")
         );
-        assert_eq!(parsed.font_size, Some(14));
+        // 11pt ≈ 15px
+        assert_eq!(parsed.font_size, Some(15));
         assert_eq!(parsed.cursor_style.as_deref(), Some("block"));
         let theme = parsed.theme.expect("resolved theme");
         assert_eq!(theme.background, "#10141C");

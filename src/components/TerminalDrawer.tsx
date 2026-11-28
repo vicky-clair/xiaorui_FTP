@@ -364,13 +364,17 @@ function toXtermTheme(scheme: TerminalColorScheme): ITheme {
   };
 }
 
-/** 构造带回退等宽栈的字体族，确保 Windows 默认字体与中文字符同时完美渲染 */
+/** 构造带回退等宽栈的字体族，正确拆解 Windows Terminal 逗号分隔的多字体列表并补充中文等宽回退 */
 function buildFontStack(primaryFace?: string | null): string {
-  const clean = primaryFace?.replace(/["']/g, "").trim();
-  if (!clean) {
+  const faces = (primaryFace ?? "")
+    .split(",")
+    .map((s) => s.replace(/["']/g, "").trim())
+    .filter(Boolean);
+  if (faces.length === 0) {
     return TERMINAL_FONTS.auto_nf.family;
   }
-  return `"${clean}", "Cascadia Mono", Consolas, "PingFang SC", "Microsoft YaHei Mono", monospace`;
+  const quoted = faces.map((f) => `"${f}"`).join(", ");
+  return `${quoted}, "Cascadia Mono", Consolas, "PingFang SC", "Microsoft YaHei Mono", monospace`;
 }
 
 /** 单个独立 PTY 标签页实例（支持远端 SSH PTY 与原生本地 PTY，隐藏时保持会话活跃不中断） */
