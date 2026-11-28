@@ -36,6 +36,7 @@ import {
   RotateCw,
   Search,
   ShieldAlert,
+  SlidersHorizontal,
   Terminal as TermIcon,
   Trash2,
   Upload,
@@ -1246,6 +1247,26 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
   const [newLabel, setNewLabel] = useState("");
   const [newCmd, setNewCmd] = useState("");
   const [pendingPaste, setPendingPaste] = useState<string | null>(null);
+  const [settingsMenuOpen, setSettingsMenuOpen] = useState(false);
+  const settingsMenuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!settingsMenuOpen) return;
+    const onDocDown = (ev: MouseEvent) => {
+      if (settingsMenuRef.current && !settingsMenuRef.current.contains(ev.target as Node)) {
+        setSettingsMenuOpen(false);
+      }
+    };
+    const onKey = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape") setSettingsMenuOpen(false);
+    };
+    window.addEventListener("mousedown", onDocDown);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("mousedown", onDocDown);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [settingsMenuOpen]);
 
   useEffect(() => {
     if (!isLocalOnly) localStorage.setItem(STORAGE_FONT, String(fontSize));
@@ -1606,12 +1627,12 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
             <>
               <button
                 type="button"
-                className="icon-btn"
-                style={{ width: 24, height: 24 }}
+                className="btn-tool btn-tool-xs"
                 onClick={() => handleAddLocalTab("default")}
                 title={`新建本地默认终端标签 (${localDefaults?.profileLabel ?? "Windows 默认"})`}
               >
-                <Plus size={13} />
+                <Plus size={12} />
+                新建
               </button>
               {localShells.length > 1 && (
                 <select
@@ -1624,7 +1645,7 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
                   style={{ maxWidth: 112 }}
                 >
                   <option value="" disabled>
-                    + 切换 Shell...
+                    切换 Shell...
                   </option>
                   {localShells.map((sh) => (
                     <option key={sh.id} value={sh.id}>
@@ -1635,42 +1656,23 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
               )}
             </>
           ) : (
-            <>
-              <button
-                type="button"
-                className="icon-btn"
-                style={{ width: 24, height: 24 }}
-                onClick={handleAddTab}
-                title="新建同会话 SSH 远程终端标签"
-              >
-                <Plus size={13} />
-              </button>
-
-              <button
-                type="button"
-                className="btn btn-sm btn-ghost"
-                style={{ height: 22, padding: "0 6px", fontSize: 11 }}
-                onClick={() => handleAddLocalTab("default")}
-                title={`新建原生本地终端标签 (${localDefaults?.profileLabel ?? "Windows 默认"})`}
-              >
-                <Laptop size={11} />
-                +本地
-              </button>
-            </>
+            <button
+              type="button"
+              className="btn-tool btn-tool-xs"
+              onClick={handleAddTab}
+              title="新建同会话 SSH 远程终端标签"
+            >
+              <Plus size={12} />
+              新建
+            </button>
           )}
         </div>
 
         <div className="term-actions">
-          {activeTab?.sizeLabel && (
-            <span className="drawer-pill tabular-nums" title="当前伪终端行列尺寸">
-              {activeTab.sizeLabel}
-            </span>
-          )}
-
           {activeTab?.kind === "ssh" && (
             <button
               type="button"
-              className="btn btn-sm btn-ghost"
+              className="btn-tool btn-tool-xs"
               onClick={() => void handleSyncCwd()}
               disabled={activeTab?.status !== "connected"}
               title={`在终端执行 cd 同步到远程目录：${cwd}`}
@@ -1680,32 +1682,10 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
             </button>
           )}
 
-          {onRemoteCwdDetected && activeTab?.kind === "ssh" && (
+          {standalone && !isLocalOnly && (
             <button
               type="button"
-              className={`btn btn-sm ${followSftp ? "btn-primary" : "btn-ghost"}`}
-              style={{ height: 24, padding: "0 7px", fontSize: 11 }}
-              onClick={() => {
-                const next = !followSftp;
-                setFollowSftp(next);
-                onNotify?.(
-                  next
-                    ? "已开启终端跟随：远端 Shell 上报 OSC 7 目录变化时自动同步 SFTP 面板"
-                    : "已关闭终端跟随 SFTP 目录",
-                  "info"
-                );
-              }}
-              title="开启后当远端 Shell 切换目录并发送 OSC 7 时，SFTP 文件面板自动同步跳转"
-            >
-              <Link2 size={11} />
-              跟随
-            </button>
-          )}
-
-          {!isLocalOnly && (
-            <button
-              type="button"
-              className="btn btn-sm btn-ghost"
+              className="btn-tool btn-tool-xs"
               onClick={() => void handleUploadLocalFiles()}
               title={`选择本地文件通过 SFTP 快速上传到 ${cwd}`}
             >
@@ -1716,84 +1696,27 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
 
           <button
             type="button"
-            className={`icon-btn ${searchOpen ? "active" : ""}`}
-            style={{ width: 25, height: 25 }}
+            className={`btn-tool btn-tool-xs ${searchOpen ? "active" : ""}`}
             onClick={() => (searchOpen ? setSearchOpen(false) : handleOpenSearch())}
-            title="搜索终端日志 (Ctrl+Shift+F，已释放 Ctrl+F 给 nvim/zsh)"
+            title="搜索终端日志 (Ctrl+Shift+F)"
           >
-            <Search size={13} />
+            <Search size={12} />
+            搜索
           </button>
 
           <button
             type="button"
-            className={`icon-btn ${historyOpen ? "active" : ""}`}
-            style={{ width: 25, height: 25 }}
+            className={`btn-tool btn-tool-xs ${historyOpen ? "active" : ""}`}
             onClick={() => setHistoryOpen((v) => !v)}
-            title="命令历史模糊检索 (Ctrl+Shift+H，已自动脱敏过滤密码)"
+            title="命令历史模糊检索 (Ctrl+Shift+H，已自动跳过密码)"
           >
-            <History size={13} />
+            <History size={12} />
+            历史
           </button>
 
           <button
             type="button"
-            className={`icon-btn ${highlightEnabled ? "active" : ""}`}
-            style={{ width: 25, height: 25 }}
-            onClick={() => setHighlightPanelOpen((v) => !v)}
-            title="终端关键词高亮规则（ERROR / WARN / OK / IPv4，自动跳过 nvim/tmux 全屏）"
-          >
-            <Highlighter size={13} />
-          </button>
-
-          <button
-            type="button"
-            className={`icon-btn ${commandGuard ? "active" : ""}`}
-            style={{ width: 25, height: 25 }}
-            onClick={() => {
-              const next = !commandGuard;
-              setCommandGuard(next);
-              onNotify?.(
-                next
-                  ? "高危命令防呆拦截已开启（拦截 rm -rf /、mkfs、reboot 等指令）"
-                  : "已临时关闭高危命令防呆拦截",
-                "info"
-              );
-            }}
-            title={
-              commandGuard
-                ? "高危命令防呆拦截：已开启（自动拦截 rm -rf /、mkfs、dd、reboot 等指令）"
-                : "高危命令防呆拦截：已关闭（点击开启）"
-            }
-          >
-            <ShieldAlert size={13} />
-          </button>
-
-          <button
-            type="button"
-            className={`btn btn-sm ${vimMode ? "btn-primary" : "btn-ghost"}`}
-            style={{ height: 24, padding: "0 7px", fontSize: 11 }}
-            onClick={() => {
-              const next = !vimMode;
-              setVimMode(next);
-              onNotify?.(
-                next
-                  ? "已开启 Vim/tmux 键位模式：Ctrl+C/V 透传给远端，复制粘贴请用 Ctrl+Shift+C/V 或右键"
-                  : "已切回标准模式：支持 Ctrl+C/V、Ctrl+Shift+C/V 与右键复制粘贴",
-                "info"
-              );
-            }}
-            title={
-              vimMode
-                ? "Vim/tmux 键位模式已开启：Ctrl+C/V 透传给 nvim/tmux（复制粘贴用 Ctrl+Shift+C/V 或右键）"
-                : "点击开启 Vim/tmux 键位模式：将 Ctrl+C/V 完整透传给 nvim 列块模式"
-            }
-          >
-            Vim
-          </button>
-
-          <button
-            type="button"
-            className="icon-btn"
-            style={{ width: 25, height: 25 }}
+            className="btn-tool btn-tool-xs"
             onClick={() => {
               void readClipboardText().then((txt) => {
                 if (txt) {
@@ -1805,103 +1728,23 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
             }}
             title="从系统剪贴板粘贴到当前终端 (Ctrl+V / Ctrl+Shift+V / 右键)"
           >
-            <ClipboardPaste size={13} />
+            <ClipboardPaste size={12} />
+            粘贴
           </button>
 
           <button
             type="button"
-            className={`icon-btn ${copyOnSelect ? "active" : ""}`}
-            style={{ width: 25, height: 25 }}
-            onClick={() => setCopyOnSelect((v) => !v)}
-            title={
-              copyOnSelect
-                ? "选中即复制：已开启（支持 Ctrl+C/V、Ctrl+Shift+C/V、右键粘贴）"
-                : "选中即复制：已关闭（支持 Ctrl+C/V、Ctrl+Shift+C/V、右键粘贴）"
-            }
-          >
-            <Copy size={13} />
-          </button>
-
-          <div className="term-zoom-group" title="调整终端字号 (Ctrl+- / Ctrl+= / Ctrl+0)">
-            <button type="button" onClick={() => handleZoom(-1)}>
-              A-
-            </button>
-            <span className="tabular-nums">{fontSize}</span>
-            <button type="button" onClick={() => handleZoom(1)}>
-              A+
-            </button>
-          </div>
-
-          <select
-            className="term-theme-select"
-            value={fontKey}
-            onChange={(e) => setFontKey(e.target.value as FontKey)}
-            title="切换终端字体（支持 Windows 默认终端字体 / Nerd Font / Powerlevel10k）"
-          >
-            <option value="win_default">
-              {localDefaults?.fontFamily
-                ? `Windows 默认 (${localDefaults.fontFamily})`
-                : "Windows 默认字体"}
-            </option>
-            {(Object.keys(TERMINAL_FONTS) as Exclude<FontKey, "win_default">[]).map((k) => (
-              <option key={k} value={k}>
-                {TERMINAL_FONTS[k].label}
-              </option>
-            ))}
-          </select>
-
-          <select
-            className="term-theme-select"
-            value={themeKey}
-            onChange={(e) => setThemeKey(e.target.value as ThemeKey)}
-            title="切换终端配色主题（支持同步 Windows Terminal 默认配色）"
-          >
-            <option value="win_default">
-              {localDefaults?.schemeName
-                ? `Windows 默认 (${localDefaults.schemeName})`
-                : "Windows 默认配色"}
-            </option>
-            {(Object.keys(TERMINAL_THEMES) as Exclude<ThemeKey, "win_default">[]).map((k) => (
-              <option key={k} value={k}>
-                {TERMINAL_THEMES[k].label}
-              </option>
-            ))}
-          </select>
-
-          <button
-            type="button"
-            className={`icon-btn ${snippetsOpen ? "active" : ""}`}
-            style={{ width: 25, height: 25 }}
-            onClick={() => setSnippetsOpen((v) => !v)}
-            title="显示/隐藏 Xshell 快捷命令栏"
-          >
-            <Zap size={13} />
-          </button>
-
-          <button
-            type="button"
-            className="icon-btn"
-            style={{ width: 25, height: 25 }}
-            onClick={() => void handleSaveLog()}
-            title="导出当前终端日志 (.log)"
-          >
-            <FileDown size={13} />
-          </button>
-
-          <button
-            type="button"
-            className="icon-btn"
-            style={{ width: 25, height: 25 }}
+            className="btn-tool btn-tool-xs"
             onClick={() => getActiveHandle()?.clear()}
-            title="清屏"
+            title="清空当前终端屏幕"
           >
-            <Trash2 size={13} />
+            <Trash2 size={12} />
+            清屏
           </button>
 
           <button
             type="button"
-            className="icon-btn"
-            style={{ width: 25, height: 25 }}
+            className="btn-tool btn-tool-xs"
             onClick={() =>
               setTabs((prev) =>
                 prev.map((t) =>
@@ -1911,15 +1754,228 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
                 )
               )
             }
-            title="重新启动当前标签的远程默认 Shell"
+            title="重新启动当前标签的 Shell 会话"
           >
-            <RotateCw size={13} />
+            <RotateCw size={12} />
+            重连
           </button>
+
+          {/* 终端外观与进阶功能统一收纳在设置浮层中，避免工具栏堆砌大量孤立小图标 */}
+          <div className="term-popover-anchor" ref={settingsMenuRef}>
+            <button
+              type="button"
+              className={`btn-tool btn-tool-xs ${settingsMenuOpen ? "active" : ""}`}
+              onClick={() => setSettingsMenuOpen((v) => !v)}
+              title="调整终端字体、配色、高亮、Vim 键位与安全防护"
+            >
+              <SlidersHorizontal size={12} />
+              设置
+              <ChevronDown size={11} />
+            </button>
+
+            {settingsMenuOpen && (
+              <div className="term-settings-popover">
+                <div className="term-popover-section-title">
+                  外观显示{activeTab?.sizeLabel ? ` · ${activeTab.sizeLabel}` : ""}
+                </div>
+
+                <div className="term-popover-row">
+                  <span>字体大小</span>
+                  <div className="term-zoom-group" title="调整终端字号 (Ctrl+- / Ctrl+= / Ctrl+0)">
+                    <button type="button" onClick={() => handleZoom(-1)}>
+                      A-
+                    </button>
+                    <span className="tabular-nums">{fontSize}px</span>
+                    <button type="button" onClick={() => handleZoom(1)}>
+                      A+
+                    </button>
+                  </div>
+                </div>
+
+                <div className="term-popover-row">
+                  <span>终端字体</span>
+                  <select
+                    className="term-theme-select"
+                    value={fontKey}
+                    onChange={(e) => setFontKey(e.target.value as FontKey)}
+                  >
+                    <option value="win_default">
+                      {localDefaults?.fontFamily
+                        ? `Windows 默认 (${localDefaults.fontFamily.split(",")[0]})`
+                        : "Windows 默认字体"}
+                    </option>
+                    {(Object.keys(TERMINAL_FONTS) as Exclude<FontKey, "win_default">[]).map((k) => (
+                      <option key={k} value={k}>
+                        {TERMINAL_FONTS[k].label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="term-popover-row">
+                  <span>配色主题</span>
+                  <select
+                    className="term-theme-select"
+                    value={themeKey}
+                    onChange={(e) => setThemeKey(e.target.value as ThemeKey)}
+                  >
+                    <option value="win_default">
+                      {localDefaults?.schemeName
+                        ? `Windows 默认 (${localDefaults.schemeName})`
+                        : "Windows 默认配色"}
+                    </option>
+                    {(Object.keys(TERMINAL_THEMES) as Exclude<ThemeKey, "win_default">[]).map(
+                      (k) => (
+                        <option key={k} value={k}>
+                          {TERMINAL_THEMES[k].label}
+                        </option>
+                      )
+                    )}
+                  </select>
+                </div>
+
+                <div className="term-popover-sep" />
+                <div className="term-popover-section-title">交互与安全防护</div>
+
+                <button
+                  type="button"
+                  className="term-popover-toggle"
+                  onClick={() => setCopyOnSelect((v) => !v)}
+                >
+                  <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                    <Copy size={13} />
+                    选中文本自动复制
+                  </span>
+                  <span className={`term-toggle-pill ${copyOnSelect ? "on" : ""}`}>
+                    {copyOnSelect ? "已开启" : "已关闭"}
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  className="term-popover-toggle"
+                  onClick={() => {
+                    const next = !vimMode;
+                    setVimMode(next);
+                    onNotify?.(
+                      next
+                        ? "已开启 Vim/tmux 键位模式：Ctrl+C/V 透传给远端，复制粘贴请用 Ctrl+Shift+C/V 或右键"
+                        : "已切回标准模式：支持 Ctrl+C/V、Ctrl+Shift+C/V 与右键复制粘贴",
+                      "info"
+                    );
+                  }}
+                >
+                  <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                    <TermIcon size={13} />
+                    Vim / tmux 键位透传
+                  </span>
+                  <span className={`term-toggle-pill ${vimMode ? "on" : ""}`}>
+                    {vimMode ? "已开启" : "已关闭"}
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  className="term-popover-toggle"
+                  onClick={() => {
+                    const next = !commandGuard;
+                    setCommandGuard(next);
+                    onNotify?.(
+                      next
+                        ? "高危命令防呆拦截已开启（拦截 rm -rf /、mkfs、reboot 等指令）"
+                        : "已临时关闭高危命令防呆拦截",
+                      "info"
+                    );
+                  }}
+                >
+                  <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                    <ShieldAlert size={13} />
+                    高危命令防呆拦截
+                  </span>
+                  <span className={`term-toggle-pill ${commandGuard ? "on" : ""}`}>
+                    {commandGuard ? "已开启" : "已关闭"}
+                  </span>
+                </button>
+
+                {onRemoteCwdDetected && activeTab?.kind === "ssh" && (
+                  <button
+                    type="button"
+                    className="term-popover-toggle"
+                    onClick={() => {
+                      const next = !followSftp;
+                      setFollowSftp(next);
+                      onNotify?.(
+                        next
+                          ? "已开启终端跟随：远端目录变化时自动同步 SFTP 面板"
+                          : "已关闭终端跟随 SFTP 目录",
+                        "info"
+                      );
+                    }}
+                  >
+                    <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                      <Link2 size={13} />
+                      终端目录跟随 SFTP
+                    </span>
+                    <span className={`term-toggle-pill ${followSftp ? "on" : ""}`}>
+                      {followSftp ? "已开启" : "已关闭"}
+                    </span>
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  className="term-popover-toggle"
+                  onClick={() => {
+                    setHighlightPanelOpen((v) => !v);
+                    setSettingsMenuOpen(false);
+                  }}
+                >
+                  <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                    <Highlighter size={13} />
+                    关键词高亮规则管理
+                  </span>
+                  <span className={`term-toggle-pill ${highlightEnabled ? "on" : ""}`}>
+                    {highlightEnabled ? "已开启" : "已关闭"}
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  className="term-popover-toggle"
+                  onClick={() => setSnippetsOpen((v) => !v)}
+                >
+                  <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                    <Zap size={13} />
+                    底部快捷命令栏
+                  </span>
+                  <span className={`term-toggle-pill ${snippetsOpen ? "on" : ""}`}>
+                    {snippetsOpen ? "显示" : "隐藏"}
+                  </span>
+                </button>
+
+                <div className="term-popover-sep" />
+
+                <button
+                  type="button"
+                  className="term-popover-toggle"
+                  onClick={() => {
+                    setSettingsMenuOpen(false);
+                    void handleSaveLog();
+                  }}
+                >
+                  <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                    <FileDown size={13} />
+                    导出终端会话日志 (.log)
+                  </span>
+                </button>
+              </div>
+            )}
+          </div>
 
           {standalone ? (
             <button
               type="button"
-              className="btn btn-sm btn-outline"
+              className="btn-tool btn-tool-xs"
               onClick={() => void api.focusMainWindow()}
               title="切换回主窗口查看本地与远程文件双栏"
             >
@@ -1931,34 +1987,34 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
               {onToggleMaximize && (
                 <button
                   type="button"
-                  className={`icon-btn ${maximized ? "active" : ""}`}
-                  style={{ width: 25, height: 25 }}
+                  className={`btn-tool btn-tool-xs ${maximized ? "active" : ""}`}
                   onClick={onToggleMaximize}
                   title={maximized ? "还原为底部停靠视图" : "工作区全屏放大终端"}
                 >
-                  {maximized ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
+                  {maximized ? <Minimize2 size={12} /> : <Maximize2 size={12} />}
+                  {maximized ? "还原" : "放大"}
                 </button>
               )}
               {onPopOut && (
                 <button
                   type="button"
-                  className="icon-btn"
-                  style={{ width: 25, height: 25 }}
+                  className="btn-tool btn-tool-xs"
                   onClick={onPopOut}
-                  title="弹出为独立操作系统窗口（可自由移动/缩放/放副屏）"
+                  title="弹出为独立操作系统窗口（可自由拖动到副屏）"
                 >
-                  <ExternalLink size={13} />
+                  <ExternalLink size={12} />
+                  独立窗口
                 </button>
               )}
               {onClose && (
                 <button
                   type="button"
-                  className="icon-btn"
-                  style={{ width: 25, height: 25 }}
+                  className="btn-tool btn-tool-xs"
                   onClick={onClose}
                   title="关闭终端面板"
                 >
-                  <X size={14} />
+                  <X size={12} />
+                  关闭
                 </button>
               )}
             </>

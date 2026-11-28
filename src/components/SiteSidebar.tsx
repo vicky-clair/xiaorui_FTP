@@ -168,25 +168,18 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
         )}
       </div>
 
-      <div
-        className="sidebar-footer"
-        style={{
-          display: "grid",
-          gridTemplateColumns: "repeat(3, 1fr)",
-          gap: 4,
-          padding: "8px 8px",
-        }}
-      >
-        <button className="btn btn-sm btn-ghost" onClick={onImport} title="从 JSON 文件导入站点配置">
+      <div className="sidebar-footer-grid">
+        <button type="button" className="btn-tool" onClick={onImport} title="从 JSON 文件导入站点配置">
           <Upload size={12} />
           导入
         </button>
-        <button className="btn btn-sm btn-ghost" onClick={onExport} title="导出站点备份为 JSON（不含敏感密钥）">
+        <button type="button" className="btn-tool" onClick={onExport} title="导出站点备份为 JSON（不含敏感密钥）">
           <Download size={12} />
           备份
         </button>
         <button
-          className="btn btn-sm btn-ghost"
+          type="button"
+          className="btn-tool"
           onClick={onImportSshConfig}
           title="一键解析并导入本机 ~/.ssh/config 主机配置"
         >
@@ -194,18 +187,19 @@ export const SiteSidebar: React.FC<SiteSidebarProps> = ({
           SSH配置
         </button>
         <button
-          className="btn btn-sm btn-ghost"
+          type="button"
+          className="btn-tool"
           onClick={onOpenSshKeys}
           title="管理本地 ~/.ssh 密钥、生成 Ed25519 并一键部署公钥到远端"
         >
           <KeyRound size={12} />
           密钥
         </button>
-        <button className="btn btn-sm btn-ghost" onClick={onOpenKnownHosts} title="管理 SSH 已知主机公钥指纹">
+        <button type="button" className="btn-tool" onClick={onOpenKnownHosts} title="管理 SSH 已知主机公钥指纹">
           <ShieldCheck size={12} />
           主机
         </button>
-        <button className="btn btn-sm btn-ghost" onClick={onOpenAuditLogs} title="查看本地脱敏安全审计日志">
+        <button type="button" className="btn-tool" onClick={onOpenAuditLogs} title="查看本地脱敏安全审计日志">
           <FileClock size={12} />
           日志
         </button>

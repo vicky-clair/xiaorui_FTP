@@ -549,50 +549,52 @@ export const FilePane: React.FC<FilePaneProps> = ({
         )}
 
         <div className="pane-toolbar-actions">
-          <button type="button" className="icon-btn" onClick={onRefresh} title="刷新 (F5)">
-            <RefreshCw size={14} className={loading ? "spin" : ""} />
+          <button
+            type="button"
+            className="btn-tool btn-tool-xs"
+            onClick={onRefresh}
+            title="刷新当前目录 (F5)"
+          >
+            <RefreshCw size={12} className={loading ? "spin" : ""} />
+            刷新
           </button>
 
-          <button type="button" className="icon-btn" onClick={onMkdir} title="新建文件夹">
-            <FolderPlus size={15} />
+          <button
+            type="button"
+            className="btn-tool btn-tool-xs"
+            onClick={onMkdir}
+            title="在当前目录新建文件夹"
+          >
+            <FolderPlus size={13} />
+            新建
           </button>
 
-          {mode === "local" && onOpenInTerminal && (
+          {mode === "remote" && (
             <button
               type="button"
-              className="icon-btn"
-              onClick={() => onOpenInTerminal(currentPath)}
-              title="在当前本地目录打开本地终端（使用 Windows 默认终端配置）"
+              className="btn-tool btn-tool-xs"
+              disabled={!selectedEntry}
+              onClick={() => selectedEntry && onTransfer(selectedEntry)}
+              title={
+                selectedEntry
+                  ? `下载「${selectedEntry.name}」并选择保存位置`
+                  : "先在下方选中文件或文件夹，即可点击下载"
+              }
             >
-              <Terminal size={14} />
+              <Download size={12} />
+              下载
             </button>
           )}
 
           {mode === "remote" && onUploadFolderFromPicker && (
             <button
               type="button"
-              className="icon-btn"
+              className="btn-tool btn-tool-xs"
               onClick={onUploadFolderFromPicker}
-              title="选择本地文件夹递归上传"
+              title="选择本地文件夹递归上传到当前远程目录"
             >
-              <FolderUp size={15} />
-            </button>
-          )}
-
-          {mode === "remote" && (
-            <button
-              type="button"
-              className="btn btn-sm btn-outline"
-              disabled={!selectedEntry}
-              onClick={() => selectedEntry && onTransfer(selectedEntry)}
-              title={
-                selectedEntry
-                  ? `下载「${selectedEntry.name}」并选择保存位置`
-                  : "先在下方选中文件或文件夹，即可点击选择位置下载"
-              }
-            >
-              <Download size={13} />
-              下载
+              <FolderUp size={13} />
+              传目录
             </button>
           )}
 
@@ -600,10 +602,11 @@ export const FilePane: React.FC<FilePaneProps> = ({
             <button
               type="button"
               className="btn btn-sm btn-primary"
+              style={{ height: 24, padding: "0 8px", fontSize: 11.5 }}
               onClick={onUploadFromPicker}
               title="选择本地文件上传到当前远程目录"
             >
-              <Upload size={13} />
+              <Upload size={12} />
               上传
             </button>
           )}

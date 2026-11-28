@@ -1360,28 +1360,16 @@ export default function App() {
             })()}
 
             {activeRemoteDisk && (
-              <button
-                type="button"
-                className={`metric-pill metric-pill-btn tabular-nums ${
+              <span
+                className={`metric-pill tabular-nums ${
                   activeRemoteDisk.usePercent >= 90
                     ? "hot"
                     : activeRemoteDisk.usePercent >= 78
                       ? "warn"
                       : ""
                 }`}
-                onClick={() => {
-                  const disks = serverMetrics.disks;
-                  if (disks.length <= 1) {
-                    void loadRemoteDir(activeSession.sessionId, activeRemoteDisk.mountPath);
-                    return;
-                  }
-                  const idx = disks.findIndex((d) => d.mountPath === activeRemoteDisk.mountPath);
-                  const next = disks[(idx + 1) % disks.length];
-                  void loadRemoteDir(activeSession.sessionId, next.mountPath);
-                  pushToast(`已切换至远端磁盘 ${next.label} (${next.mountPath})`, "info");
-                }}
                 title={
-                  `远端磁盘（点击${serverMetrics.disks.length > 1 ? "切换下一块磁盘" : "进入挂载根目录"}）：\n` +
+                  `远端磁盘状态（可在上方远程面板顶部磁盘下拉框切换）：\n` +
                   serverMetrics.disks
                     .map(
                       (d) =>
@@ -1393,32 +1381,25 @@ export default function App() {
                 <HardDrive size={11} />
                 {activeRemoteDisk.label} {activeRemoteDisk.usePercent}%
                 {serverMetrics.disks.length > 1 ? ` · 共${serverMetrics.disks.length}盘` : ""}
-              </button>
+              </span>
             )}
           </div>
         )}
 
         <div className="status-bar-right">
+          {activeTransferCount > 0 && (
+            <span className="status-bar-item tabular-nums" style={{ color: "var(--accent)" }}>
+              <ArrowDownUp size={12} />
+              传输中 {activeTransferCount}
+              {totalTransferSpeed > 0 ? ` · ${formatBytes(totalTransferSpeed)}/s` : ""}
+            </span>
+          )}
+
           <span className="status-bar-item tabular-nums">
             {dualPane ? `本地 ${localEntries.length}` : ""}
             {dualPane && activeSession ? " / " : ""}
             {activeSession ? `远程 ${remoteEntries.length}` : ""}
           </span>
-
-          <button
-            type="button"
-            className="status-bar-btn tabular-nums"
-            onClick={() => {
-              setTransferOpen((v) => !v);
-              if (!transferOpen) setTerminalOpen(false);
-            }}
-            title="展开或收起传输队列"
-          >
-            <ArrowDownUp size={12} color={activeTransferCount > 0 ? "var(--accent)" : undefined} />
-            {activeTransferCount > 0
-              ? `传输中 ${activeTransferCount}${totalTransferSpeed > 0 ? ` · ${formatBytes(totalTransferSpeed)}/s` : ""}`
-              : `队列 (${transfers.length})`}
-          </button>
 
           <button
             type="button"

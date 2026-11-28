@@ -45,12 +45,13 @@ export const TransferDrawer: React.FC<TransferDrawerProps> = ({
         </span>
         <span className="drawer-pill">已完成 {doneCount}</span>
         <div style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
-          <button className="btn btn-sm btn-ghost" onClick={onClearFinished}>
+          <button type="button" className="btn-tool btn-tool-xs" onClick={onClearFinished}>
             <Trash2 size={12} />
             清除已结束
           </button>
-          <button className="icon-btn" style={{ width: 24, height: 24 }} onClick={onClose}>
-            <X size={14} />
+          <button type="button" className="btn-tool btn-tool-xs" onClick={onClose}>
+            <X size={12} />
+            关闭
           </button>
         </div>
       </div>

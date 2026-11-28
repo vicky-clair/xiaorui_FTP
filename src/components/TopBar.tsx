@@ -74,11 +74,13 @@ export const TopBar: React.FC<TopBarProps> = ({
   return (
     <header className="topbar">
       <button
-        className={`icon-btn ${sidebarOpen ? "active" : ""}`}
+        type="button"
+        className={`btn-tool ${sidebarOpen ? "active" : ""}`}
         onClick={onToggleSidebar}
-        title="显示/隐藏站点栏"
+        title="显示或隐藏左侧站点管理栏"
       >
-        <PanelLeft size={16} />
+        <PanelLeft size={14} />
+        站点
       </button>
 
       <div className="brand">
@@ -111,23 +113,22 @@ export const TopBar: React.FC<TopBarProps> = ({
       </form>
 
       <div className="topbar-actions">
-        <button className="btn btn-primary" onClick={onNewSite} title="新建连接站点 (Ctrl+N)">
-          <Plus size={15} />
+        <button
+          type="button"
+          className="btn btn-primary"
+          style={{ height: 28, padding: "0 11px", fontSize: 12 }}
+          onClick={onNewSite}
+          title="新建连接站点 (Ctrl+N)"
+        >
+          <Plus size={14} />
           新建站点
         </button>
 
         <span className="topbar-sep" />
 
         <button
-          className={`icon-btn ${dualPane ? "active" : ""}`}
-          onClick={onToggleDualPane}
-          title={dualPane ? "切换为单栏（仅远程）" : "切换为双栏（本地 + 远程）"}
-        >
-          {dualPane ? <Columns2 size={16} /> : <Square size={15} />}
-        </button>
-
-        <button
-          className={`btn btn-sm ${localTerminalOpen ? "btn-primary" : "btn-ghost"}`}
+          type="button"
+          className={`btn-tool ${localTerminalOpen ? "active" : ""}`}
           onClick={onToggleLocalTerminal}
           title="打开本地终端（自动使用 Windows 默认终端配置）"
         >
@@ -137,33 +138,49 @@ export const TopBar: React.FC<TopBarProps> = ({
 
         {canOpenTerminal && (
           <button
-            className={`icon-btn ${terminalOpen ? "active" : ""}`}
+            type="button"
+            className={`btn-tool ${terminalOpen ? "active" : ""}`}
             onClick={onToggleTerminal}
-            title="SSH 远程终端"
+            title="打开当前远程主机的 SSH 交互终端"
           >
-            <Terminal size={16} />
+            <Terminal size={14} />
+            SSH 终端
           </button>
         )}
 
         <button
-          className={`icon-btn ${transferOpen ? "active" : ""}`}
+          type="button"
+          className={`btn-tool ${transferOpen ? "active" : ""}`}
           onClick={onToggleTransfers}
-          title="传输队列"
+          title="查看上传与下载传输队列"
         >
-          <Download size={16} />
+          <Download size={14} />
+          传输
           {activeTransferCount > 0 && (
-            <span className="badge-count">{activeTransferCount}</span>
+            <span className="inline-badge">{activeTransferCount}</span>
           )}
         </button>
 
         <span className="topbar-sep" />
 
         <button
-          className="icon-btn"
-          onClick={onToggleTheme}
-          title={theme === "light" ? "切换深色模式" : "切换浅色模式"}
+          type="button"
+          className={`btn-tool ${dualPane ? "active" : ""}`}
+          onClick={onToggleDualPane}
+          title={dualPane ? "当前为本地+远程双栏，点击切换为仅远程单栏" : "当前为单栏，点击切换为本地+远程双栏"}
         >
-          {theme === "light" ? <Moon size={16} /> : <Sun size={16} />}
+          {dualPane ? <Columns2 size={14} /> : <Square size={13} />}
+          {dualPane ? "双栏" : "单栏"}
+        </button>
+
+        <button
+          type="button"
+          className="btn-tool"
+          onClick={onToggleTheme}
+          title={theme === "light" ? "切换为深色外观" : "切换为浅色外观"}
+        >
+          {theme === "light" ? <Moon size={14} /> : <Sun size={14} />}
+          {theme === "light" ? "深色" : "浅色"}
         </button>
       </div>
     </header>
