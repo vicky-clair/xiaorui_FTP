@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_HIGHLIGHT_RULES,
+  encodeTerminalPaste,
+  hasIncompleteAnsiTail,
   highlightTerminalText,
+  isPasswordPromptLine,
   isSensitiveCommand,
   matchDangerousCommand,
   parseOsc52Write,
@@ -27,7 +30,7 @@ describe("terminalEnhance utilities", () => {
     expect(matchDangerousCommand("nvim ~/.zshrc")).toBeNull();
   });
 
-  it("filters sensitive commands from history recording", () => {
+  it("filters sensitive commands and detects password prompt lines", () => {
     expect(isSensitiveCommand("passwd root")).toBe(true);
     expect(isSensitiveCommand("export API_KEY=sk-12345")).toBe(true);
     expect(isSensitiveCommand("mysql -u root -pMySecret")).toBe(true);
@@ -35,6 +38,25 @@ describe("terminalEnhance utilities", () => {
 
     expect(isSensitiveCommand("docker ps -a")).toBe(false);
     expect(isSensitiveCommand("journalctl -u nginx -n 50")).toBe(false);
+
+    // 密码/口令提示行识别
+    expect(isPasswordPromptLine("[sudo] password for hailan20251015: ")).toBe(true);
+    expect(isPasswordPromptLine("Enter passphrase for key '/home/u/.ssh/id_ed25519':")).toBe(
+      true
+    );
+    expect(isPasswordPromptLine("请输入 sudo 密码：")).toBe(true);
+    expect(isPasswordPromptLine("user@debian13:~/app$ ls -la")).toBe(false);
+  });
+
+  it("encodes paste payloads safely for bracketed and non-bracketed paste modes", () => {
+    // 非括号粘贴模式：统一 CRLF/LF -> CR
+    expect(encodeTerminalPaste("echo 1\r\necho 2\n", false)).toBe("echo 1\recho 2\r");
+
+    // 括号粘贴模式：包裹 \x1b[200~...\x1b[201~ 并剥离恶意注入的逃逸序列
+    expect(encodeTerminalPaste("line1\r\nline2", true)).toBe("\x1b[200~line1\rline2\x1b[201~");
+    expect(encodeTerminalPaste("ok\x1b[201~rm -rf /\x1b[200~", true)).toBe(
+      "\x1b[200~okrm -rf /\x1b[201~"
+    );
   });
 
   it("parses valid OSC 7 file URIs and rejects control chars", () => {
@@ -45,13 +67,19 @@ describe("terminalEnhance utilities", () => {
     expect(parseOsc7Path("file://host/tmp/a\nb")).toBeNull();
   });
 
-  it("highlights keywords without corrupting existing ANSI sequences", () => {
-    const input = "\x1b[34m[service]\x1b[0m ERROR connecting to 192.168.9.165 (WARN retry)";
+  it("highlights keywords without wiping background colors or corrupting split ANSI", () => {
+    const input = "\x1b[44m[service]\x1b[0m ERROR connecting to 192.168.9.165 (WARN retry)";
     const out = highlightTerminalText(input, DEFAULT_HIGHLIGHT_RULES);
-    expect(out).toContain("\x1b[34m[service]\x1b[0m");
-    expect(out).toContain("\x1b[1;31mERROR\x1b[0m");
-    expect(out).toContain("\x1b[36m192.168.9.165\x1b[0m");
-    expect(out).toContain("\x1b[1;33mWARN\x1b[0m");
+    expect(out).toContain("\x1b[44m[service]\x1b[0m");
+    expect(out).toContain("\x1b[1;31mERROR\x1b[39;22m");
+    expect(out).toContain("\x1b[36m192.168.9.165\x1b[39;22m");
+    expect(out).toContain("\x1b[1;33mWARN\x1b[39;22m");
+
+    // 跨包截断的残缺 ANSI 转义序列必须原样直出
+    const splitChunk = "ERROR \x1b[38;2;255;";
+    expect(hasIncompleteAnsiTail(splitChunk)).toBe(true);
+    expect(highlightTerminalText(splitChunk, DEFAULT_HIGHLIGHT_RULES)).toBe(splitChunk);
+    expect(hasIncompleteAnsiTail(input)).toBe(false);
   });
 
   it("allows UTF-8 OSC 52 write while strictly blocking OSC 52 clipboard read", () => {

@@ -80,6 +80,31 @@ export function isSensitiveCommand(command: string): boolean {
   return sensitivePatterns.some((re) => re.test(trimmed));
 }
 
+/** 判断终端当前光标所在可见行是否处于密码/口令输入提示（命中时禁止记录到本地命令历史） */
+export function isPasswordPromptLine(line: string): boolean {
+  const trimmed = line.trimEnd();
+  if (!trimmed) return false;
+  return /(?:password|passphrase|passcode|pin\s*code|otp|verification\s+code|secret|密码|口令)[^\n]{0,60}[:：?？]\s*$/i.test(
+    trimmed
+  );
+}
+
+/**
+ * 构造发送给 PTY 的粘贴文本：
+ * - 当远端 Shell / nvim 开启 Bracketed Paste Mode (`\x1b[?2004h`) 时，先剔除剪贴板中可能夹带的
+ *   `\x1b[200~` / `\x1b[201~` 控制序列（防范跳出粘贴边界注入命令），再以标准括号粘贴序列包裹；
+ * - 未开启时将 CRLF/LF 规范为回车 `\r`，兼容老式 Shell 与 Windows CMD。
+ */
+export function encodeTerminalPaste(text: string, bracketedPasteMode: boolean): string {
+  const normalized = text.replace(/\r\n/g, "\r").replace(/\n/g, "\r");
+  if (!bracketedPasteMode) {
+    return normalized;
+  }
+  // eslint-disable-next-line no-control-regex
+  const sanitized = normalized.replace(/\x1b\[20[01]~/g, "");
+  return `\x1b[200~${sanitized}\x1b[201~`;
+}
+
 /**
  * 解析终端发出的 OSC 7 目录上报载荷（如 `file://debian-host/var/www/my%20app`），
  * 返回规范化的远端 POSIX 路径；非法或包含控制字符时返回 null。
@@ -173,9 +198,23 @@ export const DEFAULT_HIGHLIGHT_RULES: HighlightRule[] = [
 // eslint-disable-next-line no-control-regex
 const ANSI_TOKEN_RE = /(\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_])/g;
 
+/** 检测文本片中是否存在被 TCP/SSH 分包截断的残缺 ANSI 转义序列 */
+export function hasIncompleteAnsiTail(text: string): boolean {
+  if (!text.includes("\x1b")) return false;
+  const parts = text.split(ANSI_TOKEN_RE);
+  for (let i = 0; i < parts.length; i += 2) {
+    if (parts[i]?.includes("\x1b")) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /**
- * 仅对普通文本片段应用关键词着色，完整保留所有既有 ANSI 转义序列。
- * 提示：调用方应在进入备用屏幕（nvim / htop / tmux 全屏）时跳过本函数，确保 TUI 零失真。
+ * 仅对普通文本片段应用关键词着色，完整保留所有既有 ANSI 转义序列：
+ * - 遇到跨包截断的残缺转义序列时原样直出，杜绝损坏控制码；
+ * - 收尾仅使用 `\x1b[39;22m` 还原前景色与粗体，绝不冲掉 Powerlevel10k 等提示符背景色块；
+ * - 调用方应在进入备用屏幕（nvim / htop / tmux 全屏）时跳过本函数，确保 TUI 零失真。
  */
 export function highlightTerminalText(text: string, rules: HighlightRule[]): string {
   const compiled: { re: RegExp; code: string }[] = [];
@@ -191,10 +230,15 @@ export function highlightTerminalText(text: string, rules: HighlightRule[]): str
 
   const parts = text.split(ANSI_TOKEN_RE);
   for (let i = 0; i < parts.length; i += 2) {
+    if (parts[i]?.includes("\x1b")) {
+      return text;
+    }
+  }
+  for (let i = 0; i < parts.length; i += 2) {
     let seg = parts[i];
     if (!seg) continue;
     for (const { re, code } of compiled) {
-      seg = seg.replace(re, (m) => `${code}${m}\x1b[0m`);
+      seg = seg.replace(re, (m) => `${code}${m}\x1b[39;22m`);
     }
     parts[i] = seg;
   }

@@ -48,7 +48,10 @@ import { readClipboardText, writeClipboardText } from "../utils/clipboard";
 import { buildSafeCdCommand, isDangerousMultilinePaste } from "../utils/security";
 import {
   DEFAULT_HIGHLIGHT_RULES,
+  encodeTerminalPaste,
+  hasIncompleteAnsiTail,
   highlightTerminalText,
+  isPasswordPromptLine,
   isSensitiveCommand,
   matchDangerousCommand,
   parseOsc52Write,
@@ -95,6 +98,7 @@ interface TabMeta {
 
 interface PtyTabHandle {
   writeInput: (text: string) => Promise<boolean>;
+  pasteInput: (text: string) => Promise<boolean>;
   clear: () => void;
   focus: () => void;
   fit: () => void;
@@ -487,6 +491,15 @@ const PtyTabPane = React.forwardRef<
           termRef.current?.focus();
           return true;
         },
+        pasteInput: async (text: string) => {
+          const tid = terminalIdRef.current;
+          if (!tid) return false;
+          const bracketed = Boolean(termRef.current?.modes.bracketedPasteMode);
+          const payload = encodeTerminalPaste(text, bracketed);
+          await api.sshPtyWrite(tid, payload);
+          termRef.current?.focus();
+          return true;
+        },
         clear: () => {
           termRef.current?.clear();
           termRef.current?.focus();
@@ -785,25 +798,51 @@ const PtyTabPane = React.forwardRef<
       });
       ro.observe(container);
 
-      // 追踪备用屏幕状态（进入 nvim/htop/tmux 全屏时暂停关键词高亮与高危命令拦截，确保 TUI 零失真）
+      // 追踪备用屏幕状态（同时结合 xterm.js 原生 buffer.type 与转义流标记，确保进入 nvim/htop/tmux 时 TUI 零失真）
       let inAltScreen = false;
+      let prevHadIncompleteAnsi = false;
       let lineBuf = "";
+      let lineTypingStartedAt = 0;
+      let outputDuringTyping = false;
       const utf8Decoder = new TextDecoder("utf-8");
 
+      const resetLineTracking = () => {
+        lineBuf = "";
+        lineTypingStartedAt = 0;
+        outputDuringTyping = false;
+      };
+
+      const isAlternateScreenActive = () =>
+        inAltScreen || term.buffer.active.type === "alternate";
+
       const writeChunkToTerminal = (bytes: Uint8Array) => {
-        const preview = utf8Decoder.decode(bytes, { stream: true });
-        if (preview.includes("\x1b[?1049h") || preview.includes("\x1b[?47h")) {
-          inAltScreen = true;
-          lineBuf = "";
+        if (lineBuf.length > 0 && bytes.length > 0) {
+          outputDuringTyping = true;
         }
-        if (preview.includes("\x1b[?1049l") || preview.includes("\x1b[?47l")) {
+        const preview = utf8Decoder.decode(bytes, { stream: true });
+        if (
+          preview.includes("\x1b[?1049h") ||
+          preview.includes("\x1b[?1047h") ||
+          preview.includes("\x1b[?47h")
+        ) {
+          inAltScreen = true;
+          resetLineTracking();
+        }
+        if (
+          preview.includes("\x1b[?1049l") ||
+          preview.includes("\x1b[?1047l") ||
+          preview.includes("\x1b[?47l")
+        ) {
           inAltScreen = false;
         }
-        if (highlightEnabledRef.current && !inAltScreen) {
+        const altActive = isAlternateScreenActive();
+        const incomplete = hasIncompleteAnsiTail(preview);
+        if (highlightEnabledRef.current && !altActive && !prevHadIncompleteAnsi && !incomplete) {
           term.write(highlightTerminalText(preview, highlightRulesRef.current));
         } else {
           term.write(bytes);
         }
+        prevHadIncompleteAnsi = incomplete;
       };
 
       const dataDisp = term.onData((data) => {
@@ -811,7 +850,7 @@ const PtyTabPane = React.forwardRef<
         if (!tid) return;
 
         // 备用屏幕模式（nvim / tmux 全屏等）下直接透传全部原始字节
-        if (inAltScreen) {
+        if (isAlternateScreenActive()) {
           void api.sshPtyWrite(tid, data);
           return;
         }
@@ -819,8 +858,19 @@ const PtyTabPane = React.forwardRef<
         // 高危命令防呆拦截 + 安全命令历史采集（仅在按回车提交行时触发）
         if (data === "\r" || data === "\n") {
           const submitted = lineBuf.trim();
-          lineBuf = "";
-          if (submitted && commandGuardRef.current) {
+          const typingSpanMs = lineTypingStartedAt > 0 ? Date.now() - lineTypingStartedAt : 0;
+          const hadEchoOutput = outputDuringTyping;
+          resetLineTracking();
+
+          // 检测是否处于密码/口令提示行或远端无回显（-echo）状态，杜绝将 sudo/ssh 密码记入本地历史
+          const activeBuf = term.buffer.active;
+          const cursorLine =
+            activeBuf.getLine(activeBuf.baseY + activeBuf.cursorY)?.translateToString(true) ?? "";
+          const isHiddenSecretInput =
+            isPasswordPromptLine(cursorLine) ||
+            (submitted.length >= 4 && typingSpanMs >= 250 && !hadEchoOutput);
+
+          if (!isHiddenSecretInput && submitted && commandGuardRef.current) {
             const danger = matchDangerousCommand(submitted);
             if (danger) {
               onDangerousCommandRef.current(
@@ -840,7 +890,7 @@ const PtyTabPane = React.forwardRef<
               return;
             }
           }
-          if (submitted) {
+          if (!isHiddenSecretInput && submitted) {
             onRecordCommandRef.current(submitted);
           }
           void api.sshPtyWrite(tid, data);
@@ -849,10 +899,15 @@ const PtyTabPane = React.forwardRef<
 
         // 维护当前行缓冲（忽略方向键转义序列，退格删尾字符，Ctrl+C/U 清空缓冲）
         if (data === "\x03" || data === "\x15") {
-          lineBuf = "";
+          resetLineTracking();
         } else if (data === "\x7f" || data === "\b") {
           lineBuf = lineBuf.slice(0, -1);
+          if (lineBuf.length === 0) resetLineTracking();
         } else if (!data.startsWith("\x1b")) {
+          if (lineBuf.length === 0) {
+            lineTypingStartedAt = Date.now();
+            outputDuringTyping = false;
+          }
           lineBuf += data;
           if (lineBuf.length > 1024) lineBuf = lineBuf.slice(-1024);
         }
@@ -1209,7 +1264,7 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
     });
   }, []);
 
-  /** 粘贴安全守卫：单行文本直接写入，含换行符的多行命令先弹出内联确认条防隐藏命令注入 */
+  /** 粘贴安全守卫：单行文本直接走括号粘贴适配通道写入，含换行符的多行命令先弹出内联确认条防隐藏命令注入 */
   const handleRequestPaste = useCallback(
     (text: string) => {
       if (!text) return;
@@ -1217,7 +1272,7 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
         setPendingPaste(text);
         return;
       }
-      void getActiveHandle()?.writeInput(text);
+      void getActiveHandle()?.pasteInput(text);
     },
     [getActiveHandle]
   );
@@ -2104,7 +2159,7 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
               onClick={() => {
                 const txt = pendingPaste;
                 setPendingPaste(null);
-                void getActiveHandle()?.writeInput(txt);
+                void getActiveHandle()?.pasteInput(txt);
               }}
             >
               确认全部粘贴
@@ -2115,7 +2170,7 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
               onClick={() => {
                 const firstLine = pendingPaste.split(/\r?\n/)[0] ?? "";
                 setPendingPaste(null);
-                if (firstLine) void getActiveHandle()?.writeInput(firstLine);
+                if (firstLine) void getActiveHandle()?.pasteInput(firstLine);
               }}
             >
               仅粘贴首行（去回车）

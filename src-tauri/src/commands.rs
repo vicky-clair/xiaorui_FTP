@@ -153,9 +153,23 @@ impl AppState {
         Ok(())
     }
 
-    /// 在独立终端窗口关闭时回收其会话绑定记录
+    /// 在独立终端窗口关闭时回收其会话绑定记录，并兜底关闭该窗口名下全部活跃 PTY（含远端通道与本地子进程）
     pub async fn unregister_terminal_window(&self, label: &str) {
         self.terminal_windows.write().await.remove(label);
+        let to_close: Vec<tokio::sync::mpsc::Sender<PtyCommand>> = {
+            let mut ptys = self.ptys.write().await;
+            let ids: Vec<String> = ptys
+                .iter()
+                .filter(|(_, p)| p.owner_window == label)
+                .map(|(id, _)| id.clone())
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| ptys.remove(&id).map(|p| p.cmd_tx))
+                .collect()
+        };
+        for tx in to_close {
+            let _ = tx.send(PtyCommand::Close).await;
+        }
     }
 
     /// 供窗口关闭事件钩子无锁查询是否启用“关闭时最小化到托盘”
@@ -1765,6 +1779,50 @@ mod tests {
             .remote_dirs
             .contains(&format!("/deploy/{}/nested", root_name)));
         assert_eq!(plan.files.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_unregister_terminal_window_closes_only_owned_ptys() {
+        let tmp = std::env::temp_dir().join(format!("xiaorui_ftp_term_win_{}", Uuid::new_v4()));
+        let state = AppState::new(tmp.clone()).unwrap();
+
+        let (tx_term, mut rx_term) = tokio::sync::mpsc::channel::<PtyCommand>(4);
+        let (tx_main, mut rx_main) = tokio::sync::mpsc::channel::<PtyCommand>(4);
+
+        state
+            .terminal_windows
+            .write()
+            .await
+            .insert("term-abc".into(), "sess-1".into());
+        {
+            let mut ptys = state.ptys.write().await;
+            ptys.insert(
+                "pty-term".into(),
+                ActivePty {
+                    session_id: "sess-1".into(),
+                    owner_window: "term-abc".into(),
+                    cmd_tx: tx_term,
+                },
+            );
+            ptys.insert(
+                "pty-main".into(),
+                ActivePty {
+                    session_id: "sess-1".into(),
+                    owner_window: "main".into(),
+                    cmd_tx: tx_main,
+                },
+            );
+        }
+
+        state.unregister_terminal_window("term-abc").await;
+
+        assert!(!state.terminal_windows.read().await.contains_key("term-abc"));
+        assert!(!state.ptys.read().await.contains_key("pty-term"));
+        assert!(state.ptys.read().await.contains_key("pty-main"));
+        assert!(matches!(rx_term.try_recv(), Ok(PtyCommand::Close)));
+        assert!(rx_main.try_recv().is_err());
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
