@@ -44,6 +44,7 @@ webpki-roots = "0.26"
 keyring = { version = "3.6.3", features = ["windows-native", "apple-native", "sync-secret-service", "crypto-rust"] }
 zeroize = "1"
 tokio-util = { version = "0.7", features = ["io"] }
+arboard = { version = "3", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 pageant = "0.0.1"

@@ -138,6 +138,8 @@ export const api = {
   openTerminalWindow: (sessionId: string, cwd?: string) =>
     invoke<string>("open_terminal_window", { sessionId, cwd: cwd ?? null }),
   focusMainWindow: () => invoke<void>("focus_main_window"),
+  clipboardReadText: () => invoke<string>("clipboard_read_text"),
+  clipboardWriteText: (text: string) => invoke<void>("clipboard_write_text", { text }),
   saveTextFile: (filePath: string, content: string) =>
     invoke<void>("save_text_file", { filePath, content }),
   onPtyData: (cb: (ev: PtyDataEvent) => void): Promise<UnlistenFn> =>

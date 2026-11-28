@@ -1057,11 +1057,13 @@ echo "DISKS_END"
         let safe_cols = cols.clamp(20, 500);
         let safe_rows = rows.clamp(5, 200);
 
-        // 申请标准 xterm-256color 伪终端并启动远端默认登录 Shell（zsh/bash/fish/PowerShell）
+        // 申请标准 xterm-256color 伪终端，尝试透传 COLORTERM=truecolor 并启动远端默认登录 Shell（zsh/bash/fish/PowerShell）
         channel
             .request_pty(false, "xterm-256color", safe_cols, safe_rows, 0, 0, &[])
             .await
             .map_err(|e| AppError::Protocol(format!("申请远程 PTY 伪终端失败: {}", e)))?;
+        // 使用 want_reply=false 尽力透传真彩色标识，即使服务端 sshd 未开启 AcceptEnv COLORTERM 也不影响登录
+        let _ = channel.set_env(false, "COLORTERM", "truecolor").await;
         channel
             .request_shell(true)
             .await

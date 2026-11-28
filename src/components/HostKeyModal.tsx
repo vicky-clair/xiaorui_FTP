@@ -9,6 +9,7 @@
 
 import React, { useEffect, useState } from "react";
 import { AlertOctagon, Copy, ShieldAlert, ShieldCheck, X } from "lucide-react";
+import { writeClipboardText } from "../utils/clipboard";
 import type { HostKeyPrompt } from "../utils/security";
 
 interface HostKeyModalProps {
@@ -36,7 +37,8 @@ export const HostKeyModal: React.FC<HostKeyModalProps> = ({
   }, [busy, onClose]);
 
   const copyText = (text: string) => {
-    void navigator.clipboard.writeText(text).then(() => {
+    void writeClipboardText(text).then((ok) => {
+      if (!ok) return;
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1800);
     });

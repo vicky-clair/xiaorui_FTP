@@ -12,12 +12,15 @@
 import React, { useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
 import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
+import { Unicode11Addon } from "@xterm/addon-unicode11";
+import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal, type ITheme } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import {
   ChevronDown,
   ChevronUp,
+  ClipboardPaste,
   Copy,
   ExternalLink,
   FileDown,
@@ -35,6 +38,7 @@ import {
   Zap,
 } from "lucide-react";
 import { api } from "../api/tauri";
+import { readClipboardText, writeClipboardText } from "../utils/clipboard";
 import { buildSafeCdCommand, isDangerousMultilinePaste } from "../utils/security";
 
 export interface TerminalCommandRequest {
@@ -217,10 +221,42 @@ const DEFAULT_SNIPPETS: QuickSnippet[] = [
   { id: "s6", label: "Docker", cmd: "docker ps" },
 ];
 
+type FontKey = "auto_nf" | "jetbrains_nf" | "caskaydia_nf" | "meslo_nf" | "fira_nf" | "consolas";
+
+const TERMINAL_FONTS: Record<FontKey, { label: string; family: string }> = {
+  auto_nf: {
+    label: "Nerd Font 自动",
+    family:
+      '"CaskaydiaCove Nerd Font", "JetBrainsMono Nerd Font", "MesloLGS NF", "Hack Nerd Font", "FiraCode Nerd Font", "Cascadia Code", "JetBrains Mono", Consolas, "PingFang SC", "Microsoft YaHei Mono", monospace',
+  },
+  jetbrains_nf: {
+    label: "JetBrainsMono NF",
+    family: '"JetBrainsMono Nerd Font", "JetBrains Mono", Consolas, "PingFang SC", monospace',
+  },
+  caskaydia_nf: {
+    label: "CaskaydiaCove NF",
+    family: '"CaskaydiaCove Nerd Font", "Cascadia Code", Consolas, "PingFang SC", monospace',
+  },
+  meslo_nf: {
+    label: "MesloLGS NF",
+    family: '"MesloLGS NF", "MesloLGS Nerd Font", Consolas, "PingFang SC", monospace',
+  },
+  fira_nf: {
+    label: "FiraCode NF",
+    family: '"FiraCode Nerd Font", "Fira Code", Consolas, "PingFang SC", monospace',
+  },
+  consolas: {
+    label: "Consolas / 系统等宽",
+    family: 'Consolas, "Cascadia Code", "PingFang SC", monospace',
+  },
+};
+
 const STORAGE_SNIPPETS = "xiaorui_term_snippets_v1";
 const STORAGE_FONT = "xiaorui_term_font_size";
+const STORAGE_FONT_FAMILY = "xiaorui_term_font_family";
 const STORAGE_THEME = "xiaorui_term_theme";
 const STORAGE_COPY_SEL = "xiaorui_term_copy_on_select";
+const STORAGE_VIM_MODE = "xiaorui_term_vim_mode";
 
 function loadSnippets(): QuickSnippet[] {
   try {
@@ -251,12 +287,15 @@ const PtyTabPane = React.forwardRef<
     active: boolean;
     reconnectSeq: number;
     fontSize: number;
+    fontKey: FontKey;
     themeKey: ThemeKey;
     copyOnSelect: boolean;
+    vimMode: boolean;
     onStatusChange: (status: TabMeta["status"], sizeLabel?: string) => void;
     onOpenSearch: () => void;
     onZoomDelta: (delta: number | "reset") => void;
     onRequestPaste: (text: string) => void;
+    onNotify?: (text: string, kind?: "info" | "success" | "error") => void;
   }
 >(
   (
@@ -265,12 +304,15 @@ const PtyTabPane = React.forwardRef<
       active,
       reconnectSeq,
       fontSize,
+      fontKey,
       themeKey,
       copyOnSelect,
+      vimMode,
       onStatusChange,
       onOpenSearch,
       onZoomDelta,
       onRequestPaste,
+      onNotify,
     },
     ref
   ) => {
@@ -280,14 +322,19 @@ const PtyTabPane = React.forwardRef<
     const searchRef = useRef<SearchAddon | null>(null);
     const terminalIdRef = useRef<string | null>(null);
     const copyOnSelectRef = useRef(copyOnSelect);
+    const vimModeRef = useRef(vimMode);
     const onOpenSearchRef = useRef(onOpenSearch);
     const onZoomDeltaRef = useRef(onZoomDelta);
     const onStatusChangeRef = useRef(onStatusChange);
     const onRequestPasteRef = useRef(onRequestPaste);
+    const onNotifyRef = useRef(onNotify);
 
     useEffect(() => {
       copyOnSelectRef.current = copyOnSelect;
     }, [copyOnSelect]);
+    useEffect(() => {
+      vimModeRef.current = vimMode;
+    }, [vimMode]);
     useEffect(() => {
       onOpenSearchRef.current = onOpenSearch;
     }, [onOpenSearch]);
@@ -300,6 +347,9 @@ const PtyTabPane = React.forwardRef<
     useEffect(() => {
       onRequestPasteRef.current = onRequestPaste;
     }, [onRequestPaste]);
+    useEffect(() => {
+      onNotifyRef.current = onNotify;
+    }, [onNotify]);
 
     const fitAndNotify = useCallback(() => {
       const term = termRef.current;
@@ -357,16 +407,17 @@ const PtyTabPane = React.forwardRef<
       [fitAndNotify]
     );
 
-    // 动态更新字号与配色主题（无需重连 PTY）
+    // 动态更新字号、字体与配色主题（无需重连 PTY）
     useEffect(() => {
       const term = termRef.current;
       if (!term) return;
       term.options.fontSize = fontSize;
+      term.options.fontFamily = TERMINAL_FONTS[fontKey].family;
       term.options.theme = TERMINAL_THEMES[themeKey].theme;
       if (active) {
         requestAnimationFrame(() => fitAndNotify());
       }
-    }, [fontSize, themeKey, active, fitAndNotify]);
+    }, [fontSize, fontKey, themeKey, active, fitAndNotify]);
 
     // 切换为激活标签时自动重新适配窗口大小并聚焦
     useEffect(() => {
@@ -387,23 +438,41 @@ const PtyTabPane = React.forwardRef<
       let unlistenData: (() => void) | undefined;
       let unlistenExit: (() => void) | undefined;
       let resizeTimer: number | undefined;
+      let webglAddon: WebglAddon | null = null;
 
       const term = new Terminal({
         cursorBlink: true,
         cursorStyle: "bar",
-        fontFamily: '"Cascadia Code", "JetBrains Mono", Consolas, "PingFang SC", monospace',
+        fontFamily: TERMINAL_FONTS[fontKey].family,
         fontSize,
-        lineHeight: 1.32,
+        lineHeight: 1.28,
         scrollback: 8000,
-        allowProposedApi: false,
+        // Unicode11Addon 需要开启 proposed API 以精准计算 Nerd Font/Powerline/Emoji/中文宽字符列宽
+        allowProposedApi: true,
         theme: TERMINAL_THEMES[themeKey].theme,
       });
 
       const fitAddon = new FitAddon();
       const searchAddon = new SearchAddon();
+      const unicode11Addon = new Unicode11Addon();
       term.loadAddon(fitAddon);
       term.loadAddon(searchAddon);
+      term.loadAddon(unicode11Addon);
+      term.unicode.activeVersion = "11";
       term.open(container);
+
+      // 优先启用 WebGL GPU 加速渲染（显著提升 nvim / tmux / htop 滚动帧率），GPU 上下文丢失时优雅回退 DOM 渲染
+      try {
+        const gl = new WebglAddon();
+        gl.onContextLoss(() => {
+          gl.dispose();
+          webglAddon = null;
+        });
+        term.loadAddon(gl);
+        webglAddon = gl;
+      } catch {
+        webglAddon = null;
+      }
       // 终端输出纵深防御：显式拦截恶意远端 OSC 52（剪贴板读写）与 OSC 8（隐藏超链接）控制序列
       const osc52Disp = term.parser.registerOscHandler(52, () => true);
       const osc8Disp = term.parser.registerOscHandler(8, () => true);
@@ -411,24 +480,72 @@ const PtyTabPane = React.forwardRef<
       fitRef.current = fitAddon;
       searchRef.current = searchAddon;
 
-      // Xshell 经典交互：选中文本自动复制到剪贴板
-      const selDisp = term.onSelectionChange(() => {
-        if (!copyOnSelectRef.current) return;
+      // 原生剪贴板复制与粘贴辅助（直接经由 Rust arboard 读写系统剪贴板，彻底绕过 Windows WebView2 权限拦截）
+      const copySelection = async (clearAfter: boolean, silent = false) => {
         const sel = term.getSelection();
-        if (sel && sel.trim().length > 0) {
-          void navigator.clipboard.writeText(sel).catch(() => {});
+        if (!sel) return false;
+        const ok = await writeClipboardText(sel);
+        if (ok) {
+          if (clearAfter) term.clearSelection();
+          if (!silent) onNotifyRef.current?.("已复制选中内容到剪贴板", "info");
+        } else if (!silent) {
+          onNotifyRef.current?.("写入系统剪贴板失败", "error");
         }
-      });
+        return ok;
+      };
 
-      // 键盘快捷键：Ctrl+F 搜索，Ctrl+Shift+C/V 复制粘贴，Ctrl+=/-/0 字号缩放
+      const pasteFromClipboard = async () => {
+        const txt = await readClipboardText();
+        if (txt) {
+          onRequestPasteRef.current(txt);
+        } else {
+          onNotifyRef.current?.("剪贴板为空或不含可粘贴文本", "info");
+        }
+      };
+
+      // Xshell 经典交互：鼠标划选松手（mouseup）时写入系统剪贴板一次，避免拖动过程中高频争抢 Windows 剪贴板锁
+      const onMouseUpCopy = (ev: MouseEvent) => {
+        if (ev.button !== 0 || !copyOnSelectRef.current) return;
+        window.setTimeout(() => {
+          if (disposed) return;
+          const sel = term.getSelection();
+          if (sel && sel.trim().length > 0) {
+            void writeClipboardText(sel);
+          }
+        }, 0);
+      };
+      container.addEventListener("mouseup", onMouseUpCopy);
+
+      // 捕获经由系统编辑菜单或输入法触发的原生 paste 事件，统一走多行安全确认通道且防重复写入
+      const onNativePaste = (ev: ClipboardEvent) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        const txt = ev.clipboardData?.getData("text/plain") ?? "";
+        if (txt) {
+          onRequestPasteRef.current(txt);
+        } else {
+          void pasteFromClipboard();
+        }
+      };
+      container.addEventListener("paste", onNativePaste, true);
+
+      // 键盘快捷键（兼容 Neovim / tmux / zsh）：
+      // - Ctrl+Shift+F 打开终端搜索（释放 Ctrl+F 给 nvim 向下翻页与 zsh 光标右移）
+      // - Ctrl+=/-/0 缩放字号
+      // - 非 Vim 模式下：Ctrl+C（有选区复制/无选区发 ^C）、Ctrl+V 粘贴
+      // - Vim 模式下：Ctrl+C / Ctrl+V 完整透传给 nvim/tmux，复制粘贴走 Ctrl+Shift+C/V、Ctrl/Shift+Insert 或右键
       term.attachCustomKeyEventHandler((ev) => {
         if (ev.type !== "keydown") return true;
-        if ((ev.ctrlKey || ev.metaKey) && !ev.shiftKey && ev.key.toLowerCase() === "f") {
+        const key = ev.key.toLowerCase();
+        const mod = ev.ctrlKey || ev.metaKey;
+
+        if (mod && ev.shiftKey && key === "f") {
           ev.preventDefault();
+          ev.stopPropagation();
           onOpenSearchRef.current();
           return false;
         }
-        if ((ev.ctrlKey || ev.metaKey) && !ev.shiftKey) {
+        if (mod && !ev.shiftKey) {
           if (ev.key === "=" || ev.key === "+") {
             ev.preventDefault();
             onZoomDeltaRef.current(1);
@@ -444,23 +561,44 @@ const PtyTabPane = React.forwardRef<
             onZoomDeltaRef.current("reset");
             return false;
           }
+          if (!vimModeRef.current && key === "c" && term.hasSelection()) {
+            ev.preventDefault();
+            ev.stopPropagation();
+            void copySelection(true);
+            return false;
+          }
+          if (!vimModeRef.current && key === "v") {
+            ev.preventDefault();
+            ev.stopPropagation();
+            void pasteFromClipboard();
+            return false;
+          }
+          if (ev.key === "Insert") {
+            ev.preventDefault();
+            ev.stopPropagation();
+            void copySelection(false);
+            return false;
+          }
         }
-        if ((ev.ctrlKey || ev.metaKey) && ev.shiftKey) {
-          const key = ev.key.toLowerCase();
+        if (mod && ev.shiftKey) {
           if (key === "c") {
-            const sel = term.getSelection();
-            if (sel) void navigator.clipboard.writeText(sel).catch(() => {});
+            ev.preventDefault();
+            ev.stopPropagation();
+            void copySelection(false);
             return false;
           }
           if (key === "v") {
-            void navigator.clipboard
-              .readText()
-              .then((txt) => {
-                if (txt) onRequestPasteRef.current(txt);
-              })
-              .catch(() => {});
+            ev.preventDefault();
+            ev.stopPropagation();
+            void pasteFromClipboard();
             return false;
           }
+        }
+        if (!mod && ev.shiftKey && ev.key === "Insert") {
+          ev.preventDefault();
+          ev.stopPropagation();
+          void pasteFromClipboard();
+          return false;
         }
         return true;
       });
@@ -545,15 +683,18 @@ const PtyTabPane = React.forwardRef<
         disposed = true;
         if (resizeTimer) window.clearTimeout(resizeTimer);
         ro.disconnect();
+        container.removeEventListener("mouseup", onMouseUpCopy);
+        container.removeEventListener("paste", onNativePaste, true);
         osc52Disp.dispose();
         osc8Disp.dispose();
-        selDisp.dispose();
         dataDisp.dispose();
         if (unlistenData) unlistenData();
         if (unlistenExit) unlistenExit();
         const tid = terminalIdRef.current;
         terminalIdRef.current = null;
         if (tid) void api.sshPtyClose(tid);
+        webglAddon?.dispose();
+        webglAddon = null;
         term.dispose();
         termRef.current = null;
         fitRef.current = null;
@@ -575,15 +716,22 @@ const PtyTabPane = React.forwardRef<
           e.preventDefault();
           const sel = termRef.current?.getSelection();
           if (sel) {
-            void navigator.clipboard.writeText(sel).catch(() => {});
-            termRef.current?.clearSelection();
+            void writeClipboardText(sel).then((ok) => {
+              if (ok) {
+                termRef.current?.clearSelection();
+                onNotifyRef.current?.("已复制选中内容到剪贴板", "info");
+              } else {
+                onNotifyRef.current?.("写入系统剪贴板失败", "error");
+              }
+            });
           } else {
-            void navigator.clipboard
-              .readText()
-              .then((txt) => {
-                if (txt) onRequestPasteRef.current(txt);
-              })
-              .catch(() => {});
+            void readClipboardText().then((txt) => {
+              if (txt) {
+                onRequestPasteRef.current(txt);
+              } else {
+                onNotifyRef.current?.("剪贴板为空或不含可粘贴文本", "info");
+              }
+            });
           }
         }}
       />
@@ -614,10 +762,14 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
   const [drawerHeight, setDrawerHeight] = useState(310);
   const [resizing, setResizing] = useState(false);
 
-  // Xshell 偏好设置（字号、主题、选中即复制、快捷命令栏）
+  // Xshell 偏好设置（字号、Nerd Font 字体、主题、选中即复制、Vim/tmux 键位模式、快捷命令栏）
   const [fontSize, setFontSize] = useState<number>(() => {
     const saved = Number(localStorage.getItem(STORAGE_FONT));
     return Number.isFinite(saved) && saved >= 10 && saved <= 24 ? saved : 13;
+  });
+  const [fontKey, setFontKey] = useState<FontKey>(() => {
+    const saved = localStorage.getItem(STORAGE_FONT_FAMILY) as FontKey | null;
+    return saved && saved in TERMINAL_FONTS ? saved : "auto_nf";
   });
   const [themeKey, setThemeKey] = useState<ThemeKey>(() => {
     const saved = localStorage.getItem(STORAGE_THEME) as ThemeKey | null;
@@ -626,6 +778,9 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
   const [copyOnSelect, setCopyOnSelect] = useState<boolean>(() => {
     const saved = localStorage.getItem(STORAGE_COPY_SEL);
     return saved === null ? true : saved === "true";
+  });
+  const [vimMode, setVimMode] = useState<boolean>(() => {
+    return localStorage.getItem(STORAGE_VIM_MODE) === "true";
   });
 
   // 搜索条状态
@@ -647,11 +802,17 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
     localStorage.setItem(STORAGE_FONT, String(fontSize));
   }, [fontSize]);
   useEffect(() => {
+    localStorage.setItem(STORAGE_FONT_FAMILY, fontKey);
+  }, [fontKey]);
+  useEffect(() => {
     localStorage.setItem(STORAGE_THEME, themeKey);
   }, [themeKey]);
   useEffect(() => {
     localStorage.setItem(STORAGE_COPY_SEL, String(copyOnSelect));
   }, [copyOnSelect]);
+  useEffect(() => {
+    localStorage.setItem(STORAGE_VIM_MODE, String(vimMode));
+  }, [vimMode]);
   useEffect(() => {
     localStorage.setItem(STORAGE_SNIPPETS, JSON.stringify(snippets));
   }, [snippets]);
@@ -916,9 +1077,50 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
             className={`icon-btn ${searchOpen ? "active" : ""}`}
             style={{ width: 25, height: 25 }}
             onClick={() => (searchOpen ? setSearchOpen(false) : handleOpenSearch())}
-            title="搜索终端日志 (Ctrl+F)"
+            title="搜索终端日志 (Ctrl+Shift+F，已释放 Ctrl+F 给 nvim/zsh)"
           >
             <Search size={13} />
+          </button>
+
+          <button
+            type="button"
+            className={`btn btn-sm ${vimMode ? "btn-primary" : "btn-ghost"}`}
+            style={{ height: 24, padding: "0 7px", fontSize: 11 }}
+            onClick={() => {
+              const next = !vimMode;
+              setVimMode(next);
+              onNotify?.(
+                next
+                  ? "已开启 Vim/tmux 键位模式：Ctrl+C/V 透传给远端，复制粘贴请用 Ctrl+Shift+C/V 或右键"
+                  : "已切回标准模式：支持 Ctrl+C/V、Ctrl+Shift+C/V 与右键复制粘贴",
+                "info"
+              );
+            }}
+            title={
+              vimMode
+                ? "Vim/tmux 键位模式已开启：Ctrl+C/V 透传给 nvim/tmux（复制粘贴用 Ctrl+Shift+C/V 或右键）"
+                : "点击开启 Vim/tmux 键位模式：将 Ctrl+C/V 完整透传给 nvim 列块模式"
+            }
+          >
+            Vim
+          </button>
+
+          <button
+            type="button"
+            className="icon-btn"
+            style={{ width: 25, height: 25 }}
+            onClick={() => {
+              void readClipboardText().then((txt) => {
+                if (txt) {
+                  handleRequestPaste(txt);
+                } else {
+                  onNotify?.("剪贴板为空或不含可粘贴文本", "info");
+                }
+              });
+            }}
+            title="从系统剪贴板粘贴到当前终端 (Ctrl+V / Ctrl+Shift+V / 右键)"
+          >
+            <ClipboardPaste size={13} />
           </button>
 
           <button
@@ -926,7 +1128,11 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
             className={`icon-btn ${copyOnSelect ? "active" : ""}`}
             style={{ width: 25, height: 25 }}
             onClick={() => setCopyOnSelect((v) => !v)}
-            title={copyOnSelect ? "选中即复制：已开启（右键直接粘贴）" : "选中即复制：已关闭"}
+            title={
+              copyOnSelect
+                ? "选中即复制：已开启（支持 Ctrl+C/V、Ctrl+Shift+C/V、右键粘贴）"
+                : "选中即复制：已关闭（支持 Ctrl+C/V、Ctrl+Shift+C/V、右键粘贴）"
+            }
           >
             <Copy size={13} />
           </button>
@@ -940,6 +1146,19 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
               A+
             </button>
           </div>
+
+          <select
+            className="term-theme-select"
+            value={fontKey}
+            onChange={(e) => setFontKey(e.target.value as FontKey)}
+            title="切换终端字体（支持 Nerd Font / Powerlevel10k / tmux / nvim 图标）"
+          >
+            {(Object.keys(TERMINAL_FONTS) as FontKey[]).map((k) => (
+              <option key={k} value={k}>
+                {TERMINAL_FONTS[k].label}
+              </option>
+            ))}
+          </select>
 
           <select
             className="term-theme-select"
@@ -1231,11 +1450,14 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
             active={tab.id === activeTab?.id}
             reconnectSeq={tab.reconnectSeq}
             fontSize={fontSize}
+            fontKey={fontKey}
             themeKey={themeKey}
             copyOnSelect={copyOnSelect}
+            vimMode={vimMode}
             onOpenSearch={handleOpenSearch}
             onZoomDelta={handleZoom}
             onRequestPaste={handleRequestPaste}
+            onNotify={onNotify}
             onStatusChange={(status, sizeLabel) =>
               setTabs((prev) =>
                 prev.map((t) =>

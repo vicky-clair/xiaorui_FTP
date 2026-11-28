@@ -156,6 +156,8 @@ pub fn run() {
             commands::ssh_pty_close,
             commands::open_terminal_window,
             commands::focus_main_window,
+            commands::clipboard_read_text,
+            commands::clipboard_write_text,
             commands::save_text_file,
         ])
         .run(tauri::generate_context!())

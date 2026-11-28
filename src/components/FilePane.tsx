@@ -39,6 +39,7 @@ import {
   Upload,
 } from "lucide-react";
 import { formatBytes, formatTime, type FileEntry, type LocalRoot, type RemoteDisk } from "../types";
+import { writeClipboardText } from "../utils/clipboard";
 
 interface FilePaneProps {
   mode: "local" | "remote";
@@ -420,12 +421,9 @@ export const FilePane: React.FC<FilePaneProps> = ({
   };
 
   const handleCopyPath = async (path: string) => {
-    try {
-      await navigator.clipboard.writeText(path);
+    if (await writeClipboardText(path)) {
       onCopyPath?.(path);
       return;
-    } catch {
-      // 回退到临时 textarea 复制，兼容受限 WebView 环境
     }
     try {
       const ta = document.createElement("textarea");

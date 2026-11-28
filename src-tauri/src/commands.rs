@@ -1387,6 +1387,44 @@ pub fn focus_main_window(app: AppHandle) -> AppResult<()> {
     Ok(())
 }
 
+/// 读取操作系统原生剪贴板纯文本内容（解决 Windows WebView2 下 `navigator.clipboard.readText` 权限拦截问题）
+///
+/// 若当前剪贴板为空或存放的是图片/文件等非文本内容，返回空字符串而非报错。
+#[tauri::command]
+pub async fn clipboard_read_text() -> AppResult<String> {
+    tokio::task::spawn_blocking(|| -> AppResult<String> {
+        let mut cb = arboard::Clipboard::new()
+            .map_err(|e| AppError::Protocol(format!("访问系统剪贴板失败: {}", e)))?;
+        match cb.get_text() {
+            Ok(text) => Ok(text),
+            Err(arboard::Error::ContentNotAvailable) => Ok(String::new()),
+            Err(e) => Err(AppError::Protocol(format!("读取系统剪贴板失败: {}", e))),
+        }
+    })
+    .await
+    .map_err(|e| AppError::Protocol(format!("剪贴板读取任务异常: {}", e)))?
+}
+
+/// 将纯文本写入操作系统原生剪贴板（绕过 WebView2 焦点/权限限制，支持 Windows/macOS/Linux）
+#[tauri::command]
+pub async fn clipboard_write_text(text: String) -> AppResult<()> {
+    // 限制单次剪贴板写入体积上限（8 MB），防止异常大文本导致内存峰值
+    if text.len() > 8 * 1024 * 1024 {
+        return Err(AppError::SecurityPolicy(
+            "复制内容超过 8 MB 上限，已被安全策略拦截".into(),
+        ));
+    }
+    tokio::task::spawn_blocking(move || -> AppResult<()> {
+        let mut cb = arboard::Clipboard::new()
+            .map_err(|e| AppError::Protocol(format!("访问系统剪贴板失败: {}", e)))?;
+        cb.set_text(text)
+            .map_err(|e| AppError::Protocol(format!("写入系统剪贴板失败: {}", e)))?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| AppError::Protocol(format!("剪贴板写入任务异常: {}", e)))?
+}
+
 /// 将终端缓冲区日志内容导出保存到本地指定文件（严格限制 `.log`/`.txt` 扩展名、非符号链接与 10 MB 上限）
 #[tauri::command]
 pub async fn save_text_file(file_path: String, content: String) -> AppResult<()> {
