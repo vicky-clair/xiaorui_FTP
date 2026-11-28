@@ -1233,10 +1233,73 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
   const [newRuleLabel, setNewRuleLabel] = useState("");
   const [newRulePattern, setNewRulePattern] = useState("");
 
-  // 命令历史检索（自动脱敏跳过密码/Token）
+  // 命令历史检索弹窗（自动合并远端/本机真实 Shell 历史与本次采集记录，并脱敏跳过密码/Token）
   const [cmdHistory, setCmdHistory] = useState<string[]>(loadHistory);
+  const [shellHistory, setShellHistory] = useState<string[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [historyQuery, setHistoryQuery] = useState("");
+  const [historySelectedIdx, setHistorySelectedIdx] = useState(0);
+
+  const activeTabKind = tabs.find((t) => t.id === activeTabId)?.kind ?? mode;
+
+  const loadShellHistoryNow = useCallback(async () => {
+    setHistoryLoading(true);
+    try {
+      const list =
+        isLocalOnly || activeTabKind === "local" || !sessionId || sessionId === "__local__"
+          ? await api.localShellHistory(500)
+          : await api.remoteShellHistory(sessionId, 500);
+      setShellHistory(list);
+    } catch {
+      // 读取失败时优雅保留本地采集记录
+    } finally {
+      setHistoryLoading(false);
+    }
+  }, [isLocalOnly, activeTabKind, sessionId]);
+
+  useEffect(() => {
+    if (!historyOpen) return;
+    setHistorySelectedIdx(0);
+    void loadShellHistoryNow();
+  }, [historyOpen, loadShellHistoryNow]);
+
+  // 合并本次会话记录 + 真实 Shell 历史文件（最新优先，去重）
+  const mergedHistory = React.useMemo(() => {
+    const seen = new Set<string>();
+    const out: { cmd: string; source: "session" | "shell" }[] = [];
+    for (const c of cmdHistory) {
+      if (!seen.has(c)) {
+        seen.add(c);
+        out.push({ cmd: c, source: "session" });
+      }
+    }
+    for (const c of shellHistory) {
+      if (!seen.has(c)) {
+        seen.add(c);
+        out.push({ cmd: c, source: "shell" });
+      }
+    }
+    return out;
+  }, [cmdHistory, shellHistory]);
+
+  // 支持空格分隔的多关键词实时查找（如输入 "docker log" 匹配 "docker compose logs -f"）
+  const filteredHistory = React.useMemo(() => {
+    const tokens = historyQuery
+      .trim()
+      .toLowerCase()
+      .split(/\s+/)
+      .filter(Boolean);
+    if (tokens.length === 0) return mergedHistory;
+    return mergedHistory.filter((item) => {
+      const lower = item.cmd.toLowerCase();
+      return tokens.every((tk) => lower.includes(tk));
+    });
+  }, [mergedHistory, historyQuery]);
+
+  useEffect(() => {
+    setHistorySelectedIdx(0);
+  }, [historyQuery]);
 
   // 高危命令防呆拦截确认状态
   const [pendingDanger, setPendingDanger] = useState<{
@@ -2325,86 +2388,189 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
         </div>
       )}
 
-      {/* 命令历史模糊检索条（Ctrl+Shift+H） */}
+      {/* 独立居中命令历史弹出查找框（Ctrl+Shift+H，自动拉取远端 ~/.zsh_history / ~/.bash_history 或本机 PowerShell 历史） */}
       {historyOpen && (
         <div
-          className="term-search-bar"
-          style={{ flexDirection: "column", alignItems: "stretch", gap: 6, padding: "6px 10px" }}
+          className="modal-backdrop"
+          onClick={() => {
+            setHistoryOpen(false);
+            getActiveHandle()?.focus();
+          }}
         >
-          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-            <History size={13} color="var(--accent)" />
-            <input
-              value={historyQuery}
-              onChange={(e) => setHistoryQuery(e.target.value)}
-              placeholder="模糊检索已执行命令历史（已自动脱敏过滤密码与密钥）..."
-              autoFocus
-            />
-            {cmdHistory.length > 0 && (
-              <button
-                type="button"
-                className="btn btn-sm btn-ghost"
-                onClick={() => setCmdHistory([])}
-                title="清空本地命令历史"
-              >
-                清空
-              </button>
-            )}
-            <button
-              type="button"
-              className="icon-btn"
-              style={{ width: 22, height: 22 }}
-              onClick={() => setHistoryOpen(false)}
-            >
-              <X size={13} />
-            </button>
-          </div>
           <div
-            style={{
-              display: "flex",
-              flexWrap: "wrap",
-              gap: 5,
-              maxHeight: 92,
-              overflowY: "auto",
-            }}
+            className="modal"
+            style={{ maxWidth: 680, height: "72vh" }}
+            onClick={(e) => e.stopPropagation()}
           >
-            {cmdHistory
-              .filter(
-                (c) =>
-                  !historyQuery.trim() ||
-                  c.toLowerCase().includes(historyQuery.trim().toLowerCase())
-              )
-              .slice(0, 24)
-              .map((cmd) => (
-                <span key={cmd} className="term-snippet-chip">
-                  <button
-                    type="button"
-                    className="term-snippet-run"
-                    onClick={() => {
-                      void getActiveHandle()?.writeInput(cmd);
-                      setHistoryOpen(false);
-                    }}
-                    title="点击仅填入终端命令行（不自动回车）"
-                  >
-                    {cmd.length > 42 ? `${cmd.slice(0, 42)}…` : cmd}
-                  </button>
-                  <button
-                    type="button"
-                    className="term-snippet-del"
-                    onClick={() => {
-                      setHistoryOpen(false);
-                      void runCommandWithGuard(cmd);
-                    }}
-                    title="立即执行该历史命令"
-                  >
-                    ↵
-                  </button>
+            <div className="modal-header">
+              <div style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+                <History size={16} color="var(--accent)" />
+                <span>历史命令查找</span>
+                <span className="drawer-pill tabular-nums">
+                  {filteredHistory.length} / {mergedHistory.length} 条
                 </span>
-              ))}
-            {cmdHistory.length === 0 && (
-              <span style={{ fontSize: 11.5, color: "var(--text-muted)" }}>
-                暂无历史记录，在终端中执行命令后将自动采集（自动跳过含密码/Token 的命令）。
-              </span>
-            )}
+                <span className="drawer-pill">
+                  {isLocalOnly || activeTab?.kind === "local"
+                    ? "本机 PowerShell / Bash 历史"
+                    : "远端 Shell 历史 (~/.zsh_history 等)"}
+                </span>
+              </div>
+              <div style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                <button
+                  type="button"
+                  className="btn-tool btn-tool-xs"
+                  onClick={() => void loadShellHistoryNow()}
+                  title="重新从主机读取最新 Shell 历史记录"
+                >
+                  <RotateCw size={12} className={historyLoading ? "spin" : ""} />
+                  刷新
+                </button>
+                {cmdHistory.length > 0 && (
+                  <button
+                    type="button"
+                    className="btn-tool btn-tool-xs"
+                    onClick={() => {
+                      setCmdHistory([]);
+                      onNotify?.("已清空本次本地记录（远端/本机 Shell 历史文件不受影响）", "info");
+                    }}
+                    title="清空应用本地缓存的本次命令记录"
+                  >
+                    <Trash2 size={12} />
+                    清空本地
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="btn-tool btn-tool-xs"
+                  onClick={() => {
+                    setHistoryOpen(false);
+                    getActiveHandle()?.focus();
+                  }}
+                >
+                  <X size={12} />
+                  关闭
+                </button>
+              </div>
+            </div>
+
+            <div className="modal-body" style={{ flex: 1, minHeight: 0, gap: 10 }}>
+              <div className="search-box" style={{ height: 34 }}>
+                <Search size={14} color="var(--text-muted)" />
+                <input
+                  value={historyQuery}
+                  onChange={(e) => setHistoryQuery(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "ArrowDown") {
+                      e.preventDefault();
+                      setHistorySelectedIdx((i) =>
+                        Math.min(Math.max(0, filteredHistory.length - 1), i + 1)
+                      );
+                    } else if (e.key === "ArrowUp") {
+                      e.preventDefault();
+                      setHistorySelectedIdx((i) => Math.max(0, i - 1));
+                    } else if (e.key === "Enter") {
+                      e.preventDefault();
+                      const picked = filteredHistory[historySelectedIdx];
+                      if (!picked) return;
+                      setHistoryOpen(false);
+                      if (e.ctrlKey || e.metaKey) {
+                        void runCommandWithGuard(picked.cmd);
+                      } else {
+                        void getActiveHandle()?.writeInput(picked.cmd);
+                      }
+                    } else if (e.key === "Escape") {
+                      e.preventDefault();
+                      setHistoryOpen(false);
+                      getActiveHandle()?.focus();
+                    }
+                  }}
+                  placeholder="输入关键词查找历史命令（支持空格多关键词，↑↓ 选择 · Enter 填入 · Ctrl+Enter 执行 · Esc 关闭）..."
+                  autoFocus
+                />
+                {historyQuery && (
+                  <button
+                    type="button"
+                    className="icon-btn"
+                    style={{ width: 22, height: 22 }}
+                    onClick={() => setHistoryQuery("")}
+                    title="清除搜索词"
+                  >
+                    <X size={12} />
+                  </button>
+                )}
+              </div>
+
+              <div className="history-modal-list">
+                {historyLoading && mergedHistory.length === 0 ? (
+                  <div className="monitor-empty-hint" style={{ padding: "36px 0" }}>
+                    正在读取主机历史命令记录...
+                  </div>
+                ) : filteredHistory.length === 0 ? (
+                  <div className="monitor-empty-hint" style={{ padding: "36px 0" }}>
+                    {mergedHistory.length === 0
+                      ? "暂未检测到历史命令记录（已自动跳过含密码/Token 的敏感指令）。"
+                      : `未找到包含「${historyQuery}」的历史命令，换个关键词试试。`}
+                  </div>
+                ) : (
+                  filteredHistory.slice(0, 200).map((item, idx) => (
+                    <div
+                      key={`${item.source}-${item.cmd}`}
+                      className={`history-row ${idx === historySelectedIdx ? "selected" : ""}`}
+                      onMouseEnter={() => setHistorySelectedIdx(idx)}
+                      onClick={() => {
+                        void getActiveHandle()?.writeInput(item.cmd);
+                        setHistoryOpen(false);
+                      }}
+                      title={item.cmd}
+                    >
+                      <span className="history-row-idx tabular-nums">{idx + 1}</span>
+                      <span className="history-row-cmd">{item.cmd}</span>
+                      <div
+                        className="history-row-actions"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        <button
+                          type="button"
+                          className="btn-tool btn-tool-xs"
+                          onClick={() => {
+                            void writeClipboardText(item.cmd).then((ok) => {
+                              if (ok) onNotify?.("已复制历史命令到剪贴板", "info");
+                            });
+                          }}
+                          title="复制此命令到剪贴板"
+                        >
+                          <Copy size={11} />
+                          复制
+                        </button>
+                        <button
+                          type="button"
+                          className="btn-tool btn-tool-xs"
+                          onClick={() => {
+                            void getActiveHandle()?.writeInput(item.cmd);
+                            setHistoryOpen(false);
+                          }}
+                          title="填入终端命令行（不自动回车）"
+                        >
+                          填入
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-sm btn-primary"
+                          style={{ height: 24, padding: "0 8px", fontSize: 11.5 }}
+                          onClick={() => {
+                            setHistoryOpen(false);
+                            void runCommandWithGuard(item.cmd);
+                          }}
+                          title="立即执行该历史命令（受高危防呆保护）"
+                        >
+                          执行
+                        </button>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
           </div>
         </div>
       )}

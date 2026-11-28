@@ -1835,8 +1835,8 @@ select:focus-visible {
 }
 
 .term-search-bar {
-  height: 32px;
-  padding: 0 10px;
+  min-height: 32px;
+  padding: 4px 10px;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -2788,4 +2788,60 @@ select:focus-visible {
   border: 1px solid var(--border);
   background: var(--surface);
   font-size: 12px;
+}
+
+/* 历史命令弹出查找窗口列表样式 */
+.history-modal-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-right: 2px;
+}
+
+.history-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s;
+}
+
+.history-row:hover,
+.history-row.selected {
+  background: var(--surface-hover);
+  border-color: var(--accent);
+}
+
+.history-row-idx {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-muted);
+  min-width: 26px;
+  text-align: right;
+  flex-shrink: 0;
+}
+
+.history-row-cmd {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.history-row-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
 }

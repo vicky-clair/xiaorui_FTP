@@ -1260,6 +1260,56 @@ echo "DISKS_END"
         Ok(true)
     }
 
+    async fn read_shell_history(&self, limit: usize) -> AppResult<Vec<String>> {
+        let home_dir = self
+            .sftp
+            .canonicalize(".")
+            .await
+            .map_err(|e| AppError::Protocol(format!("解析远端用户主目录失败: {}", e)))?;
+
+        // 按常见 Shell 优先级通过纯 SFTP 只读拉取历史文件（零 Shell 注入风险，且不受 tmux 影响）
+        let candidates = [
+            (join_remote_path(&home_dir, ".zsh_history"), "zsh"),
+            (join_remote_path(&home_dir, ".bash_history"), "bash"),
+            (
+                join_remote_path(&home_dir, ".local/share/fish/fish_history"),
+                "fish",
+            ),
+            (
+                join_remote_path(
+                    &home_dir,
+                    "AppData/Roaming/Microsoft/Windows/PowerShell/PSReadLine/ConsoleHost_history.txt",
+                ),
+                "ps",
+            ),
+        ];
+
+        let max_items = limit.clamp(20, 1000);
+        let mut merged: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        for (path, kind) in candidates {
+            // 最多读取 2 MB，若超大则仅取尾部 1 MB
+            if let Ok(bytes) = self.read_bytes(&path, 2 * 1024 * 1024).await {
+                let slice = if bytes.len() > 1024 * 1024 {
+                    &bytes[bytes.len() - 1024 * 1024..]
+                } else {
+                    &bytes[..]
+                };
+                for cmd in crate::local_pty::parse_shell_history_bytes(slice, kind, max_items) {
+                    if seen.insert(cmd.clone()) {
+                        merged.push(cmd);
+                        if merged.len() >= max_items {
+                            return Ok(merged);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(merged)
+    }
+
     async fn start_local_forward(
         &self,
         local_port: u16,

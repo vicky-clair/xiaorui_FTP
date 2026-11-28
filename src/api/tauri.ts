@@ -164,6 +164,10 @@ export const api = {
   listLocalShells: () => invoke<LocalShellOption[]>("list_local_shells"),
   getLocalTerminalDefaults: () =>
     invoke<LocalTerminalDefaults>("get_local_terminal_defaults"),
+  localShellHistory: (limit?: number) =>
+    invoke<string[]>("local_shell_history", { limit: limit ?? 500 }),
+  remoteShellHistory: (sessionId: string, limit?: number) =>
+    invoke<string[]>("remote_shell_history", { sessionId, limit: limit ?? 500 }),
   localPtyOpen: (profile: string, cols: number, rows: number, cwd?: string) =>
     invoke<string>("local_pty_open", { profile, cols, rows, cwd: cwd ?? null }),
   sshPtyOpen: (sessionId: string, cols: number, rows: number) =>

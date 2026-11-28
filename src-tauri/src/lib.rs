@@ -164,6 +164,8 @@ pub fn run() {
             commands::ssh_tunnel_stop,
             commands::list_local_shells,
             commands::get_local_terminal_defaults,
+            commands::local_shell_history,
+            commands::remote_shell_history,
             commands::local_pty_open,
             commands::ssh_pty_open,
             commands::ssh_pty_write,

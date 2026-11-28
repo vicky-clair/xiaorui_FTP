@@ -124,6 +124,13 @@ pub trait RemoteFs: Send + Sync {
         ))
     }
 
+    /// 通过纯 SFTP 读取远端用户的真实 Shell 历史记录（Zsh / Bash / Fish / PowerShell），已脱敏去重
+    async fn read_shell_history(&self, _limit: usize) -> AppResult<Vec<String>> {
+        Err(AppError::Unsupported(
+            "仅 SFTP/SSH 会话支持读取远端 Shell 历史记录".into(),
+        ))
+    }
+
     /// 在本机 `127.0.0.1:<local_port>` 启动 SSH 本地端口转发隧道（`-L local_port:remote_host:remote_port`）
     async fn start_local_forward(
         &self,

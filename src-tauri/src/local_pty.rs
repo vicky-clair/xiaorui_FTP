@@ -786,6 +786,168 @@ fn build_shell_command(profile: &str, cwd: Option<&str>) -> AppResult<CommandBui
     Ok(cmd)
 }
 
+/// 判断历史命令行是否可能包含密码、Token、私钥或凭据（命中时从历史列表中脱敏跳过）
+fn is_sensitive_history_line(cmd: &str) -> bool {
+    let lower = cmd.to_ascii_lowercase();
+    if lower.len() < 2 {
+        return true;
+    }
+    const MARKERS: [&str; 11] = [
+        "passwd",
+        "chpasswd",
+        "sshpass",
+        "password=",
+        "password:",
+        "secret=",
+        "token=",
+        "api_key=",
+        "apikey=",
+        "access_key=",
+        "authorization: bearer",
+    ];
+    MARKERS.iter().any(|m| lower.contains(m))
+}
+
+/// 统一解析 Zsh (`: ts:0;cmd`)、Bash、Fish (`- cmd: ...`) 与 Windows PowerShell PSReadLine 历史文件，
+/// 按“最新在前”去重并自动过滤敏感凭据行
+pub fn parse_shell_history_bytes(bytes: &[u8], kind: &str, limit: usize) -> Vec<String> {
+    let raw = String::from_utf8_lossy(bytes);
+    let mut parsed: Vec<String> = Vec::new();
+
+    match kind {
+        "zsh" => {
+            let mut cur = String::new();
+            for line in raw.lines() {
+                if let Some(rest) = line.strip_prefix(": ") {
+                    if let Some((_, cmd)) = rest.split_once(';') {
+                        if !cur.trim().is_empty() {
+                            parsed.push(cur.trim().to_string());
+                            cur.clear();
+                        }
+                        if let Some(stripped) = cmd.strip_suffix('\\') {
+                            cur.push_str(stripped);
+                            cur.push(' ');
+                        } else {
+                            parsed.push(cmd.trim().to_string());
+                        }
+                        continue;
+                    }
+                }
+                if !cur.is_empty() {
+                    if let Some(stripped) = line.strip_suffix('\\') {
+                        cur.push_str(stripped);
+                        cur.push(' ');
+                    } else {
+                        cur.push_str(line);
+                        parsed.push(cur.trim().to_string());
+                        cur.clear();
+                    }
+                } else {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() {
+                        parsed.push(trimmed.to_string());
+                    }
+                }
+            }
+            if !cur.trim().is_empty() {
+                parsed.push(cur.trim().to_string());
+            }
+        }
+        "fish" => {
+            for line in raw.lines() {
+                if let Some(cmd) = line.trim_start().strip_prefix("- cmd:") {
+                    let clean = cmd.trim().replace("\\n", " ");
+                    if !clean.is_empty() {
+                        parsed.push(clean);
+                    }
+                }
+            }
+        }
+        _ => {
+            // Bash & Windows PowerShell PSReadLine (`ConsoleHost_history.txt`)
+            for line in raw.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue;
+                }
+                parsed.push(trimmed.to_string());
+            }
+        }
+    }
+
+    // 倒序遍历使最新执行的命令排在最前，同时去重与过滤敏感凭据
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    let max_items = limit.clamp(20, 1000);
+    for cmd in parsed.into_iter().rev() {
+        let single_line = cmd.replace(['\r', '\n'], " ").trim().to_string();
+        if single_line.is_empty()
+            || single_line.len() > 2048
+            || is_sensitive_history_line(&single_line)
+        {
+            continue;
+        }
+        if seen.insert(single_line.clone()) {
+            out.push(single_line);
+            if out.len() >= max_items {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// 读取本机操作系统的真实 Shell 历史记录（Windows 优先读取 PowerShell PSReadLine 与 Git Bash；Unix 读取 Zsh/Bash/Fish）
+pub fn read_local_shell_history(limit: usize) -> Vec<String> {
+    let mut candidates: Vec<(std::path::PathBuf, &str)> = Vec::new();
+
+    #[cfg(windows)]
+    {
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            candidates.push((
+                Path::new(&appdata)
+                    .join(r"Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt"),
+                "ps",
+            ));
+        }
+        if let Some(home) = dirs::home_dir() {
+            candidates.push((home.join(".bash_history"), "bash"));
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        if let Some(home) = dirs::home_dir() {
+            candidates.push((home.join(".zsh_history"), "zsh"));
+            candidates.push((home.join(".bash_history"), "bash"));
+            candidates.push((home.join(".local/share/fish/fish_history"), "fish"));
+        }
+    }
+
+    let max_items = limit.clamp(20, 1000);
+    let mut merged: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (path, kind) in candidates {
+        if let Ok(bytes) = std::fs::read(&path) {
+            // 超大历史文件仅截取尾部 1 MB，保证毫秒级加载
+            let slice = if bytes.len() > 1024 * 1024 {
+                &bytes[bytes.len() - 1024 * 1024..]
+            } else {
+                &bytes[..]
+            };
+            for item in parse_shell_history_bytes(slice, kind, max_items) {
+                if seen.insert(item.clone()) {
+                    merged.push(item);
+                    if merged.len() >= max_items {
+                        return merged;
+                    }
+                }
+            }
+        }
+    }
+    merged
+}
+
 /// 启动原生本地 PTY 伪终端并返回与 SSH PTY 完全一致的 `PtyHandle`
 pub fn open_local_pty(
     profile: &str,
@@ -936,5 +1098,20 @@ mod tests {
         assert_eq!(theme.foreground, "#E2E8F0");
         assert_eq!(theme.cursor.as_deref(), Some("#38BDF8"));
         assert_eq!(theme.magenta.as_deref(), Some("#C084FC"));
+    }
+
+    #[test]
+    fn test_parse_shell_history_zsh_fish_ps_and_sanitize() {
+        let zsh_raw = b": 1732700001:0;docker ps -a\n: 1732700002:0;export API_KEY=sk-secret\n: 1732700003:0;nvim ~/.zshrc\n: 1732700004:0;docker ps -a\n";
+        let zsh = parse_shell_history_bytes(zsh_raw, "zsh", 100);
+        assert_eq!(zsh, vec!["docker ps -a", "nvim ~/.zshrc"]);
+
+        let fish_raw = b"- cmd: git status\n  when: 1732700001\n- cmd: passwd root\n  when: 1732700002\n- cmd: ls -la\n  when: 1732700003\n";
+        let fish = parse_shell_history_bytes(fish_raw, "fish", 100);
+        assert_eq!(fish, vec!["ls -la", "git status"]);
+
+        let ps_raw = "Get-Process\r\nGet-PSDrive\r\nGet-Process\r\n".as_bytes();
+        let ps = parse_shell_history_bytes(ps_raw, "ps", 100);
+        assert_eq!(ps, vec!["Get-Process", "Get-PSDrive"]);
     }
 }

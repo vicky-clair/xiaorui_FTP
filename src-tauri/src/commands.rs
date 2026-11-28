@@ -1569,6 +1569,30 @@ pub fn get_local_terminal_defaults() -> LocalTerminalDefaults {
     local_pty::get_local_terminal_defaults()
 }
 
+/// 读取本机真实 Shell 历史记录（Windows PSReadLine / Git Bash / Unix Zsh & Bash）
+#[tauri::command]
+pub async fn local_shell_history(limit: Option<usize>) -> AppResult<Vec<String>> {
+    let max_items = limit.unwrap_or(400);
+    tokio::task::spawn_blocking(move || local_pty::read_local_shell_history(max_items))
+        .await
+        .map_err(|e| AppError::Protocol(format!("读取本机 Shell 历史记录失败: {}", e)))
+}
+
+/// 读取远端 SSH 主机的真实 Shell 历史记录（纯 SFTP 读取 `~/.zsh_history` 等并自动脱敏）
+#[tauri::command]
+pub async fn remote_shell_history(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    session_id: String,
+    limit: Option<usize>,
+) -> AppResult<Vec<String>> {
+    state
+        .ensure_window_session_access(&window, &session_id, "remote_shell_history")
+        .await?;
+    let fs = state.get_fs(&session_id).await?;
+    fs.read_shell_history(limit.unwrap_or(400)).await
+}
+
 /// 打开本地原生交互终端（PowerShell / Git Bash / CMD / Unix Shell），严格走白名单与窗口归属隔离
 #[tauri::command]
 pub async fn local_pty_open(
