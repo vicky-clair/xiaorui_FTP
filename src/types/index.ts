@@ -311,10 +311,17 @@ export interface SshTunnelInfo {
   createdAt: number;
 }
 
+/** 单个硬件温度传感器读数（CPU / GPU / NVMe / 主板等） */
+export interface TempSensor {
+  label: string;
+  tempC: number;
+}
+
 /** 远端或本机服务器硬件规格与实时资源占用快照（支持 Linux / Windows / macOS） */
 export interface ServerMetrics {
   osFamily: "linux" | "windows" | "macos" | string;
   osName: string;
+  kernelVersion?: string | null;
   hostname?: string | null;
   uptimeSecs?: number | null;
   cpuCores: number;
@@ -330,6 +337,10 @@ export interface ServerMetrics {
   gpuUsagePct?: number | null;
   gpuMemUsedMb?: number | null;
   gpuMemTotalMb?: number | null;
+  gpuTempC?: number | null;
+  temperatures: TempSensor[];
+  processCount?: number | null;
+  tcpEstablished?: number | null;
   defaultGateway?: string | null;
   netRxBps: number;
   netTxBps: number;

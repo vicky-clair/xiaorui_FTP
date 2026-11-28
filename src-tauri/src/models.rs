@@ -511,6 +511,16 @@ pub struct SshTunnelInfo {
     pub created_at: i64,
 }
 
+/// 单个硬件温度传感器读数（CPU / GPU / NVMe / 主板等）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TempSensor {
+    /// 传感器名称（如 `CPU`、`GPU`、`NVMe`、`acpitz`）
+    pub label: String,
+    /// 实时温度（摄氏度 °C）
+    pub temp_c: f32,
+}
+
 /// 远端或本机服务器硬件规格与实时资源占用快照（区分 Linux / Windows 采集）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -519,6 +529,8 @@ pub struct ServerMetrics {
     pub os_family: String,
     /// 操作系统名称（如 Debian GNU/Linux 13 / Windows 11 Pro）
     pub os_name: String,
+    /// 内核版本与架构（如 `6.12.22 · x86_64`）
+    pub kernel_version: Option<String>,
     /// 主机名
     pub hostname: Option<String>,
     /// 系统运行时长（秒）
@@ -549,6 +561,14 @@ pub struct ServerMetrics {
     pub gpu_mem_used_mb: Option<u64>,
     /// GPU 显存总量（MB）
     pub gpu_mem_total_mb: Option<u64>,
+    /// GPU 温度（摄氏度 °C）
+    pub gpu_temp_c: Option<f32>,
+    /// 硬件温度传感器列表（CPU / NVMe / 主板 / GPU 等）
+    pub temperatures: Vec<TempSensor>,
+    /// 当前运行进程总数
+    pub process_count: Option<u32>,
+    /// 当前活跃 ESTABLISHED TCP 连接数
+    pub tcp_established: Option<u32>,
     /// 默认网关 IPv4 地址
     pub default_gateway: Option<String>,
     /// 汇总实时下行速率（字节/秒）

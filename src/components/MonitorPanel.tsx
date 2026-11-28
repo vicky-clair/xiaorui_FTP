@@ -564,6 +564,35 @@ export const MonitorPanel: React.FC<MonitorPanelProps> = ({
                   <strong className="tabular-nums">{metrics.loadAvg}</strong>
                 </div>
               )}
+              {metrics?.kernelVersion && (
+                <div className="monitor-detail-row">
+                  <span>内核与架构</span>
+                  <strong className="tabular-nums">{metrics.kernelVersion}</strong>
+                </div>
+              )}
+              {metrics && metrics.temperatures.length > 0 && (
+                <>
+                  <div className="term-popover-sep" />
+                  {metrics.temperatures.map((t) => (
+                    <div key={t.label} className="monitor-detail-row">
+                      <span>{t.label} 温度</span>
+                      <strong
+                        className="tabular-nums"
+                        style={{
+                          color:
+                            t.tempC >= 80
+                              ? "var(--danger)"
+                              : t.tempC >= 68
+                                ? "var(--warning)"
+                                : "var(--success)",
+                        }}
+                      >
+                        {t.tempC.toFixed(1)}°C
+                      </strong>
+                    </div>
+                  ))}
+                </>
+              )}
             </div>
           </div>
         )}
@@ -583,6 +612,24 @@ export const MonitorPanel: React.FC<MonitorPanelProps> = ({
                     {metrics.gpuUsagePct != null ? `${metrics.gpuUsagePct.toFixed(1)}%` : "—"}
                   </strong>
                 </div>
+                {metrics.gpuTempC != null && (
+                  <div className="monitor-detail-row">
+                    <span>GPU 温度</span>
+                    <strong
+                      className="tabular-nums"
+                      style={{
+                        color:
+                          metrics.gpuTempC >= 82
+                            ? "var(--danger)"
+                            : metrics.gpuTempC >= 70
+                              ? "var(--warning)"
+                              : "var(--success)",
+                      }}
+                    >
+                      {metrics.gpuTempC.toFixed(1)}°C
+                    </strong>
+                  </div>
+                )}
                 <div className="monitor-detail-row">
                   <span>显存容量</span>
                   <strong className="tabular-nums">

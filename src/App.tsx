@@ -9,20 +9,22 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import {
+  Activity,
   AlertCircle,
   ArrowDownUp,
   CheckCircle2,
   Cloud,
   Cpu,
   Globe,
-  HardDrive,
   Info,
+  Layers,
   Lock,
-  MemoryStick,
   Minimize2,
+  Network,
   Server,
   ShieldCheck,
   Sparkles,
+  Thermometer,
   X,
 } from "lucide-react";
 import { api } from "./api/tauri";
@@ -52,7 +54,6 @@ import {
   type FileEntry,
   type LocalRoot,
   type Protocol,
-  type RemoteDisk,
   type ServerMetrics,
   type SessionInfo,
   type SiteConfig,
@@ -135,6 +136,7 @@ export default function App() {
   const [serverMetrics, setServerMetrics] = useState<ServerMetrics | null>(null);
   const [localMetrics, setLocalMetrics] = useState<ServerMetrics | null>(null);
   const [metricsLoading, setMetricsLoading] = useState(false);
+  const [remoteRttMs, setRemoteRttMs] = useState<number | null>(null);
   const [remoteCpuHistory, setRemoteCpuHistory] = useState<CpuTrendPoint[]>([]);
   const [localCpuHistory, setLocalCpuHistory] = useState<CpuTrendPoint[]>([]);
 
@@ -200,11 +202,14 @@ export default function App() {
 
   const activeSession = sessions.find((s) => s.sessionId === activeSessionId) ?? null;
 
-  // 远端 SFTP/SSH 实时硬件、网卡流量与 CPU 趋势采集（面板开启时每 5 秒刷新，关闭时 15 秒轻量刷新）
+  // 远端 SFTP/SSH 实时硬件、温度、网卡流量与 CPU 趋势采集（面板开启时每 5 秒刷新，关闭时 15 秒轻量刷新）
   const fetchRemoteMetricsNow = useCallback(async (sid: string) => {
     setMetricsLoading(true);
+    const t0 = performance.now();
     try {
       const m = await api.remoteServerMetrics(sid);
+      const elapsed = Math.round(performance.now() - t0);
+      setRemoteRttMs(Math.max(1, elapsed - 350));
       setServerMetrics(m);
       if (m.cpuUsagePct != null) {
         setRemoteCpuHistory((prev) =>
@@ -222,6 +227,7 @@ export default function App() {
 
   useEffect(() => {
     setRemoteCpuHistory([]);
+    setRemoteRttMs(null);
     if (!activeSession?.supportsShell) {
       setServerMetrics(null);
       return;
@@ -360,25 +366,6 @@ export default function App() {
       pushToast(String(err), "error");
     }
   };
-
-  /** 根据当前远程路径匹配所属远端磁盘（最长前缀优先） */
-  const activeRemoteDisk: RemoteDisk | null = useMemo(() => {
-    const disks = serverMetrics?.disks;
-    if (!disks || disks.length === 0) return null;
-    const norm = remotePath || "/";
-    let best: RemoteDisk | null = null;
-    for (const d of disks) {
-      const mp = d.mountPath.endsWith("/") && d.mountPath.length > 1
-        ? d.mountPath.slice(0, -1)
-        : d.mountPath;
-      const matches =
-        mp === "/" || norm === mp || norm.startsWith(`${mp}/`);
-      if (matches && (!best || mp.length > best.mountPath.length)) {
-        best = d;
-      }
-    }
-    return best ?? disks[0];
-  }, [serverMetrics, remotePath]);
 
   useEffect(() => {
     activeSessionIdRef.current = activeSessionId;
@@ -1397,13 +1384,16 @@ export default function App() {
         )}
       </div>
 
-      {/* 底部现代桌面状态栏（含远端硬件规格/占用、多磁盘快切与托盘模式开关） */}
+      {/* 底部现代桌面状态栏（展示硬件温度监控、进程数、TCP 活跃连接、内核架构与 SSH 延迟，与右侧监控面板互补不重复） */}
       <footer className="status-bar">
-        <span className="status-bar-item" title={serverMetrics?.osName || undefined}>
+        <span
+          className="status-bar-item"
+          title={(activeSession?.supportsShell ? serverMetrics : localMetrics)?.osName || undefined}
+        >
           <span className={`status-dot ${activeSession ? "online" : ""}`} />
           {activeSession
             ? `${PROTOCOL_META[activeSession.protocol].short} · ${activeSession.host}`
-            : "就绪 · 未连接远程站点"}
+            : "本机就绪 · 未连接远程站点"}
         </span>
 
         {activeSession?.insecureTransport && (
@@ -1423,71 +1413,74 @@ export default function App() {
           </span>
         )}
 
-        {activeSession?.supportsShell && serverMetrics && (
-          <div className="metrics-strip">
-            <span
-              className={`metric-pill tabular-nums ${
-                (serverMetrics.cpuUsagePct ?? 0) >= 85
-                  ? "hot"
-                  : (serverMetrics.cpuUsagePct ?? 0) >= 65
-                    ? "warn"
-                    : ""
-              }`}
-              title={`系统：${serverMetrics.osName}${serverMetrics.loadAvg ? ` · 1分钟负载：${serverMetrics.loadAvg}` : ""}`}
-            >
-              <Cpu size={11} />
-              {serverMetrics.cpuCores > 0 ? `${serverMetrics.cpuCores}C` : "CPU"}
-              {serverMetrics.cpuUsagePct != null
-                ? ` ${Math.round(serverMetrics.cpuUsagePct)}%`
-                : serverMetrics.loadAvg
-                  ? ` L:${serverMetrics.loadAvg}`
-                  : ""}
-            </span>
+        {(() => {
+          const statusMetrics = activeSession?.supportsShell ? serverMetrics : localMetrics;
+          if (!statusMetrics) return null;
+          const allTempTitle =
+            statusMetrics.temperatures.length > 0
+              ? `硬件温度传感器：\n${statusMetrics.temperatures
+                  .map((t) => `${t.label}: ${t.tempC.toFixed(1)}°C`)
+                  .join("\n")}`
+              : undefined;
+          return (
+            <div className="metrics-strip">
+              {statusMetrics.temperatures.slice(0, 3).map((t) => (
+                <span
+                  key={t.label}
+                  className={`metric-pill tabular-nums ${
+                    t.tempC >= 80 ? "hot" : t.tempC >= 68 ? "warn" : ""
+                  }`}
+                  title={allTempTitle}
+                >
+                  <Thermometer size={11} />
+                  {t.label} {Math.round(t.tempC)}°C
+                </span>
+              ))}
 
-            {serverMetrics.memTotalBytes > 0 && (() => {
-              const memPct = Math.min(
-                100,
-                Math.round((serverMetrics.memUsedBytes / serverMetrics.memTotalBytes) * 100)
-              );
-              return (
+              {statusMetrics.processCount != null && (
+                <span
+                  className="metric-pill tabular-nums"
+                  title={`${activeSession?.supportsShell ? "远端" : "本机"}当前运行进程总数`}
+                >
+                  <Layers size={11} />
+                  进程 {statusMetrics.processCount}
+                </span>
+              )}
+
+              {statusMetrics.tcpEstablished != null && (
+                <span
+                  className="metric-pill tabular-nums"
+                  title={`${activeSession?.supportsShell ? "远端" : "本机"}当前处于 ESTABLISHED 状态的活跃 TCP 连接数`}
+                >
+                  <Network size={11} />
+                  TCP {statusMetrics.tcpEstablished}
+                </span>
+              )}
+
+              {statusMetrics.kernelVersion && (
+                <span
+                  className="metric-pill tabular-nums"
+                  title={`操作系统：${statusMetrics.osName} · 内核与架构：${statusMetrics.kernelVersion}`}
+                >
+                  <Cpu size={11} />
+                  {statusMetrics.kernelVersion}
+                </span>
+              )}
+
+              {activeSession?.supportsShell && remoteRttMs != null && (
                 <span
                   className={`metric-pill tabular-nums ${
-                    memPct >= 88 ? "hot" : memPct >= 72 ? "warn" : ""
+                    remoteRttMs >= 500 ? "hot" : remoteRttMs >= 200 ? "warn" : ""
                   }`}
-                  title={`远端内存：已用 ${formatBytes(serverMetrics.memUsedBytes)} / 总计 ${formatBytes(serverMetrics.memTotalBytes)} (${memPct}%)`}
+                  title="SSH 监控通道估算往返延迟 (RTT)"
                 >
-                  <MemoryStick size={11} />
-                  {formatBytes(serverMetrics.memUsedBytes)}/{formatBytes(serverMetrics.memTotalBytes)} ({memPct}%)
+                  <Activity size={11} />
+                  延迟 {remoteRttMs}ms
                 </span>
-              );
-            })()}
-
-            {activeRemoteDisk && (
-              <span
-                className={`metric-pill tabular-nums ${
-                  activeRemoteDisk.usePercent >= 90
-                    ? "hot"
-                    : activeRemoteDisk.usePercent >= 78
-                      ? "warn"
-                      : ""
-                }`}
-                title={
-                  `远端磁盘状态（可在上方远程面板顶部磁盘下拉框切换）：\n` +
-                  serverMetrics.disks
-                    .map(
-                      (d) =>
-                        `${d.label}  ${d.usePercent}%  (${formatBytes(d.usedBytes)} / ${formatBytes(d.totalBytes)}，剩余 ${formatBytes(d.availBytes)})`
-                    )
-                    .join("\n")
-                }
-              >
-                <HardDrive size={11} />
-                {activeRemoteDisk.label} {activeRemoteDisk.usePercent}%
-                {serverMetrics.disks.length > 1 ? ` · 共${serverMetrics.disks.length}盘` : ""}
-              </span>
-            )}
-          </div>
-        )}
+              )}
+            </div>
+          );
+        })()}
 
         <div className="status-bar-right">
           {activeTransferCount > 0 && (

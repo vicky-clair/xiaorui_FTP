@@ -26,7 +26,7 @@ use crate::error::{AppError, AppResult};
 use crate::known_hosts::{HostKeyCheckError, KnownHostsStore};
 use crate::models::{
     format_unix_mode, join_remote_path, normalize_remote_path, AgentStatus, AuthType, FileEntry,
-    NetInterface, RemoteDisk, ServerMetrics, ShellOutput,
+    NetInterface, RemoteDisk, ServerMetrics, ShellOutput, TempSensor,
 };
 use crate::protocols::{ProgressCallback, PtyCommand, PtyHandle, RemoteFs, TunnelRuntimeHandle};
 use crate::security::{
@@ -1036,12 +1036,16 @@ if [ -r /proc/meminfo ]; then
   [ -n "$SWAP_T" ] && [ -n "$SWAP_F" ] && SWAP_U=$((SWAP_T - SWAP_F))
 fi
 GW=$(ip route show default 2>/dev/null | awk "/default/{print \$3; exit}")
+KERNEL="$(uname -r 2>/dev/null | cut -d- -f1) · $(uname -m 2>/dev/null)"
+PROCS=$(ls -d /proc/[0-9]* 2>/dev/null | wc -l | tr -d " ")
+TCP_EST=$(awk "\$4==\"01\"{c++} END{print c+0}" /proc/net/tcp /proc/net/tcp6 2>/dev/null || echo 0)
 GPU=""
 if command -v nvidia-smi >/dev/null 2>&1; then
-  GPU=$(nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null | head -n1)
+  GPU=$(nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu --format=csv,noheader,nounits 2>/dev/null | head -n1)
 fi
 echo "OS_FAMILY=$OS_FAM"
 echo "OS=$OS"
+echo "KERNEL=$KERNEL"
 echo "HOST=$HOST"
 echo "UPTIME=$UPTIME"
 echo "CORES=$CORES"
@@ -1052,7 +1056,38 @@ echo "LOAD=$LOAD"
 echo "MEM=$MEM_U:$MEM_T"
 echo "SWAP=$SWAP_U:$SWAP_T"
 echo "GW=$GW"
+echo "PROCS=$PROCS"
+echo "TCP_EST=$TCP_EST"
 [ -n "$GPU" ] && echo "GPU=$GPU"
+echo "TEMPS_BEGIN"
+FOUND_HWMON=0
+for hw in /sys/class/hwmon/hwmon*; do
+  [ -d "$hw" ] || continue
+  hname=$(cat "$hw/name" 2>/dev/null || true)
+  for tin in "$hw"/temp*_input; do
+    [ -r "$tin" ] || continue
+    raw=$(cat "$tin" 2>/dev/null || true)
+    [ -n "$raw" ] && [ "$raw" -gt 0 ] 2>/dev/null || continue
+    lbl_f="${tin%_input}_label"
+    lbl=$(cat "$lbl_f" 2>/dev/null || true)
+    [ -z "$lbl" ] && lbl="$hname"
+    [ -z "$lbl" ] && lbl="sensor"
+    deg=$(awk "BEGIN{printf \"%.1f\", $raw/1000}")
+    echo "${hname}:${lbl}|${deg}"
+    FOUND_HWMON=1
+  done
+done
+if [ "$FOUND_HWMON" -eq 0 ]; then
+  for tz in /sys/class/thermal/thermal_zone*; do
+    [ -r "$tz/temp" ] || continue
+    raw=$(cat "$tz/temp" 2>/dev/null || true)
+    [ -n "$raw" ] && [ "$raw" -gt 0 ] 2>/dev/null || continue
+    tname=$(cat "$tz/type" 2>/dev/null || basename "$tz")
+    deg=$(awk "BEGIN{printf \"%.1f\", $raw/1000}")
+    echo "${tname}|${deg}"
+  done
+fi
+echo "TEMPS_END"
 echo "NET_BEGIN"
 if [ -n "$NET2" ]; then
   IPS=$(ip -4 -o addr show 2>/dev/null | awk "{split(\$4,a,\"/\"); print \$2, a[1]}")
@@ -1311,9 +1346,9 @@ echo "DISKS_END"
     }
 }
 
-/// 构造 Windows 平台硬件/多盘/网卡实时采集 PowerShell 命令（同时服务远端 Windows SSH 与本机 Windows 监控）
+/// 构造 Windows 平台硬件/温度/进程/TCP/多盘/网卡实时采集 PowerShell 命令（同时服务远端 Windows SSH 与本机 Windows 监控）
 pub fn build_windows_metrics_script() -> &'static str {
-    r#"$os=Get-CimInstance Win32_OperatingSystem;$cs=Get-CimInstance Win32_ComputerSystem;$cpu=(Get-CimInstance Win32_Processor|Measure-Object -Property LoadPercentage -Average).Average;$up=[int64]([DateTime]::Now-$os.LastBootUpTime).TotalSeconds;$gw=(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue|Sort-Object RouteMetric|Select-Object -First 1 -ExpandProperty NextHop);$gpu=Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue|Select-Object -First 1;$s1=@{};Get-NetAdapterStatistics -ErrorAction SilentlyContinue|ForEach-Object{$s1[$_.Name]=@($_.ReceivedBytes,$_.SentBytes)};Start-Sleep -Milliseconds 350;$s2=Get-NetAdapterStatistics -ErrorAction SilentlyContinue;$ips=@{};Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue|Where-Object{$_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*'}|ForEach-Object{if(-not $ips.ContainsKey($_.InterfaceAlias)){$ips[$_.InterfaceAlias]=$_.IPAddress}};Write-Output 'OS_FAMILY=windows';Write-Output ('OS='+$os.Caption);Write-Output ('HOST='+$cs.Name);Write-Output ('UPTIME='+$up);Write-Output ('CORES='+$cs.NumberOfLogicalProcessors);Write-Output ('CPU='+$cpu);Write-Output ('MEM='+(($os.TotalVisibleMemorySize-$os.FreePhysicalMemory)*1024)+':'+($os.TotalVisibleMemorySize*1024));$swT=($os.TotalVirtualMemorySize-$os.TotalVisibleMemorySize)*1024;if($swT -lt 0){$swT=0};$swF=($os.FreeVirtualMemory-$os.FreePhysicalMemory)*1024;if($swF -lt 0){$swF=0};$swU=$swT-$swF;if($swU -lt 0){$swU=0};Write-Output ('SWAP='+$swU+':'+$swT);if($gw){Write-Output ('GW='+$gw)};if($gpu){$vram=[int64]([math]::Round(($gpu.AdapterRAM)/1MB));Write-Output ('GPU='+$gpu.Name+',,0,'+$vram)};Write-Output 'NET_BEGIN';Get-NetAdapter -ErrorAction SilentlyContinue|Where-Object{$_.Status -eq 'Up' -or $ips.ContainsKey($_.Name)}|ForEach-Object{$n=$_.Name;$st=$s2|Where-Object{$_.Name -eq $n}|Select-Object -First 1;$rx=0;$tx=0;if($st -and $s1.ContainsKey($n)){$rx=[int64]([math]::Max(0,($st.ReceivedBytes-$s1[$n][0])/0.35));$tx=[int64]([math]::Max(0,($st.SentBytes-$s1[$n][1])/0.35))};$ip=$ips[$n];Write-Output ($n+'|'+$ip+'|'+$rx+'|'+$tx)};Write-Output 'NET_END';Write-Output 'DISKS_BEGIN';Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3'|ForEach-Object{$u=$_.Size-$_.FreeSpace;Write-Output ('WIN|'+$_.DeviceID+'|'+$_.Size+'|'+$u+'|'+$_.FreeSpace)};Write-Output 'DISKS_END'"#
+    r#"$os=Get-CimInstance Win32_OperatingSystem;$cs=Get-CimInstance Win32_ComputerSystem;$cpu=(Get-CimInstance Win32_Processor|Measure-Object -Property LoadPercentage -Average).Average;$up=[int64]([DateTime]::Now-$os.LastBootUpTime).TotalSeconds;$gw=(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue|Sort-Object RouteMetric|Select-Object -First 1 -ExpandProperty NextHop);$gpu=Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue|Select-Object -First 1;$procs=(Get-Process -ErrorAction SilentlyContinue).Count;$tcpEst=(Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue).Count;$s1=@{};Get-NetAdapterStatistics -ErrorAction SilentlyContinue|ForEach-Object{$s1[$_.Name]=@($_.ReceivedBytes,$_.SentBytes)};Start-Sleep -Milliseconds 350;$s2=Get-NetAdapterStatistics -ErrorAction SilentlyContinue;$ips=@{};Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue|Where-Object{$_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*'}|ForEach-Object{if(-not $ips.ContainsKey($_.InterfaceAlias)){$ips[$_.InterfaceAlias]=$_.IPAddress}};Write-Output 'OS_FAMILY=windows';Write-Output ('OS='+$os.Caption);Write-Output ('KERNEL='+$os.Version+' · '+$os.OSArchitecture);Write-Output ('HOST='+$cs.Name);Write-Output ('UPTIME='+$up);Write-Output ('CORES='+$cs.NumberOfLogicalProcessors);Write-Output ('CPU='+$cpu);Write-Output ('PROCS='+$procs);Write-Output ('TCP_EST='+$tcpEst);Write-Output ('MEM='+(($os.TotalVisibleMemorySize-$os.FreePhysicalMemory)*1024)+':'+($os.TotalVisibleMemorySize*1024));$swT=($os.TotalVirtualMemorySize-$os.TotalVisibleMemorySize)*1024;if($swT -lt 0){$swT=0};$swF=($os.FreeVirtualMemory-$os.FreePhysicalMemory)*1024;if($swF -lt 0){$swF=0};$swU=$swT-$swF;if($swU -lt 0){$swU=0};Write-Output ('SWAP='+$swU+':'+$swT);if($gw){Write-Output ('GW='+$gw)};$nv=Get-Command nvidia-smi -ErrorAction SilentlyContinue;if($nv){$nvOut=& nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu --format=csv,noheader,nounits 2>$null|Select-Object -First 1;if($nvOut){Write-Output ('GPU='+$nvOut)}}elseif($gpu){$vram=[int64]([math]::Round(($gpu.AdapterRAM)/1MB));Write-Output ('GPU='+$gpu.Name+',,0,'+$vram)};Write-Output 'TEMPS_BEGIN';Get-CimInstance -Namespace root/wmi -ClassName MSAcpi_ThermalZoneTemperature -ErrorAction SilentlyContinue|ForEach-Object{$c=[math]::Round(($_.CurrentTemperature-2732)/10.0,1);if($c -gt 0 -and $c -lt 130){Write-Output ('ACPI|'+$c)}};Write-Output 'TEMPS_END';Write-Output 'NET_BEGIN';Get-NetAdapter -ErrorAction SilentlyContinue|Where-Object{$_.Status -eq 'Up' -or $ips.ContainsKey($_.Name)}|ForEach-Object{$n=$_.Name;$st=$s2|Where-Object{$_.Name -eq $n}|Select-Object -First 1;$rx=0;$tx=0;if($st -and $s1.ContainsKey($n)){$rx=[int64]([math]::Max(0,($st.ReceivedBytes-$s1[$n][0])/0.35));$tx=[int64]([math]::Max(0,($st.SentBytes-$s1[$n][1])/0.35))};$ip=$ips[$n];Write-Output ($n+'|'+$ip+'|'+$rx+'|'+$tx)};Write-Output 'NET_END';Write-Output 'DISKS_BEGIN';Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3'|ForEach-Object{$u=$_.Size-$_.FreeSpace;Write-Output ('WIN|'+$_.DeviceID+'|'+$_.Size+'|'+$u+'|'+$_.FreeSpace)};Write-Output 'DISKS_END'"#
 }
 
 fn build_windows_metrics_command() -> String {
@@ -1370,7 +1405,51 @@ fn is_ignored_fs(fs_type: Option<&str>, dev: &str, mount: &str) -> bool {
         || mount.starts_with("/etc/")
 }
 
-/// 解析 POSIX（Linux/macOS）或 Windows 远端/本机硬件、网卡流量与多磁盘采集输出
+/// 将 Linux `hwmon` / `thermal_zone` 原始传感器名称归一化为易读短标签并赋予展示优先级
+fn normalize_temp_sensor_label(raw: &str) -> (u8, String) {
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("package id")
+        || lower.contains("tctl")
+        || lower.contains("tdie")
+        || lower.contains("x86_pkg_temp")
+        || lower.contains("cpu-thermal")
+        || lower.contains("coretemp")
+        || lower.contains("k10temp")
+        || lower.contains("zenpower")
+    {
+        return (0, "CPU".to_string());
+    }
+    if lower.contains("gpu") || lower.contains("amdgpu") || lower.contains("nouveau") {
+        return (1, "GPU".to_string());
+    }
+    if lower.contains("nvme") || lower.contains("drivetemp") || lower.contains("sata") {
+        return (2, "NVMe".to_string());
+    }
+    if lower.contains("iwlwifi") || lower.contains("wifi") || lower.contains("phy") {
+        return (4, "WiFi".to_string());
+    }
+    if lower.contains("acpitz") || lower.contains("acpi") || lower.contains("pch") {
+        return (3, "主板".to_string());
+    }
+    let clean = raw
+        .split(':')
+        .next_back()
+        .unwrap_or(raw)
+        .trim()
+        .chars()
+        .take(16)
+        .collect::<String>();
+    (
+        5,
+        if clean.is_empty() {
+            "传感器".into()
+        } else {
+            clean
+        },
+    )
+}
+
+/// 解析 POSIX（Linux/macOS）或 Windows 远端/本机硬件、温度传感器、网卡流量与多磁盘采集输出
 pub fn parse_server_metrics(raw: &str) -> Option<ServerMetrics> {
     if !raw.contains("DISKS_BEGIN") {
         return None;
@@ -1378,6 +1457,7 @@ pub fn parse_server_metrics(raw: &str) -> Option<ServerMetrics> {
 
     let mut os_family = String::new();
     let mut os_name = String::new();
+    let mut kernel_version: Option<String> = None;
     let mut hostname: Option<String> = None;
     let mut uptime_secs: Option<u64> = None;
     let mut cpu_cores: u32 = 0;
@@ -1393,13 +1473,17 @@ pub fn parse_server_metrics(raw: &str) -> Option<ServerMetrics> {
     let mut gpu_usage_pct: Option<f32> = None;
     let mut gpu_mem_used_mb: Option<u64> = None;
     let mut gpu_mem_total_mb: Option<u64> = None;
+    let mut gpu_temp_c: Option<f32> = None;
+    let mut raw_temps: Vec<(u8, String, f32)> = Vec::new();
+    let mut process_count: Option<u32> = None;
+    let mut tcp_established: Option<u32> = None;
     let mut default_gateway: Option<String> = None;
     let mut net_interfaces: Vec<NetInterface> = Vec::new();
     let mut disks: Vec<RemoteDisk> = Vec::new();
     let mut seen_mounts = std::collections::HashSet::new();
     // 同一物理块设备（如 /dev/sda1）在多处 bind 挂载时仅保留主挂载点，防止 1 块盘被重复计为多盘
     let mut seen_devs: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut section = 0u8; // 0 = header, 1 = disks, 2 = net
+    let mut section = 0u8; // 0 = header, 1 = disks, 2 = net, 3 = temps
 
     for raw_line in raw.lines() {
         let line = raw_line.trim();
@@ -1410,12 +1494,16 @@ pub fn parse_server_metrics(raw: &str) -> Option<ServerMetrics> {
             section = 1;
             continue;
         }
-        if line == "DISKS_END" || line == "NET_END" {
+        if line == "DISKS_END" || line == "NET_END" || line == "TEMPS_END" {
             section = 0;
             continue;
         }
         if line == "NET_BEGIN" {
             section = 2;
+            continue;
+        }
+        if line == "TEMPS_BEGIN" {
+            section = 3;
             continue;
         }
 
@@ -1424,6 +1512,11 @@ pub fn parse_server_metrics(raw: &str) -> Option<ServerMetrics> {
                 os_family = v.trim().to_ascii_lowercase();
             } else if let Some(v) = line.strip_prefix("OS=") {
                 os_name = v.trim().to_string();
+            } else if let Some(v) = line.strip_prefix("KERNEL=") {
+                let s = v.trim();
+                if !s.is_empty() && s != "·" {
+                    kernel_version = Some(s.to_string());
+                }
             } else if let Some(v) = line.strip_prefix("HOST=") {
                 let s = v.trim();
                 if !s.is_empty() {
@@ -1435,6 +1528,14 @@ pub fn parse_server_metrics(raw: &str) -> Option<ServerMetrics> {
                 }
             } else if let Some(v) = line.strip_prefix("CORES=") {
                 cpu_cores = v.trim().parse().unwrap_or(0);
+            } else if let Some(v) = line.strip_prefix("PROCS=") {
+                if let Ok(n) = v.trim().parse::<u32>() {
+                    process_count = Some(n);
+                }
+            } else if let Some(v) = line.strip_prefix("TCP_EST=") {
+                if let Ok(n) = v.trim().parse::<u32>() {
+                    tcp_established = Some(n);
+                }
             } else if let Some(v) = line.strip_prefix("CPU=") {
                 if let Ok(pct) = v.trim().parse::<f32>() {
                     if pct.is_finite() {
@@ -1489,6 +1590,24 @@ pub fn parse_server_metrics(raw: &str) -> Option<ServerMetrics> {
                 if let Some(total) = parts.get(3).and_then(|s| s.parse::<u64>().ok()) {
                     if total > 0 {
                         gpu_mem_total_mb = Some(total);
+                    }
+                }
+                if let Some(t) = parts.get(4).and_then(|s| s.parse::<f32>().ok()) {
+                    if t.is_finite() && t > 0.0 && t < 130.0 {
+                        gpu_temp_c = Some(t);
+                    }
+                }
+            }
+            continue;
+        }
+
+        if section == 3 {
+            // 温度行格式：sensor_name|48.5
+            if let Some((name, val)) = line.split_once('|') {
+                if let Ok(deg) = val.trim().parse::<f32>() {
+                    if deg.is_finite() && deg > 0.0 && deg < 130.0 {
+                        let (prio, label) = normalize_temp_sensor_label(name.trim());
+                        raw_temps.push((prio, label, deg));
                     }
                 }
             }
@@ -1648,6 +1767,22 @@ pub fn parse_server_metrics(raw: &str) -> Option<ServerMetrics> {
         .map(|n| n.tx_bytes_per_sec)
         .fold(0u64, u64::saturating_add);
 
+    if let Some(gt) = gpu_temp_c {
+        raw_temps.push((1, "GPU".to_string(), gt));
+    }
+    // 同类传感器按最高温度去重聚合（例如多核 CPU 保留最高核心温度），再按 CPU -> GPU -> NVMe -> 主板 排序
+    raw_temps.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let mut temperatures: Vec<TempSensor> = Vec::new();
+    for (_, label, deg) in raw_temps {
+        if let Some(existing) = temperatures.iter_mut().find(|t| t.label == label) {
+            if deg > existing.temp_c {
+                existing.temp_c = deg;
+            }
+        } else {
+            temperatures.push(TempSensor { label, temp_c: deg });
+        }
+    }
+
     Some(ServerMetrics {
         os_family,
         os_name: if os_name.is_empty() {
@@ -1655,6 +1790,7 @@ pub fn parse_server_metrics(raw: &str) -> Option<ServerMetrics> {
         } else {
             os_name
         },
+        kernel_version,
         hostname,
         uptime_secs,
         cpu_cores,
@@ -1670,6 +1806,10 @@ pub fn parse_server_metrics(raw: &str) -> Option<ServerMetrics> {
         gpu_usage_pct,
         gpu_mem_used_mb,
         gpu_mem_total_mb,
+        gpu_temp_c,
+        temperatures,
+        process_count,
+        tcp_established,
         default_gateway,
         net_rx_bps,
         net_tx_bps,
@@ -1695,6 +1835,7 @@ mod tests {
         let sample = r#"
 OS_FAMILY=linux
 OS=Ubuntu 22.04.4 LTS
+KERNEL=6.12.22 · x86_64
 HOST=debian-srv
 UPTIME=1425600
 CORES=8
@@ -1705,7 +1846,15 @@ LOAD=0.64 0.51 0.42
 MEM=4294967296:17179869184
 SWAP=536870912:2147483648
 GW=192.168.9.1
-GPU=NVIDIA RTX 4060, 18, 1024, 8192
+PROCS=184
+TCP_EST=26
+GPU=NVIDIA RTX 4060, 18, 1024, 8192, 52
+TEMPS_BEGIN
+coretemp:Package id 0|48.5
+coretemp:Core 0|45.0
+nvme:Composite|41.0
+acpitz:acpitz|44.0
+TEMPS_END
 NET_BEGIN
 enp2s0|192.168.9.165|18432|7168
 wlp1s0||0|0
@@ -1734,6 +1883,15 @@ DISKS_END
         assert_eq!(m.default_gateway.as_deref(), Some("192.168.9.1"));
         assert_eq!(m.gpu_name.as_deref(), Some("NVIDIA RTX 4060"));
         assert_eq!(m.gpu_mem_total_mb, Some(8192));
+        assert_eq!(m.gpu_temp_c, Some(52.0));
+        assert_eq!(m.kernel_version.as_deref(), Some("6.12.22 · x86_64"));
+        assert_eq!(m.process_count, Some(184));
+        assert_eq!(m.tcp_established, Some(26));
+        assert_eq!(m.temperatures.len(), 4);
+        assert_eq!(m.temperatures[0].label, "CPU");
+        assert_eq!(m.temperatures[0].temp_c, 48.5);
+        assert_eq!(m.temperatures[1].label, "GPU");
+        assert_eq!(m.temperatures[2].label, "NVMe");
         assert_eq!(m.net_interfaces.len(), 2);
         assert_eq!(m.net_rx_bps, 18432);
         assert_eq!(m.net_tx_bps, 7168);
