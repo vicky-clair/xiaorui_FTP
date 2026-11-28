@@ -51,6 +51,7 @@ import {
   highlightTerminalText,
   isSensitiveCommand,
   matchDangerousCommand,
+  parseOsc52Write,
   parseOsc7Path,
   type DangerousCommandMatch,
   type HighlightRule,
@@ -578,8 +579,29 @@ const PtyTabPane = React.forwardRef<
       } catch {
         webglAddon = null;
       }
-      // 终端输出纵深防御：显式拦截恶意远端 OSC 52（剪贴板读写）与 OSC 8（隐藏超链接）控制序列
-      const osc52Disp = term.parser.registerOscHandler(52, () => true);
+      // 追踪用户最近一次真实交互时间，用于安全门控 tmux / nvim 发出的 OSC 52 写入复制
+      let lastUserInteractionAt = 0;
+      let isMouseDragging = false;
+      let lastAutoCopiedText = "";
+      let lastAutoCopiedAt = 0;
+      let selDebounceTimer: number | undefined;
+
+      // 终端输出纵深防御：
+      // - 永久阻断 OSC 8（隐藏超链接）与 OSC 52 读取（`?`）；
+      // - 仅在用户 3 秒内有真实鼠标/键盘交互时，安全放行 tmux / nvim 的 OSC 52 写入到系统原生剪贴板
+      const osc52Disp = term.parser.registerOscHandler(52, (payload) => {
+        const text = parseOsc52Write(payload);
+        if (text && Date.now() - lastUserInteractionAt <= 3000) {
+          void writeClipboardText(text).then((ok) => {
+            if (ok && !disposed) {
+              lastAutoCopiedText = text;
+              lastAutoCopiedAt = Date.now();
+              onNotifyRef.current?.("已复制选中内容到剪贴板 (tmux/nvim)", "info");
+            }
+          });
+        }
+        return true;
+      });
       const osc8Disp = term.parser.registerOscHandler(8, () => true);
       // 终端 -> SFTP 目录自动跟随：解析现代 Shell (zsh/bash/fish) 上报的 OSC 7 当前工作目录
       const osc7Disp = term.parser.registerOscHandler(7, (payload) => {
@@ -616,18 +638,49 @@ const PtyTabPane = React.forwardRef<
         }
       };
 
-      // Xshell 经典交互：鼠标划选松手（mouseup）时写入系统剪贴板一次，避免拖动过程中高频争抢 Windows 剪贴板锁
-      const onMouseUpCopy = (ev: MouseEvent) => {
-        if (ev.button !== 0 || !copyOnSelectRef.current) return;
-        window.setTimeout(() => {
-          if (disposed) return;
-          const sel = term.getSelection();
-          if (sel && sel.trim().length > 0) {
-            void writeClipboardText(sel);
+      // Xshell 经典交互：支持左键拖选（含拖到终端边界外松手）、双击选词、三击选行及 Shift+拖选
+      const tryAutoCopySelection = () => {
+        if (disposed || !copyOnSelectRef.current) return;
+        const sel = term.getSelection();
+        if (!sel || sel.trim().length === 0) return;
+        const now = Date.now();
+        if (sel === lastAutoCopiedText && now - lastAutoCopiedAt < 600) return;
+        lastAutoCopiedText = sel;
+        lastAutoCopiedAt = now;
+        void writeClipboardText(sel).then((ok) => {
+          if (ok && !disposed) {
+            onNotifyRef.current?.("已自动复制选中内容到剪贴板", "info");
           }
-        }, 0);
+        });
       };
-      container.addEventListener("mouseup", onMouseUpCopy);
+
+      const onMouseDownInTerm = (ev: MouseEvent) => {
+        lastUserInteractionAt = Date.now();
+        if (ev.button === 0) {
+          isMouseDragging = true;
+        }
+      };
+      const onWindowMouseUp = (ev: MouseEvent) => {
+        if (ev.button !== 0 || !isMouseDragging) return;
+        isMouseDragging = false;
+        lastUserInteractionAt = Date.now();
+        // 延迟一帧等待 xterm.js 完成选区落定，兼容拖出边界松手
+        window.setTimeout(tryAutoCopySelection, 20);
+      };
+      const onKeyInteract = () => {
+        lastUserInteractionAt = Date.now();
+      };
+
+      container.addEventListener("mousedown", onMouseDownInTerm, true);
+      container.addEventListener("keydown", onKeyInteract, true);
+      window.addEventListener("mouseup", onWindowMouseUp, true);
+
+      // 防抖监听选区变化（160ms）：覆盖双击选词、三击选行与键盘选区，且拖动中不争抢 Windows 剪贴板锁
+      const selDisp = term.onSelectionChange(() => {
+        if (!copyOnSelectRef.current || isMouseDragging) return;
+        if (selDebounceTimer) window.clearTimeout(selDebounceTimer);
+        selDebounceTimer = window.setTimeout(tryAutoCopySelection, 160);
+      });
 
       // 捕获经由系统编辑菜单或输入法触发的原生 paste 事件，统一走多行安全确认通道且防重复写入
       const onNativePaste = (ev: ClipboardEvent) => {
@@ -878,9 +931,13 @@ const PtyTabPane = React.forwardRef<
       return () => {
         disposed = true;
         if (resizeTimer) window.clearTimeout(resizeTimer);
+        if (selDebounceTimer) window.clearTimeout(selDebounceTimer);
         ro.disconnect();
-        container.removeEventListener("mouseup", onMouseUpCopy);
+        container.removeEventListener("mousedown", onMouseDownInTerm, true);
+        container.removeEventListener("keydown", onKeyInteract, true);
+        window.removeEventListener("mouseup", onWindowMouseUp, true);
         container.removeEventListener("paste", onNativePaste, true);
+        selDisp.dispose();
         osc52Disp.dispose();
         osc8Disp.dispose();
         osc7Disp.dispose();

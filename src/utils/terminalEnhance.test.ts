@@ -4,6 +4,7 @@ import {
   highlightTerminalText,
   isSensitiveCommand,
   matchDangerousCommand,
+  parseOsc52Write,
   parseOsc7Path,
 } from "./terminalEnhance";
 
@@ -51,5 +52,19 @@ describe("terminalEnhance utilities", () => {
     expect(out).toContain("\x1b[1;31mERROR\x1b[0m");
     expect(out).toContain("\x1b[36m192.168.9.165\x1b[0m");
     expect(out).toContain("\x1b[1;33mWARN\x1b[0m");
+  });
+
+  it("allows UTF-8 OSC 52 write while strictly blocking OSC 52 clipboard read", () => {
+    // 严格阻断任何远端读取本地剪贴板的 `?` 请求
+    expect(parseOsc52Write("c;?")).toBeNull();
+    expect(parseOsc52Write(";?")).toBeNull();
+    expect(parseOsc52Write("p;?")).toBeNull();
+    expect(parseOsc52Write("c;")).toBeNull();
+
+    // 正常放行 tmux / nvim 的 UTF-8 Base64 写入（"你好 tmux"）
+    const bytes = new TextEncoder().encode("你好 tmux");
+    let bin = "";
+    for (const b of bytes) bin += String.fromCharCode(b);
+    expect(parseOsc52Write(`c;${btoa(bin)}`)).toBe("你好 tmux");
   });
 });

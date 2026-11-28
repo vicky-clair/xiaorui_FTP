@@ -1649,25 +1649,36 @@ pub fn focus_main_window(app: AppHandle) -> AppResult<()> {
     Ok(())
 }
 
-/// 读取操作系统原生剪贴板纯文本内容（解决 Windows WebView2 下 `navigator.clipboard.readText` 权限拦截问题）
+/// 读取操作系统原生剪贴板纯文本内容（解决 Windows WebView2 权限拦截，并内置 4 次退避重试防剪贴板锁争抢）
 ///
 /// 若当前剪贴板为空或存放的是图片/文件等非文本内容，返回空字符串而非报错。
 #[tauri::command]
 pub async fn clipboard_read_text() -> AppResult<String> {
     tokio::task::spawn_blocking(|| -> AppResult<String> {
-        let mut cb = arboard::Clipboard::new()
-            .map_err(|e| AppError::Protocol(format!("访问系统剪贴板失败: {}", e)))?;
-        match cb.get_text() {
-            Ok(text) => Ok(text),
-            Err(arboard::Error::ContentNotAvailable) => Ok(String::new()),
-            Err(e) => Err(AppError::Protocol(format!("读取系统剪贴板失败: {}", e))),
+        let mut last_err = String::new();
+        for attempt in 0..4 {
+            match arboard::Clipboard::new() {
+                Ok(mut cb) => match cb.get_text() {
+                    Ok(text) => return Ok(text),
+                    Err(arboard::Error::ContentNotAvailable) => return Ok(String::new()),
+                    Err(e) => last_err = e.to_string(),
+                },
+                Err(e) => last_err = e.to_string(),
+            }
+            if attempt < 3 {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
         }
+        Err(AppError::Protocol(format!(
+            "读取系统剪贴板失败: {}",
+            last_err
+        )))
     })
     .await
     .map_err(|e| AppError::Protocol(format!("剪贴板读取任务异常: {}", e)))?
 }
 
-/// 将纯文本写入操作系统原生剪贴板（绕过 WebView2 焦点/权限限制，支持 Windows/macOS/Linux）
+/// 将纯文本写入操作系统原生剪贴板（绕过 WebView2 限制，内置 4 次退避重试消除 Windows 剪贴板锁冲突）
 #[tauri::command]
 pub async fn clipboard_write_text(text: String) -> AppResult<()> {
     // 限制单次剪贴板写入体积上限（8 MB），防止异常大文本导致内存峰值
@@ -1677,11 +1688,23 @@ pub async fn clipboard_write_text(text: String) -> AppResult<()> {
         ));
     }
     tokio::task::spawn_blocking(move || -> AppResult<()> {
-        let mut cb = arboard::Clipboard::new()
-            .map_err(|e| AppError::Protocol(format!("访问系统剪贴板失败: {}", e)))?;
-        cb.set_text(text)
-            .map_err(|e| AppError::Protocol(format!("写入系统剪贴板失败: {}", e)))?;
-        Ok(())
+        let mut last_err = String::new();
+        for attempt in 0..4 {
+            match arboard::Clipboard::new() {
+                Ok(mut cb) => match cb.set_text(text.clone()) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => last_err = e.to_string(),
+                },
+                Err(e) => last_err = e.to_string(),
+            }
+            if attempt < 3 {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+        Err(AppError::Protocol(format!(
+            "写入系统剪贴板失败: {}",
+            last_err
+        )))
     })
     .await
     .map_err(|e| AppError::Protocol(format!("剪贴板写入任务异常: {}", e)))?

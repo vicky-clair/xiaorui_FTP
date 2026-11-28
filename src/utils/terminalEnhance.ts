@@ -104,6 +104,32 @@ export function parseOsc7Path(payload: string): string | null {
   return normalized.startsWith("/") ? normalized : `/${normalized}`;
 }
 
+/**
+ * 安全解析远端终端发出的 OSC 52 剪贴板序列：
+ * - 严格禁止 OSC 52 读取请求（`?`），绝不允许远端读取本地剪贴板；
+ * - 仅允许合法的 Base64 写入请求（如 tmux 划选复制、nvim yank），单次上限 1 MB，完整支持 UTF-8 中文。
+ */
+export function parseOsc52Write(payload: string): string | null {
+  const sep = payload.indexOf(";");
+  if (sep < 0) return null;
+  const b64 = payload.slice(sep + 1).trim();
+  // 严格拦截 OSC 52 剪贴板读取查询（`?`）或空载荷或超大载荷
+  if (!b64 || b64 === "?" || b64.length > 1_400_000) {
+    return null;
+  }
+  try {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) {
+      bytes[i] = bin.charCodeAt(i);
+    }
+    const text = new TextDecoder("utf-8").decode(bytes);
+    return text.length > 0 ? text : null;
+  } catch {
+    return null;
+  }
+}
+
 export interface HighlightRule {
   id: string;
   label: string;
