@@ -109,8 +109,8 @@ interface TabMeta {
 }
 
 interface PtyTabHandle {
-  writeInput: (text: string) => Promise<boolean>;
-  pasteInput: (text: string) => Promise<boolean>;
+  writeInput: (text: string, shouldFocus?: boolean) => Promise<boolean>;
+  pasteInput: (text: string, shouldFocus?: boolean) => Promise<boolean>;
   clear: () => void;
   focus: () => void;
   fit: () => void;
@@ -538,20 +538,20 @@ const PtyTabPane = React.forwardRef<
     useImperativeHandle(
       ref,
       () => ({
-        writeInput: async (text: string) => {
+        writeInput: async (text: string, shouldFocus = true) => {
           const tid = terminalIdRef.current;
           if (!tid) return false;
           await api.sshPtyWrite(tid, text);
-          termRef.current?.focus();
+          if (shouldFocus) termRef.current?.focus();
           return true;
         },
-        pasteInput: async (text: string) => {
+        pasteInput: async (text: string, shouldFocus = true) => {
           const tid = terminalIdRef.current;
           if (!tid) return false;
           const bracketed = Boolean(termRef.current?.modes.bracketedPasteMode);
           const payload = encodeTerminalPaste(text, bracketed);
           await api.sshPtyWrite(tid, payload);
-          termRef.current?.focus();
+          if (shouldFocus) termRef.current?.focus();
           return true;
         },
         clear: () => {
@@ -1524,6 +1524,21 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
     });
   }, []);
 
+  /** 执行粘贴（开启广播输入时，同步向其他已连接标签发送且不抢占当前标签焦点） */
+  const sendPasteWithBroadcast = useCallback(
+    (text: string) => {
+      void getActiveHandle()?.pasteInput(text, true);
+      if (broadcastModeRef.current) {
+        for (const t of tabs) {
+          if (t.id !== activeTab?.id && t.status === "connected") {
+            void tabHandlesRef.current.get(t.id)?.pasteInput(text, false);
+          }
+        }
+      }
+    },
+    [activeTab?.id, getActiveHandle, tabs]
+  );
+
   /** 粘贴安全守卫：单行文本直接走括号粘贴适配通道写入，含换行符的多行命令先弹出内联确认条防隐藏命令注入 */
   const handleRequestPaste = useCallback(
     (text: string) => {
@@ -1532,9 +1547,9 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
         setPendingPaste(text);
         return;
       }
-      void getActiveHandle()?.pasteInput(text);
+      sendPasteWithBroadcast(text);
     },
-    [getActiveHandle]
+    [sendPasteWithBroadcast]
   );
 
   // 精确识别当前活跃标签的操作系统方言（Linux/POSIX vs Windows PowerShell vs Windows CMD）
@@ -1591,8 +1606,9 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
 
     const doSend = async () => {
       for (const l of lines) handleRecordCommand(l);
+      const activeHandle = getActiveHandle();
       for (const h of targetHandles) {
-        await h.writeInput(formatted);
+        await h.writeInput(formatted, h === activeHandle);
       }
       onNotify?.(
         `已按 ${activeOsLabel} 方式向 ${targetHandles.length} 个终端标签发送批执行命令`,
@@ -2710,7 +2726,7 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
               onClick={() => {
                 const txt = pendingPaste;
                 setPendingPaste(null);
-                void getActiveHandle()?.pasteInput(txt);
+                sendPasteWithBroadcast(txt);
               }}
             >
               确认全部粘贴
@@ -2721,7 +2737,7 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
               onClick={() => {
                 const firstLine = pendingPaste.split(/\r?\n/)[0] ?? "";
                 setPendingPaste(null);
-                if (firstLine) void getActiveHandle()?.pasteInput(firstLine);
+                if (firstLine) sendPasteWithBroadcast(firstLine);
               }}
             >
               仅粘贴首行（去回车）
@@ -2779,7 +2795,7 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
               if (!broadcastModeRef.current) return;
               for (const t of tabs) {
                 if (t.id !== tab.id && t.status === "connected") {
-                  void tabHandlesRef.current.get(t.id)?.writeInput(data);
+                  void tabHandlesRef.current.get(t.id)?.writeInput(data, false);
                 }
               }
             }}

@@ -1845,7 +1845,7 @@ select:focus-visible {
   flex-shrink: 0;
 }
 
-.term-search-bar input {
+.term-search-bar input:not([type="checkbox"]) {
   flex: 1;
   min-width: 120px;
   height: 24px;
@@ -1857,7 +1857,12 @@ select:focus-visible {
   outline: none;
 }
 
-.term-search-bar input:focus {
+.term-search-bar .term-snippet-form input:not([type="checkbox"]) {
+  flex: 0 0 auto;
+  min-width: 0;
+}
+
+.term-search-bar input:not([type="checkbox"]):focus {
   border-color: var(--accent);
 }
 
